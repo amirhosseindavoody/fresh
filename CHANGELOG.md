@@ -1,5 +1,11 @@
 # Release Notes
 
+## Unreleased
+
+### Bug Fixes
+
+* **Full redraw on terminal resize** - dragging a terminal window between monitors (notably Windows Terminal over SSH, where a DPI change can wipe the alt-screen without changing cell count) no longer leaves a solid purple/blue fill; resize now clears and repaints like **Redraw Screen** (#2723).
+
 ## 0.4.4
 
 For live updates on Fresh, [follow me on X](https://x.com/TheNoamLewis).
