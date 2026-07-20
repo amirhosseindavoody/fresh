@@ -253,14 +253,14 @@ Build and install Fresh globally from Git with [Pixi](https://pixi.sh/) (uses th
 The package manifest lives under `crates/fresh-editor`, so pass `--subdir`:
 
 ```bash
-pixi global install --git https://github.com/amirhosseindavoody/fresh.git --subdir crates/fresh-editor
+pixi global install --git https://github.com/sinelaw/fresh.git --subdir crates/fresh-editor
 ```
 
 That builds the `fresh` binary from source and exposes it on your `PATH` (same as other `pixi global` tools). Pin a branch, tag, or revision if you want:
 
 ```bash
-pixi global install --git https://github.com/amirhosseindavoody/fresh.git --subdir crates/fresh-editor --branch master
-pixi global install --git https://github.com/amirhosseindavoody/fresh.git --subdir crates/fresh-editor --tag v0.4.4
+pixi global install --git https://github.com/sinelaw/fresh.git --subdir crates/fresh-editor --branch master
+pixi global install --git https://github.com/sinelaw/fresh.git --subdir crates/fresh-editor --tag v0.4.4
 ```
 
 From a local checkout instead of Git:
