@@ -105,6 +105,8 @@ fn new_session_renders_terminal_output_without_keypress() {
                 format!("printf {}; sleep 60", MARKER),
             ]),
             title: Some("agent".into()),
+            env: None,
+            command_allowlist: None,
             request_id: 0,
         })
         .unwrap();
@@ -197,6 +199,8 @@ fn new_session_atomic_api_seeds_terminal_as_only_tab() {
             ]),
             Some("agent".into()),
             born_authority,
+            None,
+            None,
             None,
         )
         .expect("create_window_with_terminal should succeed");

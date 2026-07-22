@@ -554,7 +554,7 @@ impl Editor {
     /// than capturing a new clock — so two editors built from the
     /// same parts agree on "now".
     pub(super) fn from_parts(parts: EditorParts) -> Self {
-        Editor {
+        let editor = Editor {
             // From parts (non-trivial):
             next_buffer_id: parts.next_buffer_id,
             buffer_id_alloc: parts.buffer_id_alloc,
@@ -667,7 +667,12 @@ impl Editor {
             dock: None,
             dock_width: None,
             dock_resizing: false,
-        }
+        };
+
+        // The plugin per-window filesystem registry is populated on the first
+        // `update_plugin_state_snapshot` (during startup, before any plugin
+        // runs), so nothing to seed here.
+        editor
     }
 
     /// Create a new editor with the given configuration and terminal dimensions
@@ -1123,6 +1128,10 @@ impl Editor {
             Arc::clone(&command_registry),
             dir_context.clone(),
             Arc::clone(&theme_cache),
+            // Authority seed (repointed to the active window shortly after) and
+            // the fixed local-host filesystem for `LocalPath` values.
+            Arc::clone(&filesystem),
+            Arc::clone(&orchestrator_filesystem),
         )));
         t.phase("PluginManager::new");
 

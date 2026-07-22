@@ -317,6 +317,7 @@ impl TerminalManager {
         backing_path: Option<std::path::PathBuf>,
         terminal_wrapper: crate::services::authority::TerminalWrapper,
         env_delta: crate::services::env_provider::EnvDelta,
+        extra_env: HashMap<String, String>,
     ) -> Result<TerminalId, String> {
         let id = TerminalId(self.next_id);
         self.next_id += 1;
@@ -330,6 +331,7 @@ impl TerminalManager {
             backing_path,
             terminal_wrapper,
             env_delta,
+            extra_env,
         )?;
 
         self.terminals.insert(id, handle);
@@ -354,6 +356,7 @@ impl TerminalManager {
         backing_path: Option<std::path::PathBuf>,
         terminal_wrapper: TerminalWrapper,
         env_delta: crate::services::env_provider::EnvDelta,
+        extra_env: HashMap<String, String>,
     ) -> Result<TerminalHandle, String> {
         let pty_pair = open_pty(cols, rows)?;
 
@@ -361,7 +364,8 @@ impl TerminalManager {
         // unconditionally — local wraps `detect_shell()` with no args;
         // container/remote authorities re-parent into `docker exec -w …`,
         // `ssh …`, etc.
-        let (cmd, shell) = build_shell_command(terminal_wrapper, cwd.as_deref(), &env_delta);
+        let (cmd, shell) =
+            build_shell_command(terminal_wrapper, cwd.as_deref(), &env_delta, &extra_env);
 
         // Spawn the shell process.
         let child = pty_pair
@@ -577,6 +581,7 @@ fn build_shell_command(
     terminal_wrapper: TerminalWrapper,
     cwd: Option<&std::path::Path>,
     env_delta: &crate::services::env_provider::EnvDelta,
+    extra_env: &HashMap<String, String>,
 ) -> (CommandBuilder, String) {
     let TerminalWrapper {
         command: shell,
@@ -616,6 +621,15 @@ fn build_shell_command(
         if let Some(session_id) = crate::server::local_control::local_session_id() {
             cmd.env("FRESH_SESSION", session_id);
         }
+        // Advertise the running fresh executable's own path so a nested `fresh`
+        // — and, above all, an agent taught the Fresh CLI — invokes the EXACT
+        // same binary this editor is running. Its `--cmd` verbs and `--help`
+        // then match this build, never some other `fresh` that happens to sit
+        // earlier on PATH. Local-only (skip_cwd ⇒ a remote host where this path
+        // is meaningless), mirroring FRESH_SESSION.
+        if let Ok(exe) = std::env::current_exe() {
+            cmd.env("FRESH_BIN", exe);
+        }
     }
 
     // On Windows, ensure PROMPT is set for cmd.exe.
@@ -624,6 +638,14 @@ fn build_shell_command(
         if shell.to_lowercase().contains("cmd") {
             cmd.env("PROMPT", "$P$G");
         }
+    }
+
+    // Caller-supplied extra env (e.g. the Orchestrator's `FRESH_CMD_TOKEN`
+    // capability token, or plugin-provided vars). Applied last so these keys
+    // are guaranteed present in the child; they intentionally win over the
+    // activated env delta above. Normal callers pass an empty map — no change.
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
 
     (cmd, shell)

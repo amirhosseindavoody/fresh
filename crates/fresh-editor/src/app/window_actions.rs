@@ -336,6 +336,8 @@ impl crate::app::Editor {
         title: Option<String>,
         window_authority: crate::services::authority::Authority,
         resume: Option<Vec<String>>,
+        env: Option<HashMap<String, String>>,
+        command_allowlist: Option<Vec<String>>,
     ) -> Result<(WindowId, fresh_core::TerminalId, fresh_core::BufferId), String> {
         let id = WindowId(self.next_window_id);
         self.next_window_id += 1;
@@ -399,6 +401,16 @@ impl crate::app::Editor {
         // marks this as a restorable *session* terminal (re-spawn it on
         // restore), distinct from a throwaway ephemeral build/exec shell.
         let restore_command = command.clone().unwrap_or_default();
+
+        // Assemble the extra env injected into the seeded terminal's child:
+        // `FRESH_BIN` always, plus (when `command_allowlist` is present) a
+        // capability token bound to *this* new window + that allowlist, so a
+        // client in the terminal can drive exactly those commands against this
+        // window and no other. Minting happens here — after the window id is
+        // known, before the PTY spawns — so the token is live by the time the
+        // child reads its env. See `terminal::agent_command_env`.
+        let terminal_env = crate::app::terminal::agent_command_env(id, env, command_allowlist);
+
         let spawn_result = {
             let target = self
                 .windows
@@ -412,6 +424,7 @@ impl crate::app::Editor {
                 persistent: false, // ephemeral by default; orchestrator owns persistence
                 command,
                 title: title.filter(|t| !t.is_empty()),
+                env: terminal_env,
             })
         };
 
@@ -1367,6 +1380,8 @@ impl crate::app::Editor {
             command,
             None,
             authority,
+            None,
+            None,
             None,
         ) {
             Ok((window_id, _terminal, _buffer)) => {

@@ -815,7 +815,7 @@ console.log('\n[web-UI theme system: switch chrome look without touching the buf
 // it re-skins the native chrome and never reaches the editor. Default is Cosmos
 // (the hardware-bezel shell); macOS and Compact are the added looks.
 check('theme API is exposed (setWebTheme / webTheme / webThemes)', await page.evaluate(() =>
-  typeof window.fresh.setWebTheme === 'function' && Array.isArray(window.fresh.webThemes) && window.fresh.webThemes.length === 4));
+  typeof window.fresh.setWebTheme === 'function' && Array.isArray(window.fresh.webThemes) && window.fresh.webThemes.length === 5));
 check('default theme is Cosmos with the hardware bezel on', await page.evaluate(() =>
   window.fresh.webTheme === 'cosmos' && document.body.classList.contains('theme-cosmos') && document.getElementById('device').classList.contains('on')));
 // The buffer stays the TUI monospace stack regardless of the chrome font.
@@ -851,17 +851,188 @@ check('Compact: theme class set, bezel off, denser grid (cell width shrank)', aw
   (await page.evaluate(() => window.fresh.metrics)).cw < cwCosmos);
 // The switch is persisted as a pure view preference in localStorage.
 check('theme choice persists in localStorage', await page.evaluate(() => localStorage.getItem('fresh.webtheme') === 'compact'));
+// → Winamp: a SHELL theme (like Cosmos) — the hardware bezel host is on and
+// dressed as the "CODE STUDIO" skin window (furniture), and its own chrome
+// palette is layered inline (navy playlist selection, LCD-green accent). The
+// BUFFER stays the TUI monospace stack, same as every other web theme.
+await page.evaluate(() => window.fresh.setWebTheme('winamp'));
+await page.waitForTimeout(400);
+check('Winamp: theme class set, shell bezel ON, skin furniture built', await page.evaluate(() =>
+  document.body.classList.contains('theme-winamp') && document.getElementById('device').classList.contains('on') &&
+  !!document.querySelector('#device .wa-title .wa-title-text')));
+check('Winamp: chrome palette layered inline (navy selection + LCD-green accent), buffer stays monospace',
+  await page.evaluate(() => {
+    const r = document.documentElement.style;
+    return r.getPropertyValue('--sel').trim() === '#313c90' && r.getPropertyValue('--accent').trim() === '#4ef07f';
+  }) && (await svgFamily()) === cosmosBufFont);
+await page.screenshot({ path: `${SHOTS}/33b-theme-winamp.png` });
 // The floating switcher: clicking the pill opens a 3-row menu; a row switches.
 await page.locator('#themebtn').click();
 await page.waitForTimeout(150);
-check('theme switcher menu opens with all four themes', (await page.locator('#thememenu.open .ts-row').count()) === 4);
+check('theme switcher menu opens with all five themes', (await page.locator('#thememenu.open .ts-row').count()) === 5);
 await page.locator('#thememenu .ts-row', { hasText: 'Cosmos' }).first().click();
 await page.waitForTimeout(400);
 check('picking Cosmos from the menu restores the bezel shell', await page.evaluate(() =>
   window.fresh.webTheme === 'cosmos' && document.getElementById('device').classList.contains('on')));
 await page.screenshot({ path: `${SHOTS}/34-theme-cosmos.png` });
 
+console.log('\n[embedded terminal: Ctrl+hover carries the modifier and underlines a path link]');
+// Regression: the frontend used to send `moved` events WITHOUT the ctrl flag,
+// so Ctrl+hover over a file path in the embedded terminal never underlined it
+// (the server only computes the link highlight while CONTROL is held), even
+// though Ctrl+click — whose `down` event DID carry ctrl — worked. Open a real
+// terminal, print a path that resolves at the server's cwd (repo root), and
+// Ctrl-move over it.
+await page.keyboard.press('Escape'); await page.waitForTimeout(150);
+await page.request.post(URL + '/action', { data: { action: 'open_terminal' } });
+await page.waitForFunction(() => window.fresh.scene.regions.panes.some(p =>
+  p.cells.some(r => r.map(x => x.t).join('').match(/[#$]/))), { timeout: 8000 }).catch(() => {});
+await page.waitForTimeout(500);
+// Capture outgoing WS mouse messages so we can see what the frontend emits.
+await page.evaluate(() => {
+  window.__mouse = [];
+  const orig = WebSocket.prototype.send;
+  WebSocket.prototype.send = function (data) {
+    try { const o = JSON.parse(data); if (o && o.type === 'mouse') window.__mouse.push(o); } catch {}
+    return orig.call(this, data);
+  };
+});
+// Create a real file and print its ABSOLUTE path, so the link resolves
+// regardless of the terminal's cwd.
+const PROBE = '/tmp/fresh_link_probe.txt';
+await page.keyboard.type(`touch ${PROBE} && echo "see ${PROBE}:1:1 here"`);
+await page.keyboard.press('Enter');
+await page.waitForFunction(() => window.fresh.scene.regions.panes.some(p =>
+  p.cells.some(r => r.map(x => x.t).join('').includes('see /tmp/fresh_link_probe.txt:1:1 here'))), { timeout: 6000 }).catch(() => {});
+await page.waitForTimeout(300);
+// Locate the OUTPUT line's path (last occurrence; the first is the typed echo).
+{
+  const NEEDLE = 'fresh_link_probe.txt:1:1';
+  // The web terminal grid is run-encoded (each cell is a styled run, not one
+  // char), so a cell's column is the sum of the preceding runs' text lengths.
+  // Locate the needle by accumulating run widths, prefer the OUTPUT line (last
+  // occurrence), and report whether the runs covering it are underlined.
+  const findLink = s => {
+    let best = null;
+    for (const pane of s.regions.panes) {
+      for (let r = 0; r < pane.cells.length; r++) {
+        const row = pane.cells[r];
+        let text = '', starts = [], col = 0;
+        for (const cell of row) { starts.push(col); text += cell.t; col += cell.t.length; }
+        const i = text.indexOf(NEEDLE);
+        if (i < 0) continue;
+        const underlinedAt = ci => {
+          for (let k = 0; k < row.length; k++) { if (ci >= starts[k] && ci < starts[k] + row[k].t.length) return !!row[k].u; }
+          return false;
+        };
+        best = { pane, r, col: pane.content.x + i, row: pane.content.y + r,
+                 underlined: [0, 2, 4, NEEDLE.length - 1].every(k => underlinedAt(i + k)) };
+      }
+    }
+    return best;
+  };
+  const tm2 = await page.evaluate(() => window.fresh.metrics);
+  const h = findLink(await scene(page));
+  if (h) {
+    await page.keyboard.down('Control');
+    await page.mouse.move(gx(tm2, h.col + 2 + 0.5), gy(tm2, h.row + 0.5));
+    await page.mouse.move(gx(tm2, h.col + 3 + 0.5), gy(tm2, h.row + 0.5)); // cross a cell so the de-dupe re-sends
+    await page.waitForTimeout(400);
+    const movedCtrl = await page.evaluate(() => (window.__mouse || []).some(m => m.kind === 'moved' && m.ctrl === true));
+    check('Ctrl+move over the terminal emits a `moved` event carrying ctrl:true', movedCtrl,
+      JSON.stringify(await page.evaluate(() => (window.__mouse || []).filter(m => m.kind === 'moved').slice(-2))));
+    // Observe rendered output: the path span is underlined in the scene cells.
+    const u = findLink(await scene(page));
+    check('Ctrl+hover underlines the resolvable path in the terminal (scene cells)', !!(u && u.underlined),
+      JSON.stringify(u && { row: u.row, col: u.col, underlined: u.underlined }));
+    await page.keyboard.up('Control');
+    await page.screenshot({ path: `${SHOTS}/35-terminal-ctrl-hover.png` });
+  } else {
+    check('embedded terminal printed the path link', false, `path "${NEEDLE}" not found in terminal cells`);
+  }
+}
+
 check('no JS page errors', errs.length === 0, errs.join(' | '));
+
+// ---------------------------------------------------------------------------
+// Dropdown pop-over placement, macOS skin. The macOS vibrancy modal uses
+// `backdrop-filter`, making it the containing block for `position:fixed`
+// descendants; the Settings modal is a `transform`ed, `overflow:hidden` box
+// with a scrolling item list. A dropdown's floating option list must, in both:
+// open under its trigger (not offset by the modal origin), never be clipped by
+// those scroll/overflow containers, and grow to fit its widest option. The
+// closed pill's width must also stay stable open↔closed.
+console.log('\n[dropdown pop-overs anchor under their trigger, never clip (macOS skin)]');
+await page.keyboard.press('Escape'); await page.waitForTimeout(120);
+// Skin is read from localStorage at boot; single-client bridge → /reset first,
+// then set the skin and reload so the vibrancy modal is in play.
+await page.request.post(URL + '/reset', { data: {} });
+await page.evaluate(() => { try { localStorage.setItem('fresh.webtheme', 'macos'); } catch (_) {} });
+await page.reload({ waitUntil: 'networkidle' });
+await page.waitForFunction(() => window.fresh && window.fresh.wsOpen && window.fresh.scene && window.fresh.scene.regions.panes.length > 0, null, { timeout: 20000 });
+await page.waitForTimeout(400);
+check('macOS skin active (vibrancy modal in play)',
+  await page.evaluate(() => document.body.classList.contains('theme-macos')));
+
+// (a) Orchestrator "Run Agent" widget dropdown, mounted inside the
+// backdrop-filter modal — the case that regressed.
+await page.request.post(URL + '/action', { data: { action: 'orchestrator_run_agent' } });
+await page.waitForFunction(() => document.querySelectorAll('.w-dropdown .w-dd-pill').length > 0, null, { timeout: 8000 }).catch(() => {});
+const raBox = await page.locator('.w-dropdown .w-dd-pill').first().boundingBox();
+if (raBox) {
+  const closedW = await page.evaluate(() => document.querySelector('.w-dd-pill').getBoundingClientRect().width);
+  await page.mouse.click(raBox.x + raBox.width / 2, raBox.y + raBox.height / 2);
+  await page.waitForFunction(() => !!document.querySelector('.w-dd.w-dd-floating'), null, { timeout: 5000 }).catch(() => {});
+  const w = await page.evaluate(() => {
+    const list = document.querySelector('.w-dd.w-dd-floating'), pill = document.querySelector('.w-dd-pill');
+    if (!list || !pill) return null;
+    const lr = list.getBoundingClientRect(), pr = pill.getBoundingClientRect();
+    return { dx: Math.round(lr.left - pr.left), dy: Math.round(lr.top - pr.bottom), openW: pr.width };
+  });
+  await page.screenshot({ path: `${SHOTS}/34-macos-widget-dropdown.png` });
+  check('Run-Agent widget dropdown opens directly under its pill (not offset by the modal)',
+    !!w && Math.abs(w.dx) <= 4 && w.dy >= -2 && w.dy <= 8, JSON.stringify(w));
+  // The open (▴) and closed (▾) chevrons must be the same width so the pill
+  // doesn't jump — regressed when open used the full-size ▲ vs the small ▾.
+  check('closed pill width stays stable when opened (matched-size chevron)',
+    !!w && Math.abs(w.openW - closedW) <= 1, JSON.stringify({ closedW: Math.round(closedW), openW: Math.round(w.openW) }));
+}
+await page.keyboard.press('Escape'); await page.waitForTimeout(100);
+await page.keyboard.press('Escape'); await page.waitForTimeout(200);
+
+// (b) Settings "Default Language" dropdown: a long option list far wider than
+// its compact "(none)" pill, with the control flush against the dialog's right
+// edge — the exact case that used to run off the edge and get clipped by the
+// scroll container. It must open below the pill, grow WIDER than the pill (to
+// fit option text), and sit fully inside the modal (no clipping on any side).
+await page.request.post(URL + '/action', { data: { action: 'open_settings' } });
+await page.waitForFunction(() => !!window.fresh.scene.regions.settings, { timeout: 8000 }).catch(() => {});
+await page.waitForTimeout(300);
+const langPill = page.locator('.settings-modal .set-item', { hasText: 'Default Language' }).locator('.set-pill');
+await langPill.scrollIntoViewIfNeeded().catch(() => {});
+const lpBox = await langPill.boundingBox();
+if (lpBox) {
+  await page.mouse.click(lpBox.x + lpBox.width / 2, lpBox.y + lpBox.height / 2);
+  await page.waitForFunction(() => !!document.querySelector('.set-dd'), null, { timeout: 5000 }).catch(() => {});
+  const sd = await page.evaluate(() => {
+    const item = [...document.querySelectorAll('.settings-modal .set-item')].find(r => r.textContent.includes('Default Language'));
+    // The option list is portaled to the body-level host, not inside the modal.
+    const dd = document.querySelector('#fresh-popover-host .set-dd'), pill = item && item.querySelector('.set-pill');
+    const modal = document.querySelector('.settings-modal');
+    if (!dd || !pill || !modal) return null;
+    const d = dd.getBoundingClientRect(), p = pill.getBoundingClientRect(), m = modal.getBoundingClientRect();
+    return {
+      below: Math.round(d.top - p.bottom), grewWiderBy: Math.round(d.width - p.width),
+      insideModal: d.left >= m.left - 1 && d.right <= m.right + 1 && d.top >= m.top - 1 && d.bottom <= m.bottom + 1,
+      d: { l: Math.round(d.left), r: Math.round(d.right), b: Math.round(d.bottom) }, m: { l: Math.round(m.left), r: Math.round(m.right), b: Math.round(m.bottom) },
+    };
+  });
+  await page.screenshot({ path: `${SHOTS}/35-macos-settings-dropdown.png` });
+  check('Settings "Default Language" list opens below its pill', !!sd && sd.below >= -1 && sd.below <= 8, JSON.stringify(sd));
+  check('Settings dropdown grows wider than its compact pill to fit options', !!sd && sd.grewWiderBy > 8, JSON.stringify(sd));
+  check('Settings dropdown is NOT clipped — fully inside the dialog', !!sd && sd.insideModal, JSON.stringify(sd));
+}
+await page.keyboard.press('Escape'); await page.waitForTimeout(120);
 
 console.log('\n[touch pan/scroll on mobile (hasTouch context)]');
 // The bridge is single-client: close the desktop page (frees /ws) before

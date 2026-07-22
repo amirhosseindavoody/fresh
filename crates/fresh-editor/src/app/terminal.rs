@@ -31,6 +31,7 @@ use crate::services::terminal::TerminalId;
 use crate::state::EditorState;
 use crate::view::split::SplitViewState;
 use rust_i18n::t;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -96,6 +97,56 @@ pub struct PluginTerminalSpec {
     pub persistent: bool,
     pub command: Option<Vec<String>>,
     pub title: Option<String>,
+    /// Extra environment variables applied to the terminal's child
+    /// process, on top of the inherited + activated env. Applied after
+    /// the control vars (`TERM`, `FRESH_SESSION`). Empty adds nothing.
+    pub env: HashMap<String, String>,
+}
+
+/// Assemble the extra env for a terminal that hosts an agent which may drive
+/// the editor from its shell.
+///
+/// Always advertises `FRESH_BIN` — this editor's own executable path — so a
+/// nested `fresh` or a Fresh-CLI-taught agent invokes the EXACT build running
+/// here, never some other `fresh` earlier on PATH (its `--cmd` verbs then match
+/// this build). This duplicates what the terminal manager already injects
+/// universally, on purpose: it guarantees `FRESH_BIN` rides the child's env
+/// regardless of the manager's own cwd/socket state.
+///
+/// When `command_allowlist` is `Some`, mints an unforgeable capability token
+/// bound to `window` plus that allowlist and injects it as `FRESH_CMD_TOKEN`,
+/// alongside `FRESH_SESSION` — ensuring the control socket is listening first
+/// so a token never ships without a session to talk to. Token minting is
+/// deliberately caller-driven (opt-in via the allowlist), never blanket: a
+/// standing editor-driving capability belongs only in terminals a caller
+/// explicitly grants it to, not in every spawned subprocess.
+///
+/// Shared by `create_window_with_terminal` (agents born in a new window) and
+/// `handle_create_terminal` (agents spawned into an existing window) so both
+/// paths mint and inject identically. `base_env` seeds the map (plugin-supplied
+/// env, empty when omitted).
+pub(crate) fn agent_command_env(
+    window: fresh_core::WindowId,
+    base_env: Option<HashMap<String, String>>,
+    command_allowlist: Option<Vec<String>>,
+) -> HashMap<String, String> {
+    let mut env = base_env.unwrap_or_default();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe) = exe.to_str() {
+            env.insert("FRESH_BIN".to_string(), exe.to_string());
+        }
+    }
+    if let Some(allowlist) = command_allowlist {
+        if let Ok(session_id) = crate::server::local_control::start() {
+            env.insert("FRESH_SESSION".to_string(), session_id.to_string());
+        }
+        let token = crate::server::command_access::mint(crate::server::command_access::Grant::new(
+            Some(window.0),
+            allowlist,
+        ));
+        env.insert("FRESH_CMD_TOKEN".to_string(), token);
+    }
+    env
 }
 
 impl Window {
@@ -197,6 +248,7 @@ impl Window {
         cwd: Option<PathBuf>,
         persistent: bool,
         command_override: Option<Vec<String>>,
+        extra_env: HashMap<String, String>,
     ) -> Option<TerminalId> {
         let (cols, rows) = self.get_terminal_dimensions();
 
@@ -251,6 +303,7 @@ impl Window {
             Some(backing_path),
             wrapper,
             env_delta,
+            extra_env,
         ) {
             Ok(terminal_id) => {
                 self.terminal_log_files.insert(terminal_id, log_path);
@@ -395,6 +448,7 @@ impl Window {
             persistent,
             command,
             title,
+            env,
         } = spec;
         // Derive the auto-title from the command's executable name
         // (basename of argv[0]). The host writes this into the
@@ -412,7 +466,7 @@ impl Window {
         });
         let resolved_title = title.or(auto_title);
         let terminal_id = self
-            .spawn_terminal_session(cwd, persistent, command)
+            .spawn_terminal_session(cwd, persistent, command, env)
             .ok_or_else(|| "Failed to spawn terminal".to_string())?;
 
         // Register the leader pid with this window's process_groups
@@ -744,7 +798,7 @@ impl Window {
         // `None` command override — `Open Terminal` always spawns the
         // user's shell, never a one-off command. Plugin-driven
         // terminals route through `create_plugin_terminal` instead.
-        let terminal_id = self.spawn_terminal_session(None, true, None)?;
+        let terminal_id = self.spawn_terminal_session(None, true, None, HashMap::new())?;
         let split_id = self
             .buffers
             .splits()
@@ -908,6 +962,7 @@ impl Window {
                 backing_path,
                 wrapper,
                 env_delta,
+                HashMap::new(),
             ) {
                 Ok(id) => id,
                 Err(e) => {
@@ -972,7 +1027,7 @@ impl Editor {
     pub(crate) fn spawn_terminal_session(&mut self) -> Option<TerminalId> {
         // No command override — see comment on `Window::open_terminal_in_window`.
         self.active_window_mut()
-            .spawn_terminal_session(None, true, None)
+            .spawn_terminal_session(None, true, None, HashMap::new())
     }
 
     /// Open a new terminal in the active window's current split, fire

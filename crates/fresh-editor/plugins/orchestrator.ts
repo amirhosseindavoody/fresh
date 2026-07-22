@@ -17,8 +17,10 @@
 //     terminal_exit code: RUNNING / AWAITING / READY / ERRORED.
 
 import {
+  activate,
   button,
   col,
+  dropdown,
   flexSpacer,
   FloatingWidgetPanel,
   hintBar,
@@ -156,8 +158,26 @@ type CreateSpec =
       name: string;
       // Agent command; "" ⇒ a bare terminal.
       cmd: string;
-      // Fork point for `git worktree add`; "" ⇒ the detected default branch.
+      // Enable the agent's auto/reduced-approval mode (adds the agent's
+      // documented flag, e.g. `claude --permission-mode auto`). Only honoured
+      // for a command that resolves to a known agent with an `auto` flag;
+      // ignored for a bare terminal / unknown command.
+      auto: boolean;
+      // Initial prompt to hand the agent at launch (positional or via the
+      // agent's prompt flag). "" ⇒ no prompt. Only applied to a resolved agent
+      // that documents a prompt argument; never replayed on resume.
+      startPrompt: string;
+      // Inject the Fresh CLI system prompt + mint a capability token so the
+      // agent can drive the editor from the shell. Only honoured for a command
+      // that resolves to an agent with a `systemPrompt` strategy.
+      teachFreshCli: boolean;
+      // "Checkout branch": an existing branch/ref to check out (worktree) or
+      // switch to (in-place). "" ⇒ the detected default branch (worktree only).
       branch: string;
+      // "New branch name": when set, create the worktree on a freshly-cut
+      // branch off the checkout branch (or default). "" ⇒ no new branch.
+      // Ignored in the non-worktree (in-place checkout) path.
+      newBranch: string;
       // Create a fresh worktree (only honoured when the path is a git tree).
       createWorktree: boolean;
       // Row label + project shown on the pending dock row.
@@ -367,7 +387,27 @@ interface NewSessionForm {
   projectPath: { value: string; cursor: number };
   name: { value: string; cursor: number };
   cmd: { value: string; cursor: number };
+  // Initial prompt handed to a supporting agent at launch (a single-line box,
+  // shown only for the local backend where agent launch is wired). Ignored for
+  // a bare terminal / an agent with no prompt argument.
+  startPrompt: { value: string; cursor: number };
+  // "Auto mode" toggle — adds the resolved agent's auto/reduced-approval flag
+  // to the launch (and resume) argv. Only meaningful for an agent that
+  // documents such a flag; the checkbox is hidden otherwise.
+  autoMode: boolean;
+  // "Teach Fresh CLI" toggle — injects a system prompt teaching the agent the
+  // `fresh` CLI and mints a capability token so it can drive the editor. Only
+  // meaningful for an agent with a `systemPrompt` injection strategy; the
+  // checkbox is hidden otherwise.
+  teachFreshCli: boolean;
   branch: { value: string; cursor: number };
+  // "New branch name" field (Advanced): when set, the new worktree is
+  // created on a freshly-cut branch (`git worktree add -b <newBranch>`).
+  // Empty ⇒ use the "Checkout branch" value (or the default) instead.
+  newBranch: { value: string; cursor: number };
+  // Whether the collapsible "Advanced…" section (worktree toggle +
+  // branch fields) is expanded. Starts collapsed on every open.
+  advancedExpanded: boolean;
   // Whether to create a new git worktree under
   // `<XDG>/orchestrator/<slug>/<session>/` (true) or run the
   // session directly inside `projectPath` (false). Enabled
@@ -490,6 +530,38 @@ let createFolderPanel: FloatingWidgetPanel | null = null;
 // Cancel button, where Enter must cancel (pressing Enter on a focused
 // Cancel that *creates* the folder is exactly backwards).
 let createFolderFocusKey = "folder-name";
+
+// ---------------------------------------------------------------------
+// "Run Agent…" dialog — a lightweight picker to launch one of the
+// starting processes the New-Workspace dialogue offers (a bare terminal
+// or a registered agent) from an existing session, WITHOUT the full
+// workspace-creation form. The user picks the process, whether it runs
+// in the current window or a fresh worktree+window, auto mode, and an
+// optional first prompt; the choice is remembered for next time. Both
+// targets reuse the dialogue's launch logic (session-id pin, auto flags,
+// Fresh-CLI system-prompt injection, capability token) so a
+// palette-launched agent is indistinguishable from a dialogue-launched
+// one.
+// ---------------------------------------------------------------------
+const RUN_AGENT_MODE = "orchestrator-run-agent-dialog";
+// Where a Run-Agent launch lands: a terminal in the CURRENT window, or a
+// fresh worktree + window (the dialogue's classic path).
+type RunAgentTarget = "current" | "new";
+interface RunAgentDialogState {
+  // Index into `runAgentProcesses()` (0 = bare terminal, then agents).
+  agentIndex: number;
+  target: RunAgentTarget;
+  // Auto/bypass-approvals mode. Only meaningful (and only shown) for an
+  // agent whose registry entry has an `auto` flag.
+  auto: boolean;
+  // Optional first prompt handed to the agent at launch. Only shown for
+  // an agent that documents a prompt argument.
+  prompt: { value: string; cursor: number };
+}
+let runAgentDialog: RunAgentDialogState | null = null;
+let runAgentPanel: FloatingWidgetPanel | null = null;
+// Persisted last choice so the dialog reopens where the user left it.
+const RUN_AGENT_LAST_KEY = "orchestrator.run_agent.last";
 
 // Open dialog state. `null` ⇒ the picker isn't mounted. Lives
 // alongside the new-session form state but is independent of
@@ -1234,14 +1306,14 @@ function scanSessionContent(): void {
   const dir = editor.pathJoin(editor.getDataDir(), "workspaces");
   let entries: DirEntry[];
   try {
-    entries = editor.readDir(dir);
+    entries = editor.readDir(editor.localPath(dir));
   } catch {
     return;
   }
   if (!entries) return;
   for (const e of entries) {
     if (!e.is_file || !e.name.endsWith(".json")) continue;
-    const raw = editor.readFile(editor.pathJoin(dir, e.name));
+    const raw = editor.readFile(editor.localPath(editor.pathJoin(dir, e.name)));
     if (!raw) continue;
     let ws: Record<string, unknown>;
     try {
@@ -4771,7 +4843,7 @@ function archiveManifestPath(repoRoot: string): string {
 
 function loadArchiveManifest(repoRoot: string): ArchiveManifest {
   const path = archiveManifestPath(repoRoot);
-  const raw = editor.readFile(path);
+  const raw = editor.readFile(editor.localPath(path));
   if (!raw) return { version: 1, sessions: [] };
   try {
     const parsed = JSON.parse(raw);
@@ -4791,8 +4863,8 @@ function loadArchiveManifest(repoRoot: string): ArchiveManifest {
 function saveArchiveManifest(repoRoot: string, m: ArchiveManifest): boolean {
   const path = archiveManifestPath(repoRoot);
   const dir = editor.pathDirname(path);
-  if (!editor.createDir(dir)) return false;
-  return editor.writeFile(path, JSON.stringify(m, null, 2));
+  if (!editor.createDir(editor.localPath(dir))) return false;
+  return editor.writeFile(editor.localPath(path), JSON.stringify(m, null, 2));
 }
 
 // Pick a session id to make active so that `excludeId` can be
@@ -4846,6 +4918,8 @@ async function ensureReplacementWindow(projectRoot: string): Promise<boolean> {
       root: projectRoot,
       label,
       cwd: projectRoot,
+      // Always mint the workspace's capability token (see runLocalCreate).
+      commandAllowlist: FRESH_CLI_DEFAULT_ALLOWLIST,
     });
     // `createWindowWithTerminal` fires `window_created`, which reconciles
     // the new window into the model; set it eagerly too so the immediate
@@ -4943,7 +5017,7 @@ async function archiveOne(id: number): Promise<LifecycleResult> {
       s.label,
     );
     const parent = editor.pathDirname(archivedRoot);
-    if (!editor.createDir(parent)) {
+    if (!editor.createDir(editor.localPath(parent))) {
       return { ok: false, err: editor.t("err.could_not_create", { path: parent }), repoRoot };
     }
     const moveRes = await spawnCollect(
@@ -5076,7 +5150,7 @@ async function syncSessions(repoRoot: string): Promise<SyncResult> {
   // First-time setup creates the worktree as an orphan branch
   // with no parent commit (cleanest history; no leftover files
   // from the original tree).
-  if (!editor.createDir(editor.pathDirname(wt))) {
+  if (!editor.createDir(editor.localPath(editor.pathDirname(wt)))) {
     return { ok: false, err: "createDir failed for sync workspace parent" };
   }
   const branchExists = await spawnCollect(
@@ -5131,7 +5205,7 @@ async function syncSessions(repoRoot: string): Promise<SyncResult> {
   // lives at the root of the sync branch.
   const snapshot = await buildSyncSnapshot(repoRoot);
   const sessionsPath = editor.pathJoin(wt, "sessions.json");
-  if (!editor.writeFile(sessionsPath, JSON.stringify(snapshot, null, 2))) {
+  if (!editor.writeFile(editor.localPath(sessionsPath), JSON.stringify(snapshot, null, 2))) {
     return { ok: false, err: "writeFile sessions.json failed" };
   }
 
@@ -5597,6 +5671,13 @@ const HISTORY_CAP = 100;
 /// keys this form actually binds it stays in sync.
 let formFocusCycle: string[] = [];
 let formFocusIndex = 0;
+// Mirror of the Agent dropdown's option pop-over open/closed state, kept in
+// sync from the host's `dropdown_open` widget_event (fired on every open/close
+// — keyboard, trigger click, or an option pick). The form's Enter/Escape key
+// handlers read it to route those keys correctly: an open pop-over swallows
+// Enter/Escape into the list (commit / dismiss), a closed one lets them
+// activate / cancel the dialog.
+let agentDropdownOpen = false;
 
 function rebuildFormFocusCycle(): void {
   if (!form) {
@@ -5613,11 +5694,29 @@ function rebuildFormFocusCycle(): void {
   const cycle: string[] = activeBackend ? [activeBackend.key] : [];
   if (form.backend === "local") {
     const worktreeEnabled = form.projectPathIsGit !== false;
-    const branchInert = !(worktreeEnabled && form.createWorktree);
-    cycle.push("project_path");
-    if (worktreeEnabled) cycle.push("worktree");
-    cycle.push("name", "cmd");
-    if (!branchInert) cycle.push("branch");
+    const effectiveCreateWorktree = worktreeEnabled && form.createWorktree;
+    // The agent selector is a single stop after Session Name. The Agent Command
+    // field moved under the Advanced fold (a power-user override the dropdown
+    // fills), so it's a Tab stop there, not in the body.
+    cycle.push("project_path", "name", "agent_dropdown");
+    // Agent-specific controls sit between the selector and the Advanced fold,
+    // matching `agentOptionsFields`' render order (Auto mode, then Start prompt).
+    const agent = activeAgentEntry();
+    if (agent?.auto) cycle.push("auto_mode");
+    if (agent?.prompt) cycle.push("start_prompt");
+    // The "Advanced…" header is always a Tab stop; its folded fields join the
+    // cycle only while expanded, in render order: Agent Command, Teach Fresh
+    // CLI, worktree, "Checkout branch" (a stop on any git path — it drives the
+    // in-place checkout when no worktree is created), then "New branch name"
+    // (only when cutting a worktree).
+    cycle.push("advanced_toggle");
+    if (form.advancedExpanded) {
+      cycle.push("cmd");
+      if (agent?.systemPrompt) cycle.push("teach_fresh_cli");
+      if (worktreeEnabled) cycle.push("worktree");
+      if (worktreeEnabled) cycle.push("branch");
+      if (effectiveCreateWorktree) cycle.push("new_branch");
+    }
   } else if (form.backend === "devcontainer") {
     cycle.push("project_path", "name", "cmd");
   } else if (form.backend === "ssh") {
@@ -5629,15 +5728,13 @@ function rebuildFormFocusCycle(): void {
     }
     cycle.push("name", "cmd");
   }
-  // Make the agent presets keyboard-reachable: the *active* preset is a
-  // single Tab stop just before the Agent Command field (←/→ chooses
-  // within the group), mirroring how the "Run in:" tab precedes its
-  // fields.
+  // On remote backends the agent selector sits just before the (still-inline)
+  // Agent Command field. Local already placed `agent_dropdown` explicitly.
   const cmdIdx = cycle.indexOf("cmd");
-  if (cmdIdx >= 0) {
-    cycle.splice(cmdIdx, 0, activeAgentPresetKey());
+  if (cmdIdx >= 0 && !cycle.includes("agent_dropdown")) {
+    cycle.splice(cmdIdx, 0, "agent_dropdown");
   }
-  cycle.push("cancel", "create-visit", "create-bg");
+  cycle.push("create-visit", "create-bg", "cancel");
   formFocusCycle = cycle;
   if (formFocusIndex >= cycle.length) formFocusIndex = 0;
 }
@@ -5819,29 +5916,175 @@ interface AgentResumeSpec {
   provision?: { idFlag: string; resumeArgs: string[] };
   continue?: { resumeArgs: string[] };
 }
-// `id` is the command the New Session dropdown fills in and the basename the
-// matcher keys on; `match` lets a path/args form (e.g. `/usr/bin/claude --foo`)
-// still resolve to the entry.
-const AGENT_REGISTRY: Array<{ id: string; match: RegExp; spec: AgentResumeSpec }> = [
+// How an agent takes an initial prompt on the command line: as a trailing
+// positional (`claude "prompt"`) or behind a flag (`opencode --prompt "…"`,
+// `aider -m "…"`). Absent ⇒ the agent has no launch-prompt argument and the
+// New Session prompt box is hidden for it.
+type AgentPromptArg =
+  | { style: "positional" }
+  | { style: "flag"; flag: string };
+// How to hand an agent the "drive the Fresh editor from the shell" system
+// prompt when "Teach Fresh CLI" is on: either appended to launch argv behind a
+// flag (`claude --append-system-prompt "…"`), or written into a file the agent
+// reads at startup (`AGENTS.md` for codex/opencode). Absent ⇒ the agent has no
+// autonomous shell to drive the editor with, so the checkbox stays hidden.
+type AgentSystemPrompt =
+  | { via: "flag"; flag: string }
+  | { via: "file"; path: string };
+interface AgentEntry {
+  // The command the New Session dropdown fills in and the basename the matcher
+  // keys on.
+  id: string;
+  // Human label for the preset button. Falls back to `id` when omitted.
+  label?: string;
+  // Resolves a path/args form (e.g. `/usr/bin/claude --foo`) to this entry.
+  match: RegExp;
+  // Resume strategy across editor restarts (see `resolveAgentLaunch`).
+  spec: AgentResumeSpec;
+  // Flag(s) enabling the agent's "auto"/bypass-approvals mode. Absent ⇒ the
+  // agent has no such flag (opencode gates this via config, not a flag), so the
+  // "Auto mode" checkbox is hidden for it.
+  auto?: string[];
+  // How the agent accepts an initial prompt at launch. Absent ⇒ no prompt box.
+  prompt?: AgentPromptArg;
+  // How to inject the "drive the Fresh editor" system prompt when the user
+  // enables "Teach Fresh CLI". Absent ⇒ the agent has no autonomous shell to
+  // drive the editor (aider), so the checkbox stays hidden for it.
+  systemPrompt?: AgentSystemPrompt;
+}
+// The four launcher-priority agents come first (claude, codex, opencode), then
+// the long-standing aider entry. Order here drives the preset-row order.
+const AGENT_REGISTRY: AgentEntry[] = [
   {
     // Claude Code CLI: `--session-id <uuid>` pins the session at launch;
     // `--resume <uuid>` rejoins it; `--continue` resumes the latest in cwd.
     id: "claude",
+    label: "claude",
     match: /^claude$/,
     spec: {
       provision: { idFlag: "--session-id", resumeArgs: ["--resume", "{id}"] },
       continue: { resumeArgs: ["--continue"] },
     },
+    // "Auto mode" = `--permission-mode auto`: the safe-autonomous mode (a
+    // classifier vets actions before they run) — deliberately NOT
+    // `--dangerously-skip-permissions` (which is `bypassPermissions`, the
+    // unchecked maximal bypass, reserved for isolated containers).
+    auto: ["--permission-mode", "auto"],
+    prompt: { style: "positional" },
+    systemPrompt: { via: "flag", flag: "--append-system-prompt" },
+  },
+  {
+    // OpenAI Codex CLI: resume is a *subcommand*, not a flag — `codex resume
+    // --last` rejoins the latest session in the cwd. There's no launch-time
+    // session-id to pin, so it's continue-only.
+    //
+    // Auto mode: `--full-auto` was REMOVED from the root command (recent Codex
+    // rejects `codex --full-auto` outright; it survives only under `codex exec`
+    // as a deprecation warning that redirects to `--sandbox workspace-write`).
+    // The current no-prompt, self-approving posture is the pair
+    // `--sandbox workspace-write --ask-for-approval never`: Codex runs
+    // model-proposed commands itself inside the workspace-write sandbox and
+    // never stops to ask — deliberately NOT `-s danger-full-access` nor the
+    // `--dangerously-bypass-approvals-and-sandbox` full bypass. Both flags are
+    // accepted on the root command AND on the `resume` subcommand, so they ride
+    // launch and resume alike. The initial prompt is a trailing positional
+    // (`codex "…"`).
+    id: "codex",
+    label: "codex",
+    match: /^codex$/,
+    spec: { continue: { resumeArgs: ["resume", "--last"] } },
+    auto: ["--sandbox", "workspace-write", "--ask-for-approval", "never"],
+    prompt: { style: "positional" },
+    systemPrompt: { via: "file", path: "AGENTS.md" },
+  },
+  {
+    // opencode (SST): `--continue` resumes the latest session in the cwd.
+    // "Auto"/YOLO mode is config-driven (permissions in opencode.json), so it
+    // has no launch flag — the checkbox is hidden. `--prompt` pre-seeds the TUI.
+    id: "opencode",
+    label: "opencode",
+    match: /^opencode$/,
+    spec: { continue: { resumeArgs: ["--continue"] } },
+    prompt: { style: "flag", flag: "--prompt" },
+    systemPrompt: { via: "file", path: "AGENTS.md" },
   },
   {
     // aider keeps its conversation in the repo and reloads it with
     // `--restore-chat-history`; it has no caller-supplied session id, so it's
-    // a continue-only (strategy B) agent.
+    // a continue-only (strategy B) agent. `--yes-always` auto-confirms; `-m`
+    // hands it a message.
     id: "aider",
+    label: "aider",
     match: /^aider$/,
     spec: { continue: { resumeArgs: ["--restore-chat-history"] } },
+    auto: ["--yes-always"],
+    prompt: { style: "flag", flag: "-m" },
   },
 ];
+
+// Command ids the workspace's capability token is minted for. Conservative and
+// safe: these two back the `fresh --cmd split` alias, letting a process in the
+// workspace split its own view without exposing the full command surface.
+// Passed to the host as `commandAllowlist` on *every* workspace creation, which
+// binds the minted `FRESH_CMD_TOKEN` to exactly these ids on the new window —
+// the token is always present; the "Teach Fresh CLI" toggle only controls
+// whether the agent is *told* about it (the system-prompt injection).
+const FRESH_CLI_DEFAULT_ALLOWLIST = ["split_vertical", "split_horizontal"];
+
+// System prompt injected (via flag or AGENTS.md) when "Teach Fresh CLI" is on.
+// Teaches the agent the verbatim `fresh` CLI verbs it can drive the editor
+// with. Keep the command strings exact — they're the agent's only reference.
+const FRESH_CLI_SYSTEM_PROMPT = [
+  "You are running inside a Fresh editor workspace and can control it from the shell via the `fresh` CLI.",
+  "Always invoke it through the `$FRESH_BIN` environment variable — it points at the exact editor binary running this workspace, so its `--cmd` verbs and `--help` match this build (never rely on a bare `fresh` from PATH, which may be a different version).",
+  'Discover what you can do: `"$FRESH_BIN" --cmd cmd list --json` (lists the commands you\'re allowed to run in this workspace).',
+  'Run one: `"$FRESH_BIN" --cmd cmd run <id>` (e.g. `"$FRESH_BIN" --cmd cmd run split_vertical`), or the shortcut `"$FRESH_BIN" --cmd split --vertical`.',
+  'Open a file in this workspace: `"$FRESH_BIN" <path>` (this blocks until you close the file, so use it for hand-offs, not quick peeks).',
+  'Open another project as a new workspace: `"$FRESH_BIN" --cmd workspace new <dir>`.',
+  "These commands act only on the current workspace.",
+].join("\n");
+
+// Marker wrapping the injected block so an existing user file (codex/opencode
+// `AGENTS.md`) is amended, never clobbered, and a retry/recovery run stays
+// idempotent (the block is added at most once).
+const FRESH_CLI_BLOCK_START = "<!-- fresh-cli:start -->";
+const FRESH_CLI_BLOCK_END = "<!-- fresh-cli:end -->";
+
+// Write (or append) the Fresh CLI system prompt into an agent-read file
+// (`AGENTS.md`). If the file already exists, append a clearly-marked block
+// rather than overwriting the user's content; otherwise create it fresh.
+function writeFreshCliPromptFile(path: string): void {
+  const block = `${FRESH_CLI_BLOCK_START}\n${FRESH_CLI_SYSTEM_PROMPT}\n${FRESH_CLI_BLOCK_END}\n`;
+  if (editor.fileExists(editor.localPath(path))) {
+    const existing = editor.readFile(editor.localPath(path)) ?? "";
+    // Idempotent on retry / restart-recovery: never stack duplicate blocks.
+    if (existing.includes(FRESH_CLI_BLOCK_START)) return;
+    const sep = existing.length === 0 || existing.endsWith("\n") ? "\n" : "\n\n";
+    editor.writeFile(editor.localPath(path), existing + sep + block);
+  } else {
+    editor.writeFile(editor.localPath(path), block);
+  }
+}
+
+// The registry entry a typed command resolves to (by argv0 basename), or null
+// for a bare terminal / unknown command. Drives which agent-only controls
+// (Auto mode, Start prompt) the form surfaces.
+function agentEntryForCmd(cmd: string): AgentEntry | null {
+  const argv = splitAgentCmd(cmd);
+  if (argv.length === 0) return null;
+  const base = editor.pathBasename(argv[0]) || argv[0];
+  return AGENT_REGISTRY.find((e) => e.match.test(base)) ?? null;
+}
+
+// The agent (if any) the form's current command resolves to.
+function activeAgentEntry(): AgentEntry | null {
+  return form ? agentEntryForCmd(form.cmd.value) : null;
+}
+
+// Build the argv fragment that hands `prompt` to an agent per its prompt style.
+function agentPromptArgs(spec: AgentPromptArg, prompt: string): string[] {
+  return spec.style === "flag" ? [spec.flag, prompt] : [prompt];
+}
 
 // Presets for the New Session "Agent Command" dropdown: the plain shell
 // (default), every registry agent (which a restart will resume), and a
@@ -5861,7 +6104,7 @@ function agentPresets(): AgentPreset[] {
   ];
   for (const e of AGENT_REGISTRY) {
     presets.push({
-      label: e.id,
+      label: e.label ?? e.id,
       cmd: e.id,
       key: `agent-preset-${e.id}`,
       resumes: true,
@@ -5892,7 +6135,10 @@ function activeAgentPresetKey(): string {
 function applyAgentPreset(p: AgentPreset): void {
   if (!form) return;
   if (p.custom) {
-    // Hand focus to the free-text field so the user can type a command.
+    // Hand focus to the free-text command field so the user can type. On local
+    // that field lives under Advanced, so expand the fold first; otherwise the
+    // `cmd` key isn't in the focus cycle and the setFocusKey would be dropped.
+    if (form.backend === "local") form.advancedExpanded = true;
     // Focus must be set *after* the re-render — re-mounting the spec resets
     // host focus, which would otherwise clobber the setFocusKey.
     renderForm();
@@ -5906,25 +6152,6 @@ function applyAgentPreset(p: AgentPreset): void {
   // it (re-rendering the spec alone won't change an already-mounted input).
   formPanel?.setValue("cmd", form.cmd.value, form.cmd.cursor);
   renderForm();
-}
-
-// ←/→ over the agent dropdown (mirrors the "Run in:" tabs' switchTabIfFocused):
-// when focus sits on a preset button, arrows move the selection and apply it.
-// Returns true if it consumed the key.
-function switchAgentIfFocused(delta: 1 | -1): boolean {
-  if (!form) return false;
-  const presets = agentPresets();
-  const idx = presets.findIndex((p) => p.key === formFocusedKey());
-  if (idx < 0) return false;
-  const next = (idx + delta + presets.length) % presets.length;
-  const target = presets[next];
-  applyAgentPreset(target);
-  // Keep focus on the row (unless the choice moved it to the text field).
-  if (!target.custom) {
-    formPanel?.setFocusKey(target.key);
-    snapFormFocusTo(target.key);
-  }
-  return true;
 }
 
 // A v4-style unique id for an agent session handle. Not security-sensitive
@@ -5951,24 +6178,52 @@ function agentSessionUuid(): string {
 // agents) pass through unchanged with no resume — i.e. today's behaviour.
 function resolveAgentLaunch(
   argv: string[],
+  opts?: { auto?: boolean; prompt?: string; systemPrompt?: string },
 ): { launch: string[]; resume?: string[] } {
   if (argv.length === 0) return { launch: argv };
   const argv0 = argv[0];
   const base = editor.pathBasename(argv0) || argv0;
   const entry = AGENT_REGISTRY.find((e) => e.match.test(base));
+  // Unknown command (a plain shell / custom binary): pass through untouched.
+  // Auto mode and the start prompt are agent-registry features, so there's
+  // nothing to inject here.
   if (!entry) return { launch: argv };
+
+  // Auto-mode flags ride on *both* launch and resume — a resumed session
+  // keeps the approval posture the user chose. Prompt is launch-only: it seeds
+  // the first turn and must never be replayed when rejoining the conversation.
+  const autoArgs = opts?.auto && entry.auto ? entry.auto : [];
+  const prompt = (opts?.prompt ?? "").trim();
+  const promptArgs = prompt && entry.prompt
+    ? agentPromptArgs(entry.prompt, prompt)
+    : [];
+  // "Teach Fresh CLI" for a flag-style agent (claude) rides launch only —
+  // like the start prompt, it seeds the first turn and must not replay on
+  // resume. File-style agents (codex/opencode) get the text written into a
+  // file instead, so they never reach here.
+  const sysPrompt = (opts?.systemPrompt ?? "").trim();
+  const sysPromptArgs = sysPrompt && entry.systemPrompt?.via === "flag"
+    ? [entry.systemPrompt.flag, sysPrompt]
+    : [];
+  // Flags first (auto + system prompt), then the (trailing) positional prompt
+  // so a positional start-prompt stays last.
+  const withAuto = [...argv, ...autoArgs, ...sysPromptArgs];
+
   if (entry.spec.provision) {
     const id = agentSessionUuid();
     const { idFlag, resumeArgs } = entry.spec.provision;
     return {
-      launch: [...argv, idFlag, id],
-      resume: [argv0, ...resumeArgs.map((a) => a.replace("{id}", id))],
+      launch: [...withAuto, idFlag, id, ...promptArgs],
+      resume: [argv0, ...resumeArgs.map((a) => a.replace("{id}", id)), ...autoArgs],
     };
   }
   if (entry.spec.continue) {
-    return { launch: argv, resume: [argv0, ...entry.spec.continue.resumeArgs] };
+    return {
+      launch: [...withAuto, ...promptArgs],
+      resume: [argv0, ...entry.spec.continue.resumeArgs, ...autoArgs],
+    };
   }
-  return { launch: argv };
+  return { launch: [...withAuto, ...promptArgs] };
 }
 
 async function spawnCollect(
@@ -6330,40 +6585,85 @@ function backendTabsRow(): WidgetSpec {
 // that out — so a user discovers both that `claude` is an option and that it
 // gets special session handling. The resume tag only shows for the local
 // backend, the one where resume is wired today.
+// Agent selector: a single dropdown of the preset labels (terminal, the
+// known agents, custom…). ←/→ or ↑/↓ over it cycles; the change event maps
+// the chosen index back to a preset and applies it (fills the command field).
 function agentPresetRow(): WidgetSpec {
-  const showsResume = !form || form.backend === "local";
+  const presets = agentPresets();
   const activeKey = activeAgentPresetKey();
-  const parts: WidgetSpec[] = [
-    {
-      kind: "raw",
-      entries: [styledRow([{ text: editor.t("form.agent"), style: { fg: "ui.menu_disabled_fg" } }])],
-    },
-  ];
-  for (const p of agentPresets()) {
-    parts.push(spacer(1));
-    const label = p.resumes && showsResume ? editor.t("form.agent_resume_tag", { label: p.label }) : p.label;
-    // Only the active preset is a Tab stop; ←/→ chooses within the
-    // group (matches the "Run in:" tabs).
-    parts.push(button(label, {
-      key: p.key,
-      intent: p.key === activeKey ? "primary" : undefined,
-      focusable: p.key === activeKey,
-    }));
-  }
-  parts.push(flexSpacer());
-  const hint = showsResume ? editor.t("form.agent_hint_resume") : editor.t("form.agent_hint");
-  parts.push({
-    kind: "raw",
-    entries: [styledRow([{ text: hint, style: { fg: "ui.menu_disabled_fg", italic: true } }])],
+  const selectedIndex = Math.max(0, presets.findIndex((p) => p.key === activeKey));
+  return dropdown(presets.map((p) => p.label), {
+    selectedIndex,
+    // Strip the trailing colon from the shared "Agent:" label — the dropdown
+    // widget adds its own separator, so the raw string renders "Agent::".
+    label: editor.t("form.agent").replace(/:\s*$/, ""),
+    key: "agent_dropdown",
   });
-  return row(...parts);
 }
 
-// Local backend: Project Path + worktree toggle + linked-worktree hint.
+// Agent-specific controls shown below the Agent Command field: a "Start
+// prompt" box (for agents that take a launch prompt) and an "Auto mode"
+// checkbox (for agents with a bypass-approvals flag). Both are local-only —
+// remote backends don't route through `resolveAgentLaunch` — and adapt to the
+// resolved agent: a bare terminal / unknown command shows neither, opencode
+// shows only the prompt (no auto flag), etc.
+// "Agent Command" text input — the raw command the workspace launches. The
+// agent dropdown fills it, so it's a power-user override: folded into Advanced
+// on the local backend, shown inline on remote backends (no Advanced fold).
+function cmdField(): WidgetSpec {
+  return labeledSection({
+    label: editor.t("form.agent_command"),
+    child: text({
+      value: form!.cmd.value,
+      cursorByte: form!.cmd.cursor,
+      // Clearing the field falls back to the backend default: a bare local
+      // terminal (the host resolves `$SHELL`), or — for SSH — letting ssh
+      // spawn the remote login shell. The placeholder names that default.
+      placeholder: form!.backend === "ssh"
+        ? editor.t("form.cmd_placeholder_ssh")
+        : editor.t("form.agent_terminal"),
+      fullWidth: true,
+      key: "cmd",
+    }),
+  });
+}
+
+function agentOptionsFields(): WidgetSpec[] {
+  if (!form || form.backend !== "local") return [];
+  const entry = activeAgentEntry();
+  if (!entry) return [];
+  const fields: WidgetSpec[] = [];
+  if (entry.auto) {
+    fields.push(
+      toggle(form.autoMode, editor.t("form.auto_mode"), { key: "auto_mode" }),
+    );
+  }
+  // "Teach Fresh CLI" lives under the Advanced fold (see `advancedSection`),
+  // so it stays hidden by default even though it's enabled by default.
+  if (entry.prompt) {
+    fields.push(
+      labeledSection({
+        label: editor.t("form.start_prompt"),
+        child: text({
+          value: form.startPrompt.value,
+          cursorByte: form.startPrompt.cursor,
+          placeholder: editor.t("form.start_prompt_placeholder"),
+          fullWidth: true,
+          // Single-line to stay consistent with the form's keyboard model
+          // (Enter advances focus, Ctrl+Enter submits); the whole prompt is
+          // handed to the agent as one launch argument.
+          key: "start_prompt",
+        }),
+      }),
+    );
+  }
+  return fields;
+}
+
+// Local backend: Project Path + linked-worktree hint. The worktree toggle
+// and branch fields moved into the collapsible `advancedSection()`.
 function localBodyFields(): WidgetSpec[] {
   if (!form) return [];
-  const worktreeEnabled = form.projectPathIsGit !== false;
-  const effectiveCreateWorktree = worktreeEnabled && form.createWorktree;
   const fields: WidgetSpec[] = [
     labeledSection({
       label: editor.t("form.project_path"),
@@ -6381,25 +6681,6 @@ function localBodyFields(): WidgetSpec[] {
         key: "project_path",
       }),
     }),
-    worktreeEnabled
-      ? toggle(effectiveCreateWorktree, editor.t("form.create_worktree"), {
-          key: "worktree",
-        })
-      : {
-          kind: "raw",
-          entries: [
-            styledRow([
-              {
-                text: editor.t("form.create_worktree_disabled"),
-                style: { fg: "editor.whitespace_indicator_fg" },
-              },
-              {
-                text: editor.t("form.disabled_non_git"),
-                style: { fg: "editor.whitespace_indicator_fg", italic: true },
-              },
-            ]),
-          ],
-        },
   ];
   if (form.projectPathIsLinkedWorktree === true) {
     fields.push({
@@ -6419,20 +6700,77 @@ function localBodyFields(): WidgetSpec[] {
   return fields;
 }
 
-// Local-only Branch field — the fork point for `git worktree add`.
-function localBranchSection(): WidgetSpec {
-  const worktreeEnabled = !!form && form.projectPathIsGit !== false;
-  const effectiveCreateWorktree = !!form && worktreeEnabled && form.createWorktree;
-  const branchInert = !effectiveCreateWorktree;
+// Collapsible "Advanced…" section (local backend). Collapsed → just the
+// clickable header. Expanded → header + the worktree toggle (moved out of the
+// always-visible body) + the "Checkout branch" and "New branch name" fields.
+// Keeping these behind a fold keeps the common case (accept the defaults)
+// compact while still exposing full git control.
+function advancedSection(): WidgetSpec[] {
+  if (!form) return [];
+  const expanded = form.advancedExpanded;
+  // Disclosure triangles (▶ collapsed / ▼ expanded), deliberately NOT the
+  // focus caret `▸`: reusing that glyph would make the fold header read as a
+  // second focused control (both to a user scanning for the caret and to the
+  // e2e focus-model assertions that require exactly one `▸` on screen).
+  const header = button(
+    `${expanded ? "▼" : "▶"} ${editor.t("form.advanced")}`,
+    { key: "advanced_toggle" },
+  );
+  if (!expanded) return [header];
+
+  const worktreeEnabled = form.projectPathIsGit !== false;
+  const effectiveCreateWorktree = worktreeEnabled && form.createWorktree;
+  const fields: WidgetSpec[] = [header];
+
+  // "Agent Command" — the raw launch command. The agent dropdown fills it, so
+  // it lives here as a power-user override rather than cluttering the body.
+  fields.push(cmdField());
+
+  // "Teach Fresh CLI" — enabled by default, but folded away here so it doesn't
+  // clutter the common case. Only meaningful for an agent with a systemPrompt
+  // injection strategy (a bare terminal / unknown command can't be "taught").
+  if (activeAgentEntry()?.systemPrompt) {
+    fields.push(
+      toggle(form.teachFreshCli, editor.t("form.teach_fresh_cli"), {
+        key: "teach_fresh_cli",
+      }),
+    );
+  }
+
+  // Worktree toggle: a checkbox on a git path, else a disabled hint.
+  fields.push(
+    worktreeEnabled
+      ? toggle(effectiveCreateWorktree, editor.t("form.create_worktree"), {
+          key: "worktree",
+        })
+      : {
+          kind: "raw",
+          entries: [
+            styledRow([
+              {
+                text: editor.t("form.create_worktree_disabled"),
+                style: { fg: "editor.whitespace_indicator_fg" },
+              },
+              {
+                text: editor.t("form.disabled_non_git"),
+                style: { fg: "editor.whitespace_indicator_fg", italic: true },
+              },
+            ]),
+          ],
+        },
+  );
+
+  // "Checkout branch" — an existing branch to check out. Editable for ANY git
+  // path (inert only on a non-git path): with a worktree it's the base the
+  // worktree is cut from / checked out to; without one it drives an in-place
+  // `git checkout` in the project dir. The placeholder reflects which.
+  const branchInert = !worktreeEnabled;
   let branchPlaceholder: string;
-  if (!form) {
-    branchPlaceholder = "";
-  } else if (branchInert) {
-    branchPlaceholder = !worktreeEnabled
-      ? editor.t("form.branch_no_git")
-      : form.projectPathIsLinkedWorktree === true
-      ? editor.t("form.branch_existing_worktree")
-      : editor.t("form.branch_shared_worktree");
+  if (!worktreeEnabled) {
+    branchPlaceholder = editor.t("form.branch_no_git");
+  } else if (!effectiveCreateWorktree) {
+    // In-place checkout: blank keeps the current branch.
+    branchPlaceholder = editor.t("form.branch_checkout_inplace");
   } else if (!form.defaultBranch) {
     branchPlaceholder = editor.t("form.detecting_default_branch");
   } else if (form.defaultBranchIsHeadFallback) {
@@ -6440,16 +6778,38 @@ function localBranchSection(): WidgetSpec {
   } else {
     branchPlaceholder = form.defaultBranch;
   }
-  return labeledSection({
-    label: editor.t("form.branch"),
-    child: text({
-      value: form ? form.branch.value : "",
-      cursorByte: form ? form.branch.cursor : 0,
-      placeholder: branchPlaceholder,
-      fullWidth: true,
-      key: branchInert ? undefined : "branch",
+  fields.push(
+    labeledSection({
+      label: editor.t("form.checkout_branch"),
+      child: text({
+        value: form.branch.value,
+        cursorByte: form.branch.cursor,
+        placeholder: branchPlaceholder,
+        fullWidth: true,
+        key: branchInert ? undefined : "branch",
+      }),
     }),
-  });
+  );
+
+  // "New branch name" — creates the worktree on a freshly-cut branch. Only
+  // meaningful when a worktree is being created (there's no isolated tree to
+  // safely branch into in-place), so it's inert otherwise.
+  fields.push(
+    labeledSection({
+      label: editor.t("form.new_branch"),
+      child: text({
+        value: form.newBranch.value,
+        cursorByte: form.newBranch.cursor,
+        placeholder: effectiveCreateWorktree
+          ? ""
+          : editor.t("form.new_branch_worktree_only"),
+        fullWidth: true,
+        key: effectiveCreateWorktree ? "new_branch" : undefined,
+      }),
+    }),
+  );
+
+  return fields;
 }
 
 // Devcontainer backend: a Project Path that contains a `.devcontainer/`.
@@ -6684,6 +7044,25 @@ function buildConnectingView(): WidgetSpec {
   );
 }
 
+// Whether the form has enough input to create: the per-backend minimum
+// required field. Gates the Create buttons (rendered disabled otherwise) and
+// guards the submit paths so an empty form can't be submitted via Enter.
+function formIsSubmittable(): boolean {
+  if (!form) return false;
+  switch (form.backend) {
+    case "local":
+    case "devcontainer":
+      return !!(form.projectPath.value.trim() || form.defaultProjectPath);
+    case "ssh":
+      return form.sshHost.value.trim().length > 0;
+    case "kubernetes":
+      return (
+        form.k8sTarget.value.trim().length > 0 ||
+        form.k8sPod.value.trim().length > 0
+      );
+  }
+}
+
 function buildFormSpec(): WidgetSpec {
   if (!form) return col();
   // Disabled/connecting state: read-only summary + Cancel-only (item 3).
@@ -6717,25 +7096,17 @@ function buildFormSpec(): WidgetSpec {
       }),
     }),
     agentPresetRow(),
-    labeledSection({
-      label: editor.t("form.agent_command"),
-      child: text({
-        value: form.cmd.value,
-        cursorByte: form.cmd.cursor,
-        // Clearing the field falls back to the backend default: a bare local
-        // terminal (the host resolves `$SHELL`), or — for SSH — letting ssh
-        // spawn the remote login shell. The placeholder names that default.
-        placeholder: form.backend === "ssh"
-          ? editor.t("form.cmd_placeholder_ssh")
-          : editor.t("form.agent_terminal"),
-        fullWidth: true,
-        key: "cmd",
-      }),
-    }),
+    // On remote backends the command box stays inline (no Advanced fold to hold
+    // it); on local it moves into Advanced (appended in `advancedSection`).
+    ...(form.backend === "local" ? [] : [cmdField()]),
+    // Agent-specific controls (Auto mode / Start prompt), adaptive to the
+    // resolved agent. Empty for a bare terminal / unknown command.
+    ...agentOptionsFields(),
   ];
-  // Branch is local-only (the fork point for `git worktree add`).
+  // Worktree + branch controls are local-only and live behind the
+  // collapsible "Advanced…" fold.
   if (form.backend === "local") {
-    children.push(localBranchSection());
+    children.push(...advancedSection());
   }
   // Remote backends connect asynchronously and the dialog stays open until the
   // session is real (see `runRemoteAttach`). The in-flight "connecting" state
@@ -6764,11 +7135,20 @@ function buildFormSpec(): WidgetSpec {
     // right edge. The wrap path ignores the leading flex spacer (and
     // trims a blank that would lead a line), so the pair left-packs.
     wrappingRow(
+      button(editor.t("form.btn_create"), {
+        intent: "primary",
+        key: "create-visit",
+        disabled: !formIsSubmittable(),
+        focusable: true,
+      }),
+      spacer(2),
+      button(editor.t("form.btn_create_bg"), {
+        key: "create-bg",
+        disabled: !formIsSubmittable(),
+        focusable: true,
+      }),
+      spacer(2),
       button(editor.t("form.btn_cancel"), { intent: "danger", key: "cancel" }),
-      spacer(2),
-      button(editor.t("form.btn_create_visit"), { intent: "primary", key: "create-visit" }),
-      spacer(2),
-      button(editor.t("form.btn_create_bg"), { key: "create-bg" }),
     ),
     spacer(0),
     // === Footer: keybinding helper, centered. ====================
@@ -6836,7 +7216,15 @@ function openForm(options?: { fromPicker?: boolean }): void {
     // terminal, or — for SSH — the remote login shell). No hidden
     // "empty means reuse lastCmd" fallback at submit time.
     cmd: { value: lastCmd, cursor: lastCmd.length },
+    startPrompt: { value: "", cursor: 0 },
+    autoMode: false,
+    // Teach the agent the Fresh CLI by default: the capability token is always
+    // minted, so an agent that knows the `fresh` verbs is strictly more useful
+    // out of the box. Only surfaces for agents with a systemPrompt strategy.
+    teachFreshCli: true,
     branch: { value: "", cursor: 0 },
+    newBranch: { value: "", cursor: 0 },
+    advancedExpanded: false,
     // Default checkbox state is `true` (the historical behaviour
     // of "always create a worktree"); the renderer demotes this
     // to `false` automatically when the resolved Project Path is
@@ -7101,7 +7489,7 @@ function computePathCompletions(typed: string): string[] {
     parent = typed.slice(0, slashIdx);
     basename = typed.slice(slashIdx + 1);
   }
-  const entries = editor.readDir(parent);
+  const entries = editor.readDir(editor.localPath(parent));
   const matches = entries
     .filter((e) => !basename || e.name.startsWith(basename))
     .filter((e) => !e.name.startsWith(".") || basename.startsWith("."));
@@ -7279,6 +7667,7 @@ function closeForm(): void {
     formPanel = null;
   }
   form = null;
+  agentDropdownOpen = false;
   editor.setEditorMode(null);
 }
 
@@ -7371,7 +7760,14 @@ function captureCreateSpec(f: NewSessionForm): CaptureResult {
         projectPath,
         name: sessionName,
         cmd,
+        // Only carry agent options for a command that resolves to an agent
+        // that supports them, so a bare terminal / custom command never gets
+        // stray flags or a prompt appended.
+        auto: !!agentEntryForCmd(cmd)?.auto && f.autoMode,
+        startPrompt: agentEntryForCmd(cmd)?.prompt ? f.startPrompt.value.trim() : "",
+        teachFreshCli: !!agentEntryForCmd(cmd)?.systemPrompt && f.teachFreshCli,
         branch: f.branch.value.trim(),
+        newBranch: f.newBranch.value.trim(),
         createWorktree: f.createWorktree,
         displayLabel,
         displayProject: projectPath,
@@ -7656,7 +8052,8 @@ async function runLocalCreate(id: number): Promise<void> {
   if (!s0 || !s0.pending || s0.pending.spec.backend !== "local") return;
   const spec = s0.pending.spec;
   const cmd = spec.cmd;
-  const branchInput = spec.branch;
+  const checkoutBranch = spec.branch;
+  const newBranch = spec.newBranch;
   const projectPath = spec.projectPath;
 
   // Re-probe is-git so we trust the latest filesystem state, not a UI flag.
@@ -7689,44 +8086,132 @@ async function runLocalCreate(id: number): Promise<void> {
 
   // Recovery idempotency: a worktree left on disk by an interrupted run is
   // reused rather than re-added (a re-add would fail and error the row).
-  const rootExists = createWorktree && editor.fileExists(root);
+  const rootExists = createWorktree && editor.fileExists(editor.localPath(root));
   // Whether *this* run put the worktree on disk (vs. reusing an existing one),
   // so a mid-flight dismissal can remove exactly what it created.
   let addedWorktree = false;
   if (createWorktree && !rootExists) {
     setPendingMessage(id, editor.t("dock.pending_adding_worktree"));
     const parent = editor.pathDirname(root);
-    if (!editor.createDir(parent)) {
+    if (!editor.createDir(editor.localPath(parent))) {
       failPending(id, editor.t("err.mkdir_failed", { path: parent }));
       return;
     }
     const defaultBranch = await detectDefaultBranch(repoRoot);
-    const branchName = branchInput || sessionName;
-    // Try `-b <new>` first; if the branch already exists, fall back to
-    // checking out the existing branch into a new worktree.
-    let addRes = await spawnCollect(
-      "git",
-      ["-C", repoRoot, "worktree", "add", root, "-b", branchName, defaultBranch],
-      repoRoot,
-    );
-    if (addRes.exit_code !== 0) {
-      const fallback = await spawnCollect(
+    // Fork point for the new worktree: the explicit checkout branch, or the
+    // detected default when the user left it blank.
+    const base = checkoutBranch || defaultBranch;
+    if (newBranch) {
+      // "New branch name" set: cut a fresh branch off `base`. A pre-existing
+      // branch of that name is a hard error — NO silent fallback to checking
+      // it out (that would put the user on someone else's history).
+      const addRes = await spawnCollect(
         "git",
-        ["-C", repoRoot, "worktree", "add", root, branchName],
+        ["-C", repoRoot, "worktree", "add", root, "-b", newBranch, base],
         repoRoot,
       );
-      if (fallback.exit_code !== 0) {
+      if (addRes.exit_code !== 0) {
+        if (/already exists/i.test(addRes.stderr || "")) {
+          failPending(id, editor.t("err.branch_exists", { branch: newBranch }));
+        } else {
+          failPending(
+            id,
+            lastNonEmptyLine(addRes.stderr) || editor.t("err.worktree_add_failed"),
+          );
+        }
+        return;
+      }
+    } else if (checkoutBranch) {
+      // "Checkout branch" set (no new branch): check that existing branch/ref
+      // out into the new worktree.
+      const addRes = await spawnCollect(
+        "git",
+        ["-C", repoRoot, "worktree", "add", root, checkoutBranch],
+        repoRoot,
+      );
+      if (addRes.exit_code !== 0) {
         failPending(
           id,
-          lastNonEmptyLine(fallback.stderr) ||
-            lastNonEmptyLine(addRes.stderr) ||
-            editor.t("err.worktree_add_failed"),
+          lastNonEmptyLine(addRes.stderr) || editor.t("err.worktree_add_failed"),
         );
         return;
       }
-      addRes = fallback;
+    } else {
+      // Neither field set — today's behaviour: cut `<sessionName>` off the
+      // default branch, falling back to checking out an existing branch of
+      // that name (only for this default case).
+      let addRes = await spawnCollect(
+        "git",
+        ["-C", repoRoot, "worktree", "add", root, "-b", sessionName, defaultBranch],
+        repoRoot,
+      );
+      if (addRes.exit_code !== 0) {
+        const fallback = await spawnCollect(
+          "git",
+          ["-C", repoRoot, "worktree", "add", root, sessionName],
+          repoRoot,
+        );
+        if (fallback.exit_code !== 0) {
+          failPending(
+            id,
+            lastNonEmptyLine(fallback.stderr) ||
+              lastNonEmptyLine(addRes.stderr) ||
+              editor.t("err.worktree_add_failed"),
+          );
+          return;
+        }
+        addRes = fallback;
+      }
     }
     addedWorktree = true;
+  }
+
+  // Non-worktree (in-place) checkout: switch the project's own working tree
+  // to `checkoutBranch`. Refuse unless the tree is clean AND fully pushed —
+  // a checkout here mutates the user's real repo, so we never risk stranding
+  // uncommitted or unpushed work (and never use `-f`). `newBranch` is ignored
+  // in this path.
+  if (!createWorktree && checkoutBranch) {
+    setPendingMessage(id, editor.t("dock.pending_adding_worktree"));
+    const statusRes = await spawnCollect(
+      "git",
+      ["-C", projectPath, "status", "--porcelain"],
+      projectPath,
+    );
+    if ((statusRes.stdout || "").trim().length > 0) {
+      failPending(id, editor.t("err.checkout_unclean"));
+      return;
+    }
+    const upstreamRes = await spawnCollect(
+      "git",
+      ["-C", projectPath, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+      projectPath,
+    );
+    if (upstreamRes.exit_code !== 0) {
+      failPending(id, editor.t("err.checkout_no_upstream"));
+      return;
+    }
+    const unpushedRes = await spawnCollect(
+      "git",
+      ["-C", projectPath, "rev-list", "--count", "@{u}..HEAD"],
+      projectPath,
+    );
+    if (parseInt((unpushedRes.stdout || "0").trim(), 10) > 0) {
+      failPending(id, editor.t("err.checkout_unpushed"));
+      return;
+    }
+    const coRes = await spawnCollect(
+      "git",
+      ["-C", projectPath, "checkout", checkoutBranch],
+      projectPath,
+    );
+    if (coRes.exit_code !== 0) {
+      failPending(
+        id,
+        lastNonEmptyLine(coRes.stderr) || editor.t("err.worktree_add_failed"),
+      );
+      return;
+    }
   }
   if (!orchestratorSessions.get(id)?.pending) {
     // Dismissed while the worktree was being added — remove what we just
@@ -7743,16 +8228,29 @@ async function runLocalCreate(id: number): Promise<void> {
   const isLinkedAttach = attachInfo?.isLinked === true;
   const effectiveProjectPath = isLinkedAttach ? attachInfo!.mainRoot : projectPath;
   const reportedBranch = createWorktree
-    ? (branchInput || sessionName)
-    : (isLinkedAttach ? attachInfo!.branch : "");
+    ? (newBranch || checkoutBranch || sessionName)
+    : (checkoutBranch || (isLinkedAttach ? attachInfo!.branch : ""));
 
   appendHistory("project_path", projectPath);
   appendHistory("name", sessionName);
   if (cmd) appendHistory("cmd", cmd);
   if (createWorktree) appendHistory("branch", reportedBranch);
 
+  // "Teach Fresh CLI": inject the CLI system prompt and (below) mint a
+  // capability token. `via: "file"` writes an AGENTS.md the agent reads at
+  // startup; `via: "flag"` rides the launch argv (resolved just below).
+  const teachEntry = spec.teachFreshCli ? agentEntryForCmd(cmd) : null;
+  const teach = teachEntry?.systemPrompt ?? null;
+  if (teach?.via === "file") {
+    writeFreshCliPromptFile(editor.pathJoin(root, teach.path));
+  }
+
   const argv = splitAgentCmd(cmd);
-  const { launch: launchArgv, resume: resumeArgv } = resolveAgentLaunch(argv);
+  const { launch: launchArgv, resume: resumeArgv } = resolveAgentLaunch(argv, {
+    auto: spec.auto,
+    prompt: spec.startPrompt,
+    systemPrompt: teach?.via === "flag" ? FRESH_CLI_SYSTEM_PROMPT : undefined,
+  });
   const sharedWorktree = !createWorktree && !isLinkedAttach;
 
   // Capture the user's current window so focus can return to it after
@@ -7769,6 +8267,10 @@ async function runLocalCreate(id: number): Promise<void> {
       command: launchArgv.length > 0 ? launchArgv : undefined,
       title: launchArgv.length > 0 ? launchArgv[0] : undefined,
       resume: resumeArgv,
+      // Always mint the capability token bound to this window + allowlist so
+      // `fresh --cmd cmd ...` from inside the workspace is authorised — whether
+      // or not the agent was taught about it. `teach` only gates the prompt.
+      commandAllowlist: FRESH_CLI_DEFAULT_ALLOWLIST,
     });
     const winId = result.windowId;
     // Dismissed during the (awaited) spawn: the window was born and dove in,
@@ -8017,6 +8519,8 @@ async function attachToWorktree(opts: {
       root: opts.root,
       label: opts.label,
       cwd: opts.root,
+      // Always mint the workspace's capability token (see runLocalCreate).
+      commandAllowlist: FRESH_CLI_DEFAULT_ALLOWLIST,
     });
     const id = result.windowId;
     editor.setWindowState("project_path", opts.projectPath);
@@ -8069,6 +8573,312 @@ function startNewSession(): void {
   openForm();
 }
 
+// =============================================================================
+// "Run Agent…" — launch a starting process from an existing session
+// =============================================================================
+
+// A starting process the Run-Agent dialog can launch: a bare terminal plus
+// every registered agent (the same non-custom presets the New-Workspace
+// dropdown lists). `cmd` is the argv the dialogue's Command field would hold.
+interface RunAgentProcess {
+  cmd: string;
+  label: string;
+  entry: AgentEntry | null;
+}
+function runAgentProcesses(): RunAgentProcess[] {
+  const list: RunAgentProcess[] = [
+    { cmd: "", label: editor.t("form.agent_terminal"), entry: null },
+  ];
+  for (const e of AGENT_REGISTRY) {
+    list.push({ cmd: e.id, label: e.label ?? e.id, entry: e });
+  }
+  return list;
+}
+
+// Options a Run-Agent launch carries, mirroring the dialogue's per-agent
+// controls. `auto`/`prompt`/`teachFreshCli` are only honoured for an agent
+// whose registry entry supports each (a bare terminal ignores all three).
+interface RunAgentLaunchOpts {
+  auto: boolean;
+  prompt: string;
+  teachFreshCli: boolean;
+}
+
+// Launch `cmd` as a terminal in the CURRENT window — no new worktree, no new
+// window. Reuses `resolveAgentLaunch` for the argv (session-id pin, auto
+// flags, flag-style system prompt) and mints the same capability token the
+// dialogue does via the extended `createTerminal`, so the agent can drive the
+// editor exactly like a dialogue-launched one. File-style system prompts
+// (codex/opencode `AGENTS.md`) are written into the current cwd.
+async function launchAgentInCurrentWorkspace(
+  cmd: string,
+  opts: RunAgentLaunchOpts,
+): Promise<void> {
+  const trimmedCmd = cmd.trim();
+  const cwd = editor.getCwd();
+  const entry = agentEntryForCmd(trimmedCmd);
+  // "Teach Fresh CLI": inject the CLI system prompt (via flag on launch, or by
+  // writing AGENTS.md for file-style agents). The capability token is minted
+  // regardless (see `commandAllowlist` below) — `teach` only gates the prompt.
+  const teach = opts.teachFreshCli && entry?.systemPrompt ? entry.systemPrompt : null;
+  if (teach?.via === "file") {
+    writeFreshCliPromptFile(editor.pathJoin(cwd, teach.path));
+  }
+  const argv = splitAgentCmd(trimmedCmd);
+  const { launch } = resolveAgentLaunch(argv, {
+    auto: opts.auto,
+    prompt: opts.prompt,
+    systemPrompt: teach?.via === "flag" ? FRESH_CLI_SYSTEM_PROMPT : undefined,
+  });
+  if (trimmedCmd) editor.setGlobalState("orchestrator.last_cmd", trimmedCmd);
+  try {
+    await editor.createTerminal({
+      cwd,
+      command: launch.length > 0 ? launch : undefined,
+      title: launch.length > 0 ? editor.pathBasename(launch[0]) || launch[0] : undefined,
+      // Always mint the capability token bound to THIS window + allowlist, so
+      // `fresh --cmd ...` from inside the terminal is authorised — matching the
+      // dialogue, where the token is always present and only the prompt is
+      // gated by "Teach Fresh CLI".
+      commandAllowlist: FRESH_CLI_DEFAULT_ALLOWLIST,
+      focus: true,
+    });
+  } catch (e) {
+    editor.setStatus(
+      editor.t("status.prefix", { msg: e instanceof Error ? e.message : String(e) }),
+    );
+  }
+}
+
+// Launch `cmd` in a fresh worktree + window — the dialogue's classic path,
+// reached without opening the form. Builds the same `CreateSpec` a default
+// submit would and runs it through `startPendingWorkspace` → `runLocalCreate`.
+async function launchAgentInNewWorkspace(
+  cmd: string,
+  opts: RunAgentLaunchOpts,
+): Promise<void> {
+  const trimmedCmd = cmd.trim();
+  // Resolve the Project Path the way the dialogue's probe does: the active
+  // window's local default, resolved to its canonical repo root when it sits
+  // inside a git tree. `runLocalCreate` re-resolves this itself, so the
+  // worktree fork point is identical either way — this is for the display row.
+  const localDefault = localProjectDefault();
+  const canonical = await resolveCanonicalRepoRoot(localDefault);
+  const projectPath = canonical || localDefault;
+  const entry = agentEntryForCmd(trimmedCmd);
+  startPendingWorkspace(
+    {
+      backend: "local",
+      projectPath,
+      name: "",
+      cmd: trimmedCmd,
+      auto: !!entry?.auto && opts.auto,
+      startPrompt: entry?.prompt ? opts.prompt.trim() : "",
+      teachFreshCli: !!entry?.systemPrompt && opts.teachFreshCli,
+      branch: "",
+      newBranch: "",
+      // A fresh worktree like the dialogue; `runLocalCreate` demotes this to an
+      // in-place open when the project path isn't a git tree.
+      createWorktree: true,
+      displayLabel: editor.pathBasename(projectPath) ||
+        editor.t("dock.pending_default_name"),
+      displayProject: projectPath,
+    },
+    // Land in the new workspace — an explicit "run this agent" reads as "take
+    // me there", matching the dialogue's "Create & Visit".
+    { visit: true },
+  );
+}
+
+// Persist the dialog's current choice (agent + target + auto) so the next open
+// starts where the user left off. The start prompt is deliberately not
+// persisted — it's a per-invocation message, not a setting.
+function saveRunAgentLast(cmd: string, target: RunAgentTarget, auto: boolean): void {
+  editor.setGlobalState(RUN_AGENT_LAST_KEY, { cmd, target, auto });
+}
+
+// The dialog's initial state, seeded from the last-used choice (falling back
+// to a bare terminal in the current workspace).
+function initialRunAgentState(): RunAgentDialogState {
+  const last = editor.getGlobalState(RUN_AGENT_LAST_KEY) as
+    | { cmd?: unknown; target?: unknown; auto?: unknown }
+    | undefined;
+  const procs = runAgentProcesses();
+  const lastCmd = typeof last?.cmd === "string" ? last.cmd : "";
+  const idx = Math.max(0, procs.findIndex((p) => p.cmd === lastCmd));
+  const target: RunAgentTarget = last?.target === "new" ? "new" : "current";
+  return {
+    agentIndex: idx,
+    target,
+    auto: last?.auto === true,
+    prompt: { value: "", cursor: 0 },
+  };
+}
+
+// Open the Run-Agent dialog. No-op if it (or another orchestrator dialog) is
+// already up.
+function openRunAgentDialog(): void {
+  if (runAgentDialog || form || createFolderDialog) return;
+  runAgentDialog = initialRunAgentState();
+  mountRunAgentDialog();
+}
+
+function mountRunAgentDialog(): void {
+  // Yield the dock's keyboard while the dialog owns it (mirrors the
+  // new-session form and the folder dialog).
+  if (openPanel && dockMode) {
+    dockBlurred = true;
+    editor.floatingPanelControl(openPanel.id(), "blur", 0);
+  }
+  runAgentPanel = new FloatingWidgetPanel();
+  runAgentPanel.mount(buildRunAgentSpec(), {
+    widthPct: 55,
+    // A generous cap; both frontends size to the form's real content (the TUI
+    // shrinks to fit, the web modal uses `height:auto`), so this only bounds
+    // the dialog on a very short terminal.
+    heightPct: 60,
+    focusMarker: true,
+    title: `${editor.t("form.header_keyword")} :: ${editor.t("run_agent.title")}`,
+    closable: true,
+  });
+  editor.floatingPanelControl(runAgentPanel.id(), "fullscreen", 1);
+  editor.setEditorMode(RUN_AGENT_MODE);
+  // Land focus on the agent picker so ↑/↓ (with the list open) or Tab flow
+  // naturally from there.
+  runAgentPanel.setFocusKey("run-agent-agent");
+}
+
+// Shared label-column width for the form. Pads every label so the `:`
+// separators and value cells line up in a single column ("Auto mode" is the
+// longest label at 9 cols, so 11 leaves a two-space gutter before the colon).
+const RUN_AGENT_LABEL_WIDTH = 11;
+
+// A blank spacer row — one empty line — used to pad the top/bottom of the form
+// and separate the field groups, per the dialog layout.
+function runAgentBlankRow(): WidgetSpec {
+  return raw([styledRow([{ text: "" }])]);
+}
+
+// The dialog spec: a padded, single-column form — agent picker, target picker,
+// optional Auto-mode toggle (with a muted inline hint) and Start-prompt field
+// (both agent-dependent), then the centered Cancel / Run buttons. Every control
+// shares `RUN_AGENT_LABEL_WIDTH` so their `label :` columns and value cells
+// align; blank rows give the form vertical breathing room.
+function buildRunAgentSpec(): WidgetSpec {
+  const d = runAgentDialog!;
+  const procs = runAgentProcesses();
+  const proc = procs[d.agentIndex] ?? procs[0];
+  const lw = RUN_AGENT_LABEL_WIDTH;
+  const children: WidgetSpec[] = [
+    runAgentBlankRow(),
+    dropdown(procs.map((p) => p.label), {
+      selectedIndex: d.agentIndex,
+      label: editor.t("run_agent.agent_label"),
+      labelWidth: lw,
+      key: "run-agent-agent",
+    }),
+    runAgentBlankRow(),
+    dropdown(
+      [editor.t("run_agent.target_current"), editor.t("run_agent.target_new")],
+      {
+        selectedIndex: d.target === "new" ? 1 : 0,
+        label: editor.t("run_agent.target_label"),
+        labelWidth: lw,
+        key: "run-agent-target",
+      },
+    ),
+  ];
+  // Auto mode: only for an agent that documents a bypass/auto flag. Rendered
+  // form-style (`Auto mode : [v]`) so its chip aligns under the other value
+  // cells, with the rationale as a muted hint trailing the chip.
+  if (proc.entry?.auto) {
+    children.push(
+      runAgentBlankRow(),
+      row(
+        toggle(d.auto, editor.t("run_agent.auto_label"), {
+          labelFirst: true,
+          labelWidth: lw,
+          key: "run-agent-auto",
+        }),
+        raw([
+          styledRow([
+            { text: " (" + editor.t("run_agent.auto_help") + ")", style: { fg: "ui.menu_disabled_fg" } },
+          ]),
+        ]),
+      ),
+    );
+  }
+  // Start prompt: only for an agent that documents a prompt argument. Uses the
+  // text widget's own form label so its bracketed field aligns with the rest.
+  if (proc.entry?.prompt) {
+    children.push(
+      runAgentBlankRow(),
+      text({
+        value: d.prompt.value,
+        cursorByte: d.prompt.cursor,
+        placeholder: editor.t("run_agent.prompt_placeholder"),
+        label: editor.t("run_agent.prompt_label"),
+        labelWidth: lw,
+        fieldWidth: 26,
+        key: "run-agent-prompt",
+      }),
+    );
+  }
+  // Centered Cancel / Run group with a wide gutter, then bottom padding.
+  children.push(
+    runAgentBlankRow(),
+    row(
+      flexSpacer(),
+      button(editor.t("run_agent.btn_cancel"), { intent: "danger", key: "run-agent-cancel" }),
+      spacer(6),
+      button(editor.t("run_agent.btn_run"), { intent: "primary", key: "run-agent-run" }),
+      flexSpacer(),
+    ),
+    runAgentBlankRow(),
+  );
+  return col(...children);
+}
+
+// Commit the dialog: launch the selected process against the chosen target,
+// remember the choice, and close.
+function submitRunAgent(): void {
+  const d = runAgentDialog;
+  if (!d) return;
+  const procs = runAgentProcesses();
+  const proc = procs[d.agentIndex] ?? procs[0];
+  const opts: RunAgentLaunchOpts = {
+    auto: !!proc.entry?.auto && d.auto,
+    prompt: proc.entry?.prompt ? d.prompt.value.trim() : "",
+    // Teach Fresh CLI on by default (matches the dialogue), where supported.
+    teachFreshCli: !!proc.entry?.systemPrompt,
+  };
+  const target = d.target;
+  const cmd = proc.cmd;
+  saveRunAgentLast(cmd, target, d.auto);
+  closeRunAgentDialog();
+  if (target === "current") {
+    void launchAgentInCurrentWorkspace(cmd, opts);
+  } else {
+    void launchAgentInNewWorkspace(cmd, opts);
+  }
+}
+
+// Tear down the dialog and hand keyboard focus back to the dock (if up).
+function closeRunAgentDialog(): void {
+  if (runAgentPanel) {
+    runAgentPanel.unmount();
+    runAgentPanel = null;
+  }
+  runAgentDialog = null;
+  editor.setEditorMode(null);
+  if (openPanel && dockMode) {
+    dockBlurred = false;
+    editor.floatingPanelControl(openPanel.id(), "focus", 0);
+    openPanel.setFocusKey("sessions");
+    refreshOpenDialog();
+  }
+}
+
 // Form key bindings — each delegates to smart-key dispatch on the
 // panel, which routes to the focused widget. `mode_text_input`
 // handles printable input outside this list.
@@ -8113,6 +8923,20 @@ const FOLDER_DIALOG_MODE_BINDINGS: [string, string][] = [
   ["C-Enter", "orchestrator_folder_submit"],
 ];
 editor.defineMode(CREATE_FOLDER_MODE, FOLDER_DIALOG_MODE_BINDINGS, true, true);
+
+// Run-Agent dialog: only Ctrl+Enter is bound (submit from anywhere). Plain
+// Enter, Tab, ↑/↓, Space and Esc all fall through to the panel's default
+// smart-key routing — so Enter opens/commits the focused dropdown or activates
+// the focused button, Tab cycles fields, and Esc closes an open dropdown (then,
+// with nothing open, fires the panel `cancel` event handled in `widget_event`).
+const RUN_AGENT_MODE_BINDINGS: [string, string][] = [
+  ["C-Enter", "orchestrator_run_agent_submit"],
+];
+editor.defineMode(RUN_AGENT_MODE, RUN_AGENT_MODE_BINDINGS, true, true);
+registerHandler("orchestrator_run_agent_submit", () => {
+  if (runAgentDialog) submitRunAgent();
+});
+
 registerHandler("orchestrator_folder_submit", () => {
   if (!createFolderDialog) return;
   // Enter submits from anywhere in the dialog — except on the Cancel
@@ -8159,21 +8983,34 @@ registerHandler("orchestrator_form_key_tab", () => {
 // Visit" (the "In Background" alternative is an explicit button / Enter on it).
 registerHandler("orchestrator_form_submit", () => {
   if (!form) return;
+  // Same gating as the Create buttons: no required input ⇒ no submit.
+  if (!formIsSubmittable()) return;
   void submitForm(true);
 });
 registerHandler("orchestrator_form_key_enter", () => {
-  // When the popup is open, the host's smart-key fires
-  // `completion_dismiss` (plugin syncs local state via that
-  // event) without firing the form's picker-Enter or focus
-  // advance — Enter is "dismiss the popup, stay focused on
-  // the text input". When the popup is closed, Enter falls
-  // through to the host's normal Text-widget Enter (picker
-  // activate or focus advance). On a focus advance, the host
-  // fires a `widget_event { event_type: "focus" }` and the
-  // plugin snaps `formFocusIndex` from that authoritative
-  // signal — see the `focus` branch in the widget_event
-  // handler below.
-  dispatchFormKey("Enter");
+  if (!form || !formPanel) return;
+  // Popup open: keep the existing behaviour — the host's smart-key
+  // dismisses the completion popup and fires `completion_dismiss` (the
+  // plugin syncs local state via that event), staying on the text input.
+  if (completionVisibleForFocused()) {
+    dispatchFormKey("Enter");
+    return;
+  }
+  // Focused Agent dropdown: Enter opens the option pop-over (and, when it's
+  // already open, commits the highlighted option and closes). `activate()` is
+  // a no-op on a Dropdown, so route the raw key to the host's smart-key
+  // dispatch instead — `set_dropdown_open` / the open-list short-circuit
+  // handle both directions. (Mouse click on the `[value ▼]` trigger already
+  // opens it via the host's `dropdown_toggle` hit.)
+  if (formFocusedKey() === "agent_dropdown") {
+    dispatchFormKey("Enter");
+    return;
+  }
+  // Popup closed: Enter must NOT advance focus (Tab / Shift-Tab are the only
+  // field movers). Activate the focused control instead — `activate()` fires
+  // a Button's "activate" event (Create / Cancel / Advanced / the type tabs)
+  // or a Toggle's "toggle", and is a no-op on text inputs and the dropdown.
+  formPanel.command(activate());
 });
 registerHandler(
   "orchestrator_form_key_shift_tab",
@@ -8193,6 +9030,14 @@ registerHandler("orchestrator_form_key_escape", () => {
   // resync happens in the widget_event handler. Only when
   // the popup is already closed does Escape cancel the form.
   if (completionVisibleForFocused()) {
+    dispatchFormKey("Escape");
+    return;
+  }
+  // An open Agent dropdown pop-over swallows the first Escape: route it to
+  // the host's dropdown short-circuit (which closes the list) instead of
+  // cancelling the dialog. A second Escape — now that the list is closed —
+  // falls through to `cancelForm` below.
+  if (agentDropdownOpen && formFocusedKey() === "agent_dropdown") {
     dispatchFormKey("Escape");
     return;
   }
@@ -8217,12 +9062,10 @@ function switchTabIfFocused(delta: 1 | -1): boolean {
 }
 registerHandler("orchestrator_form_key_left", () => {
   if (switchTabIfFocused(-1)) return;
-  if (switchAgentIfFocused(-1)) return;
   dispatchFormKey("Left");
 });
 registerHandler("orchestrator_form_key_right", () => {
   if (switchTabIfFocused(1)) return;
-  if (switchAgentIfFocused(1)) return;
   dispatchFormKey("Right");
 });
 registerHandler("orchestrator_form_key_up", () => {
@@ -8409,6 +9252,65 @@ editor.on("widget_event", (e) => {
     return;
   }
   // ---------------------------------------------------------------------
+  // "Run Agent…" dialog: agent picker, target picker, Auto toggle,
+  // Start-prompt field, Cancel / Run.
+  // ---------------------------------------------------------------------
+  if (runAgentPanel && runAgentDialog && e.panel_id === runAgentPanel.id()) {
+    const d = runAgentDialog;
+    if (e.event_type === "cancel") {
+      // Esc / click-outside: the host already unmounted the panel, so just
+      // drop our handle and refocus the dock.
+      runAgentPanel = null;
+      runAgentDialog = null;
+      editor.setEditorMode(null);
+      if (openPanel && dockMode) {
+        dockBlurred = false;
+        editor.floatingPanelControl(openPanel.id(), "focus", 0);
+        openPanel.setFocusKey("sessions");
+        refreshOpenDialog();
+      }
+      return;
+    }
+    if (e.event_type === "change" && e.widget_key === "run-agent-agent") {
+      const idx = (e.payload as { index?: unknown })?.index;
+      if (typeof idx === "number") {
+        d.agentIndex = idx;
+        // Rebuild: the Auto toggle and Start-prompt field appear/disappear
+        // with the selected agent's capabilities.
+        runAgentPanel.update(buildRunAgentSpec());
+      }
+      return;
+    }
+    if (e.event_type === "change" && e.widget_key === "run-agent-target") {
+      const idx = (e.payload as { index?: unknown })?.index;
+      if (typeof idx === "number") d.target = idx === 1 ? "new" : "current";
+      return;
+    }
+    if (e.event_type === "change" && e.widget_key === "run-agent-prompt") {
+      const payload = (e.payload ?? {}) as Record<string, unknown>;
+      if (typeof payload.value === "string") d.prompt.value = payload.value;
+      if (typeof payload.cursorByte === "number") d.prompt.cursor = payload.cursorByte;
+      return;
+    }
+    if (e.event_type === "toggle" && e.widget_key === "run-agent-auto") {
+      const checked = (e.payload as { checked?: unknown })?.checked;
+      d.auto = typeof checked === "boolean" ? checked : !d.auto;
+      // Rebuild so the checkbox glyph reflects the new state (the toggle's
+      // visual comes from the spec, like the folder dialog's checkbox).
+      runAgentPanel.update(buildRunAgentSpec());
+      return;
+    }
+    if (e.event_type === "activate" && e.widget_key === "run-agent-cancel") {
+      closeRunAgentDialog();
+      return;
+    }
+    if (e.event_type === "activate" && e.widget_key === "run-agent-run") {
+      submitRunAgent();
+      return;
+    }
+    return;
+  }
+  // ---------------------------------------------------------------------
   // Dock session context menu (right-click): Visit / Archive / Delete.
   // ---------------------------------------------------------------------
   if (dockMenuPanel && dockMenuState && e.panel_id === dockMenuPanel.id()) {
@@ -8525,6 +9427,32 @@ editor.on("widget_event", (e) => {
       // that mirror from the authoritative signal here so the
       // plugin never has to predict host-side focus rules.
       snapFormFocusTo(e.widget_key);
+      // Leaving the Agent dropdown (Tab / click elsewhere) closes its
+      // pop-over host-side; keep the local mirror honest.
+      if (e.widget_key !== "agent_dropdown") agentDropdownOpen = false;
+      return;
+    }
+    if (e.event_type === "dropdown_open" && e.widget_key === "agent_dropdown") {
+      // Host-authoritative open/closed signal for the option pop-over.
+      const payload = (e.payload ?? {}) as Record<string, unknown>;
+      agentDropdownOpen = payload.open === true;
+      return;
+    }
+    if (e.event_type === "change" && e.widget_key === "agent_dropdown") {
+      // Agent selector: the host reports the newly-selected option index
+      // (`payload.index`, verified against `handle_widget_dropdown_cycle`).
+      // Map it back to a preset and apply it (fills the command field / hands
+      // focus to it for "custom…"), then relay out the Tab cycle.
+      const payload = (e.payload ?? {}) as Record<string, unknown>;
+      const index = payload.index;
+      if (typeof index === "number") {
+        const presets = agentPresets();
+        const preset = presets[index];
+        if (preset) {
+          applyAgentPreset(preset);
+          rebuildFormFocusCycle();
+        }
+      }
       return;
     }
     if (e.event_type === "change") {
@@ -8539,8 +9467,12 @@ editor.on("widget_event", (e) => {
         ? form.name
         : field === "cmd"
         ? form.cmd
+        : field === "start_prompt"
+        ? form.startPrompt
         : field === "branch"
         ? form.branch
+        : field === "new_branch"
+        ? form.newBranch
         : field === "ssh_host"
         ? form.sshHost
         : field === "ssh_path"
@@ -8575,6 +9507,9 @@ editor.on("widget_event", (e) => {
       if (field === "project_path") {
         scheduleProjectPathReprobe();
         scheduleCompletionRefresh("project_path");
+        // Re-render so the Create gating (which keys off the project path)
+        // updates the disabled state as the user types.
+        renderForm();
       } else if (field === "branch") {
         scheduleCompletionRefresh("branch");
       } else {
@@ -8588,6 +9523,17 @@ editor.on("widget_event", (e) => {
           rebuildFormFocusCycle();
           renderForm();
         }
+        // Editing the command changes which agent it resolves to, and thus
+        // whether the Auto mode / Start prompt controls appear — re-lay-out.
+        if (field === "cmd") {
+          rebuildFormFocusCycle();
+          renderForm();
+        }
+        // The remaining Create-gating fields: re-render so the disabled
+        // state on the Create buttons tracks what the user has typed.
+        if (field === "ssh_host" || field === "k8s_pod") {
+          renderForm();
+        }
       }
       return;
     }
@@ -8598,6 +9544,28 @@ editor.on("widget_event", (e) => {
         form.createWorktree = checked;
       } else {
         form.createWorktree = !form.createWorktree;
+      }
+      renderForm();
+      return;
+    }
+    if (e.event_type === "toggle" && e.widget_key === "auto_mode") {
+      const payload = (e.payload ?? {}) as Record<string, unknown>;
+      const checked = payload.checked;
+      if (typeof checked === "boolean") {
+        form.autoMode = checked;
+      } else {
+        form.autoMode = !form.autoMode;
+      }
+      renderForm();
+      return;
+    }
+    if (e.event_type === "toggle" && e.widget_key === "teach_fresh_cli") {
+      const payload = (e.payload ?? {}) as Record<string, unknown>;
+      const checked = payload.checked;
+      if (typeof checked === "boolean") {
+        form.teachFreshCli = checked;
+      } else {
+        form.teachFreshCli = !form.teachFreshCli;
       }
       renderForm();
       return;
@@ -8639,17 +9607,20 @@ editor.on("widget_event", (e) => {
         }
         return;
       }
-      const preset = agentPresets().find((p) => p.key === e.widget_key);
-      if (preset && form) {
-        // Click on a dropdown choice: fill the command (or, for "custom…",
-        // hand focus to the free-text field). The field stays editable for
-        // arguments / custom agents either way.
-        applyAgentPreset(preset);
+      if (e.widget_key === "advanced_toggle") {
+        // Fold / unfold the Advanced section (worktree + branch fields).
+        form.advancedExpanded = !form.advancedExpanded;
+        rebuildFormFocusCycle();
+        renderForm();
         return;
       }
       if (e.widget_key === "create-visit") {
+        // Gate: a Create with no required input is a no-op (the button is
+        // also rendered disabled, but Enter-on-button could still reach here).
+        if (!formIsSubmittable()) return;
         void submitForm(true);
       } else if (e.widget_key === "create-bg") {
+        if (!formIsSubmittable()) return;
         void submitForm(false);
       } else if (e.widget_key === "cancel") {
         cancelForm();
@@ -9432,6 +10403,20 @@ editor.registerCommand(
   "%cmd.move",
   "%cmd.move_desc",
   "orchestrator_move",
+  null,
+  { terminalBypass: true },
+);
+
+// "Run Agent…" — launch a terminal or agent from an existing session without
+// the full New-Workspace dialogue (see the Run-Agent section above). Named for
+// what it does — start a coding agent — with no "workspace"/"orchestrator" in
+// the label. `terminalBypass` keeps it reachable from a keyboard-focused
+// terminal pane, like the other orchestrator commands.
+registerHandler("orchestrator_run_agent", openRunAgentDialog);
+editor.registerCommand(
+  "%cmd.run_agent",
+  "%cmd.run_agent_desc",
+  "orchestrator_run_agent",
   null,
   { terminalBypass: true },
 );

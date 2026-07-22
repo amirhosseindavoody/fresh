@@ -194,6 +194,24 @@ impl Editor {
     }
 
     pub fn update_plugin_state_snapshot(&mut self) {
+        // Rebuild the per-window filesystem registry so plugin file I/O resolves
+        // against the correct window's authority (or the active one). This runs
+        // on the same cadence as the snapshot, so it captures window
+        // create/close and focus changes without hooking each site.
+        #[cfg(feature = "plugins")]
+        if let Some(registry) = self.plugin_manager.read().unwrap().window_fs_registry() {
+            let active = self.active_window;
+            let entries: Vec<(
+                fresh_core::WindowId,
+                std::sync::Arc<dyn crate::model::filesystem::FileSystem + Send + Sync>,
+            )> = self
+                .windows
+                .iter()
+                .map(|(id, w)| (*id, std::sync::Arc::clone(&w.authority.filesystem)))
+                .collect();
+            registry.rebuild(active, entries);
+        }
+
         let Some(snapshot_handle) = self.plugin_manager.read().unwrap().state_snapshot_handle()
         else {
             return;
@@ -903,10 +921,20 @@ impl Editor {
                 command,
                 title,
                 resume,
+                env,
+                command_allowlist,
                 request_id,
             } => {
                 self.handle_create_window_with_terminal(
-                    root, label, cwd, command, title, resume, request_id,
+                    root,
+                    label,
+                    cwd,
+                    command,
+                    title,
+                    resume,
+                    env,
+                    command_allowlist,
+                    request_id,
                 );
             }
             PluginCommand::SetActiveWindow { id } => {
@@ -1537,10 +1565,22 @@ impl Editor {
                 window_id,
                 command,
                 title,
+                env,
+                command_allowlist,
                 request_id,
             } => {
                 self.handle_create_terminal(
-                    cwd, direction, ratio, focus, persistent, window_id, command, title, request_id,
+                    cwd,
+                    direction,
+                    ratio,
+                    focus,
+                    persistent,
+                    window_id,
+                    command,
+                    title,
+                    env,
+                    command_allowlist,
+                    request_id,
                 );
             }
 
@@ -3745,6 +3785,8 @@ impl Editor {
         command: Option<Vec<String>>,
         title: Option<String>,
         resume: Option<Vec<String>>,
+        env: Option<std::collections::HashMap<String, String>>,
+        command_allowlist: Option<Vec<String>>,
         request_id: u64,
     ) {
         let callback_id = JsCallbackId::from(request_id);
@@ -3777,6 +3819,8 @@ impl Editor {
             title,
             new_authority,
             resume,
+            env,
+            command_allowlist,
         ) {
             Ok((window_id, terminal_id, buffer_id)) => {
                 let api_result = fresh_core::api::SessionWithTerminalResult {
@@ -3800,6 +3844,7 @@ impl Editor {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn handle_create_terminal(
         &mut self,
         cwd: Option<String>,
@@ -3810,6 +3855,8 @@ impl Editor {
         target_session_id: Option<fresh_core::WindowId>,
         command: Option<Vec<String>>,
         title: Option<String>,
+        env: Option<std::collections::HashMap<String, String>>,
+        command_allowlist: Option<Vec<String>>,
         request_id: u64,
     ) {
         // Resolve target window. Explicit `windowId` wins when the
@@ -3842,6 +3889,15 @@ impl Editor {
             None
         };
 
+        // Assemble the extra env injected into the spawned terminal's child:
+        // `FRESH_BIN` plus, when `command_allowlist` is given, a capability
+        // token bound to the TARGET window + that allowlist (with
+        // `FRESH_SESSION`). This is what lets an agent spawned into an
+        // *existing* window drive the editor exactly like one born via
+        // `createWindowWithTerminal` — both paths share the same helper.
+        let terminal_env =
+            crate::app::terminal::agent_command_env(target_id, env, command_allowlist);
+
         let result = {
             let target = self
                 .windows
@@ -3855,6 +3911,7 @@ impl Editor {
                 persistent,
                 command,
                 title: title.filter(|t| !t.is_empty()),
+                env: terminal_env,
             })
         };
         match result {
@@ -4995,6 +5052,9 @@ impl Editor {
             title: if as_dock { None } else { title },
             closable: !as_dock && closable,
             close_button_rect: None,
+            dropdown_popup: None,
+            dropdown_popup_hits: Vec::new(),
+            dropdown_popup_rect: None,
         });
         let prev = std::collections::HashMap::new();
         let prev_focus = String::new();
@@ -5011,6 +5071,7 @@ impl Editor {
         let embeds = out.embeds;
         let overlays = out.overlays;
         let scroll_regions = out.scroll_regions;
+        let dropdown_popup = out.dropdown_popup;
         self.widget_registry.mount(
             panel_key.clone(),
             buffer_id,
@@ -5026,6 +5087,7 @@ impl Editor {
             fwp.embeds = embeds;
             fwp.overlays = overlays;
             fwp.scroll_regions = scroll_regions;
+            fwp.dropdown_popup = dropdown_popup;
         }
         tracing::debug!(
             "Mounted floating widget panel {} ({}%x{}%)",
@@ -5079,6 +5141,7 @@ impl Editor {
         let embeds = out.embeds;
         let overlays = out.overlays;
         let scroll_regions = out.scroll_regions;
+        let dropdown_popup = out.dropdown_popup;
         if self
             .widget_registry
             .update(
@@ -5103,6 +5166,7 @@ impl Editor {
             fwp.embeds = embeds;
             fwp.overlays = overlays;
             fwp.scroll_regions = scroll_regions;
+            fwp.dropdown_popup = dropdown_popup;
         }
     }
 

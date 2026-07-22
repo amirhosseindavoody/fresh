@@ -8,6 +8,19 @@
 // Concatenate a TextPropertyEntry's display text (segments preferred).
 function entryText(e){ return (e.segments&&e.segments.length)?e.segments.map(s=>s.text||"").join(""):(e.text||""); }
 
+// A fixed-width form-label cell ("Agent:") so a column of controls aligns.
+// The width (in ch) is the spec's `labelWidth` — the display-column budget the
+// TUI pads the label to — carried through instead of discarded, so the web can
+// build the same aligned grid. The stylesheet owns the actual look/alignment
+// per theme; trailing pad spaces are trimmed since the width is what aligns.
+function formLabel(text, labelWidth){
+  const l=document.createElement("span");
+  l.className="w-flabel";
+  l.textContent=(text||"").replace(/\s+$/,"")+":";
+  if(labelWidth>0) l.style.setProperty("--flw", labelWidth);
+  return l;
+}
+
 // Route a widget interaction. `ctx.kind` is "toolbar" (prompt toolbar, routed by
 // key) or "panel" (floating/dock, routed by the hit's IDENTITY — widgetKey +
 // eventType + payload — with the recorded hit's index as a legacy tiebreaker).
@@ -92,6 +105,84 @@ function utf16ToByte(s,idx){
   return b;
 }
 
+// A single body-level host for dropdown option lists. Portaling the list OUT
+// of its modal is what lets it never be clipped: a floating modal / the
+// Settings dialog is a `transform`ed, `overflow`-clipping box, so ANY
+// descendant (even `position:fixed`) is clipped to it. As a child of <body>
+// the list has the viewport as its containing block and nothing clips it — the
+// approach every portal-based design system (Radix, MUI, …) uses. The host is
+// 0×0 (its children are all fixed-positioned), so it never intercepts clicks.
+function popoverHost(){
+  let h=document.getElementById("fresh-popover-host");
+  if(!h){ h=document.createElement("div"); h.id="fresh-popover-host"; document.body.appendChild(h); }
+  return h;
+}
+// Mount a dropdown option list into the body-level host, tagged with the region
+// currently rendering (renderRegion sets `popoverRegionOwner`). That region
+// reaps its own tagged pop-overs on its next fill, so the list disappears the
+// moment the dropdown closes and can never leak/accumulate across frames.
+function mountPopover(el){
+  el.dataset.popoverRegion=(typeof popoverRegionOwner!=="undefined"&&popoverRegionOwner)||"";
+  popoverHost().appendChild(el);
+}
+
+// Position a `position:fixed` popover (dropdown option list) under its trigger
+// so it is never clipped by an ancestor's scroll/overflow — a fixed box is only
+// clipped by its containing block, not by intervening `overflow` scrollers like
+// the Settings list or a plugin panel body. Mirrors what native macOS pop-up
+// menus and Windows combo dropdowns do when items are wider than the closed
+// control: the list is AT LEAST the trigger width and grows to fit its widest
+// item, opens under the trigger, and SHIFTS/FLIPS to stay on screen rather than
+// truncating. (Apple HIG: "the width of a pop-up menu should be wide enough to
+// accommodate the longest item"; WinUI: dropdown min-width = control width,
+// grows with content — neither forces the closed control to the widest item.)
+//   - min-width = trigger width (never narrower than the trigger);
+//   - left-align the list under the trigger; if that would spill past the
+//     right edge, right-align it (grow leftward) — the shift a right-flush
+//     control needs (e.g. the Settings controls, which sit at the dialog edge);
+//   - flip above when there is no room below;
+//   - clamp to the viewport so it's never pushed off-screen.
+// Callers portal the list to the body-level host (see mountPopover), so the
+// fixed containing block is the viewport; the ancestor walk below is a
+// defensive fallback for any future in-tree caller.
+function positionFloatingPopover(anchor, popup, opts){
+  if(!anchor||!anchor.isConnected||!popup) return;
+  opts=opts||{};
+  // Fixed-positioning containing block: the viewport, unless an ancestor
+  // establishes one (transform / filter / backdrop-filter / perspective /
+  // will-change). Portaled popovers live under <body> so this is normally the
+  // viewport; the walk stays for robustness (and for any non-portaled caller).
+  let cb={left:0,top:0,right:window.innerWidth,bottom:window.innerHeight};
+  for(let el=popup.parentElement; el; el=el.parentElement){
+    const cs=getComputedStyle(el);
+    if(cs.transform!=="none"||cs.perspective!=="none"
+       ||(cs.filter&&cs.filter!=="none")
+       ||(cs.backdropFilter&&cs.backdropFilter!=="none")
+       ||(cs.webkitBackdropFilter&&cs.webkitBackdropFilter!=="none")
+       ||/transform|filter|perspective/.test(cs.willChange||"")){
+      cb=el.getBoundingClientRect(); break;
+    }
+  }
+  const a=anchor.getBoundingClientRect();
+  popup.style.minWidth=a.width+"px";       // >= trigger, grow-to-content past it
+  const w=popup.offsetWidth, h=popup.offsetHeight, M=4;
+  // Horizontal alignment to the trigger. `align:"end"` aligns the right edges
+  // (list grows leftward) — the right thing for a control flush against a
+  // container's right edge (the Settings controls), so the wider list opens
+  // INTO the dialog rather than spilling past it. Default `"start"` aligns the
+  // left edges (grows rightward) for controls with room to their right (the
+  // plugin form dropdowns). Either way, clamp to the viewport so it's never
+  // pushed off-screen.
+  let left = (opts.align==="end") ? (a.right-w) : a.left;
+  left=Math.max(cb.left+M, Math.min(left, cb.right-w-M));
+  // Vertical: prefer below the trigger; flip above when there is no room.
+  let top=a.bottom+2;
+  if(top+h > cb.bottom-M && a.top-h-2 >= cb.top+M) top=a.top-h-2;
+  top=Math.max(cb.top+M, Math.min(top, cb.bottom-h-M));
+  popup.style.left=(left-cb.left)+"px";
+  popup.style.top=(top-cb.top)+"px";
+}
+
 // After a widgets-region rebuild: hand real DOM focus to the host-focused
 // text widget's input (so the native caret blinks and IME composes there),
 // pin its caret to the host TextEdit's cursor, and fall back to the hidden
@@ -121,11 +212,19 @@ function widgetEl(spec, ctx){
     return el;
   }
   if(kind==="toggle"){
-    const el=div("w-toggle"+(spec.checked?" on":"")+(focused?" focus":""));
+    const el=div("w-toggle"+(spec.checked?" on":"")+(focused?" focus":"")+(spec.labelFirst?" labelfirst":""));
     // A sliding switch (CSS-drawn), matching the Settings UI toggles —
-    // not a unicode ☑/☐ glyph.
-    const box=document.createElement("span"); box.className="w-box"; el.appendChild(box);
-    const lb=document.createElement("span"); lb.className="w-label"; lb.textContent=spec.label||""; el.appendChild(lb);
+    // not a unicode ☑/☐ glyph. `labelFirst` renders the form layout
+    // (`Auto mode : [switch]`) so the chip aligns under a column of controls;
+    // the default keeps the chip-first `[switch] label` layout.
+    const box=document.createElement("span"); box.className="w-box";
+    if(spec.labelFirst){
+      if(spec.label) el.appendChild(formLabel(spec.label, spec.labelWidth));
+      el.appendChild(box);
+    } else {
+      el.appendChild(box);
+      const lb=document.createElement("span"); lb.className="w-label"; lb.textContent=spec.label||""; el.appendChild(lb);
+    }
     if(spec.key) el.onmousedown=e=>{ e.preventDefault(); e.stopPropagation(); routeWidget(ctx,spec); };
     return el;
   }
@@ -159,7 +258,12 @@ function widgetEl(spec, ctx){
     const inst=(ctx.instances&&spec.key)?ctx.instances[spec.key]:null;
     const val=(inst&&inst.textValue!=null)?inst.textValue:(spec.value||"");
     const el=div("w-text"+(focused?" focus":""));
-    if(spec.label){ const l=document.createElement("span"); l.className="w-text-label"; l.textContent=spec.label+": "; el.appendChild(l); }
+    // A form-style field (`label` + `labelWidth`) keeps its label OUTSIDE the
+    // bordered field, in the shared label column, so the label doesn't get
+    // boxed into the input and the field aligns with the other controls. A
+    // plain labelled field (no width) keeps the legacy inline label.
+    const formField=spec.label&&spec.labelWidth>0;
+    if(spec.label&&!formField){ const l=document.createElement("span"); l.className="w-text-label"; l.textContent=spec.label+": "; el.appendChild(l); }
     const multi=(spec.rows||1)>1;
     const input=document.createElement(multi?"textarea":"input");
     input.className="w-text-input";
@@ -204,6 +308,12 @@ function widgetEl(spec, ctx){
       });
       el.appendChild(dd);
     }
+    if(formField){
+      const rowEl=div("w-field-row");
+      rowEl.appendChild(formLabel(spec.label, spec.labelWidth));
+      rowEl.appendChild(el);
+      return rowEl;
+    }
     return el;
   }
   if(kind==="number"){
@@ -232,20 +342,32 @@ function widgetEl(spec, ctx){
     const inst=(ctx.instances&&spec.key)?ctx.instances[spec.key]:null;
     const selIdx=(inst&&inst.selectedIndex!=null)?inst.selectedIndex:(spec.selectedIndex||0);
     const open=inst?!!inst.dropdownOpen:!!spec.open;
-    const el=div("w-dropdown"+(focused?" focus":""));
-    if(spec.label){ const l=document.createElement("span"); l.className="w-text-label"; l.textContent=spec.label+": "; el.appendChild(l); }
+    const el=div("w-dropdown"+(focused?" focus":"")+(spec.label&&spec.labelWidth>0?" wform":""));
+    if(spec.label){
+      if(spec.labelWidth>0) el.appendChild(formLabel(spec.label, spec.labelWidth));
+      else { const l=document.createElement("span"); l.className="w-text-label"; l.textContent=spec.label+": "; el.appendChild(l); }
+    }
     const pill=document.createElement("span"); pill.className="w-dd-pill";
-    pill.textContent=((spec.options||[])[selIdx]??"—")+(open?" ▲":" ▾");
+    // Small up/down chevrons — a MATCHED-SIZE pair (▴ U+25B4 / ▾ U+25BE). The
+    // full-size ▲ (U+25B2) is ~2× the width of the small ▾ in a proportional
+    // font (e.g. the macOS skin's -apple-system), so pairing it with ▾ made the
+    // pill jump ~6px wider on open; the small ▴ keeps the width stable.
+    pill.textContent=((spec.options||[])[selIdx]??"—")+(open?" ▴":" ▾");
     pill.onmousedown=e=>{ e.preventDefault(); e.stopPropagation(); if(spec.key) routeControl(ctx,spec.key,"dropdown_toggle",{}); };
     el.appendChild(pill);
     if(open){
-      const dd=div("w-dd");
+      const dd=div("w-dd w-dd-floating");
       (spec.options||[]).forEach((o,i)=>{
         const r=div("w-dd-row"+(i===selIdx?" sel":"")); r.textContent=o;
         r.onmousedown=e=>{ e.preventDefault(); e.stopPropagation(); if(spec.key) routeControl(ctx,spec.key,"dropdown_select",{index:i}); };
         dd.appendChild(r);
       });
-      el.appendChild(dd);
+      // Portal the option list to the body-level host so it extends PAST the
+      // modal's border and is never clipped by the surface's overflow (parity
+      // with the TUI popover). Shared positioner anchors it under the pill,
+      // grows it to fit the widest item, and flips/shifts to stay on screen.
+      mountPopover(dd);
+      requestAnimationFrame(()=>positionFloatingPopover(pill, dd));
     }
     return el;
   }
@@ -430,7 +552,15 @@ function settingControlEl(c, idx, live){
     el.appendChild(mk("−","set-step","controlDecrement")); const v=document.createElement("span"); v.className="set-num-v"; v.textContent=c.value; el.appendChild(v); el.appendChild(mk("+","set-step","controlIncrement"));
   }
   else if(k==="dropdown"){ const p=document.createElement("span"); p.className="set-pill"; p.textContent=(c.options[c.selected]||"—")+" ▾"; if(live) p.onmousedown=setHit("controlDropdown",idx); el.appendChild(p);
-    if(c.open){ const d=div("set-dd"); c.options.forEach((o,i)=>{const r=div("set-dd-row"+(i===c.selected?" sel":""));r.textContent=o;if(live)r.onmousedown=setHit("controlDropdownOption",idx,i);d.appendChild(r);}); el.appendChild(d);} }
+    if(c.open){ const d=div("set-dd"); c.options.forEach((o,i)=>{const r=div("set-dd-row"+(i===c.selected?" sel":""));r.textContent=o;if(live)r.onmousedown=setHit("controlDropdownOption",idx,i);d.appendChild(r);});
+      // Portal to the body-level host (same as the plugin Dropdown): the
+      // Settings dialog is a transformed, overflow-clipping box with a
+      // scrolling list, so an in-place list is cut off at the dialog edge (a
+      // long option set — e.g. Default Language — is far wider than the compact
+      // pill). Out of the modal it grows to fit the widest option and shifts to
+      // stay in view (right-aligning under the flush-right control).
+      mountPopover(d);
+      requestAnimationFrame(()=>positionFloatingPopover(p, d, {align:"end"})); } }
   else if(k==="text"){ const f=document.createElement("span"); f.className="set-field"; f.textContent=(c.value||c.placeholder||"")+(c.editing?"▌":""); if(live) f.onmousedown=setHit("controlText",idx); el.appendChild(f); }
   else if(k==="json"){ const f=document.createElement("span"); f.className="set-field mono"; f.textContent=(c.value||"").slice(0,80)||"{}"; if(live) f.onmousedown=setHit("controlText",idx); el.appendChild(f); }
   else if(k==="complex"){ el.textContent="‹"+c.typeName+"›"; el.classList.add("set-dim"); }
@@ -700,14 +830,14 @@ function widgetSurfaceEls(s){
     out.push(scrim);
   }
   const el=div("region widget-surface w-"+s.kind+(s.anchored?" anchored":"")); place(el,s.rect);
-  if(s.kind==="dock" && !isMobile() && s.rect.x===0 && webTheme==="cosmos"){
-    // COSMOS shell: the dock keeps its cell rect for hit-testing (widget
+  if(s.kind==="dock" && !isMobile() && s.rect.x===0 && shellTheme()){
+    // Shell themes: the dock keeps its cell rect for hit-testing (widget
     // clicks forward LOGICAL cells, never pixel-derived ones), but its
     // visual card is inset from the device — a gap on the right where the
     // bezel's left rail lands — and stretched to the bezel's vertical
-    // extents so it reads as its own floating glass panel. Cosmos-only: the
-    // macOS / compact themes have no bezel, so their dock keeps its plain
-    // cell rect (a flush full-height sidebar).
+    // extents so it reads as its own floating panel. Shell-only: the macOS /
+    // compact themes have no bezel, so their dock keeps its plain cell rect
+    // (a flush full-height sidebar).
     el.style.width=Math.max(140, px(s.rect.w,CW)-SHELL.side-SHELL.gap)+"px";
     el.style.top=(px(s.rect.y,CH)-SHELL.top+4)+"px";
     el.style.height=(px(s.rect.h,CH)+SHELL.top+SHELL.bot-8)+"px";
@@ -730,22 +860,26 @@ function widgetSurfaceEls(s){
   }
   if(s.kind==="floatingModal"){
     // The host sizes the panel in whole terminal cells, but the DOM adds
-    // per-row gaps + padding a cell grid can't express, so a snug dialog
-    // (e.g. the New Folder dialog) would overflow its fixed height and clip
-    // its buttons under `overflow:auto`. Treat the host height as a minimum
-    // and let the modal grow to fit its content; nudge it up by half the
-    // overflow so it stays visually centered. An anchored popup instead
-    // stays pinned at its click cell — it grows downward, no recentering.
-    const want=el.style.height; el.style.minHeight=want; el.style.height="auto";
+    // per-row gaps + padding a cell grid can't express. `height:auto` sizes the
+    // modal to its real content so it never clips its buttons.
+    const want=parseFloat(el.style.height||"0");
     if(s.anchored){
-      // Content-sized in both axes (host cells can't express DOM padding);
-      // the host-clamped rect stays as the minimum so the popup never
-      // shrinks below its TUI footprint.
+      // Anchored popup (context menu): keep the host height as a floor and
+      // content-size the width; it stays pinned at its click cell, growing
+      // downward (no recentering).
+      el.style.minHeight=el.style.height; el.style.height="auto";
       el.style.minWidth=el.style.width; el.style.width="auto"; el.style.maxWidth="60vw";
-    } else requestAnimationFrame(()=>{
-      const grew=el.offsetHeight-parseFloat(want||"0");
-      if(grew>0) el.style.top=(parseFloat(el.style.top)-grew/2)+"px";
-    });
+    } else {
+      // Form dialog: size to content EXACTLY — no host-height floor — so it
+      // neither clips its buttons nor leaves dead space below them, then shift
+      // by half the delta vs the host-planned height so it stays centered
+      // whether the content came out taller OR shorter than the cell estimate.
+      el.style.height="auto";
+      requestAnimationFrame(()=>{
+        const delta=el.offsetHeight-want;
+        if(delta) el.style.top=(parseFloat(el.style.top)-delta/2)+"px";
+      });
+    }
   }
   const ctx={ kind:"panel", plugin:s.plugin, panelId:s.panelId, hits:s.hits, instances:s.instances, focusKey:s.focusKey };
   el.appendChild(widgetEl(s.spec, ctx));

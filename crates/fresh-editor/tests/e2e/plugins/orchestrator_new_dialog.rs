@@ -966,7 +966,7 @@ fn tab_is_linear_one_stop_per_radio_group() {
                 saw_inactive_option = true;
             }
         }
-        if line.contains("Create & Visit") {
+        if line.contains("Create Workspace") {
             saw_create = true;
         }
     }
@@ -985,7 +985,7 @@ fn tab_is_linear_one_stop_per_radio_group() {
         agent_stops, 1,
         "the 'Agent:' group is a single Tab stop per cycle (got {agent_stops})",
     );
-    assert!(saw_create, "Tab must reach the [ Create & Visit ] button");
+    assert!(saw_create, "Tab must reach the [ Create Workspace ] button");
 }
 
 /// ←/→ changes the option *within* the "Run in:" selector (and swaps
@@ -1107,4 +1107,453 @@ fn ctrl_enter_submits_from_a_text_field() {
     harness
         .wait_until(|h| !h.screen_to_string().contains("←/→ switch type"))
         .unwrap();
+}
+
+/// Advance Tab focus until the single "Agent:" preset stop is reached.
+fn focus_agent_preset_stop(harness: &mut EditorTestHarness) {
+    let mut guard = 0;
+    while !focused_line(&harness.screen_to_string()).contains("Agent:") {
+        harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+        harness.tick_and_render().unwrap();
+        guard += 1;
+        assert!(
+            guard < 20,
+            "Tab never reached the 'Agent:' stop. Screen:\n{}",
+            harness.screen_to_string(),
+        );
+    }
+}
+
+/// Tab to the collapsed "Advanced…" fold header and activate it, so the
+/// folded controls (worktree, branch fields, and the "Teach Fresh CLI"
+/// toggle) render. The header glyph flips `▶` → `▼` when expanded.
+fn expand_advanced(harness: &mut EditorTestHarness) {
+    let mut guard = 0;
+    while !focused_line(&harness.screen_to_string()).contains("Advanced") {
+        harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+        harness.tick_and_render().unwrap();
+        guard += 1;
+        assert!(
+            guard < 20,
+            "Tab never reached the 'Advanced…' fold. Screen:\n{}",
+            harness.screen_to_string(),
+        );
+    }
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("▼ Advanced"))
+        .unwrap();
+}
+
+/// The launcher prioritises the coding-CLI presets — a bare `terminal`,
+/// then `claude`, `codex`, `opencode` — ahead of the long-standing `aider`
+/// and the `custom…` escape hatch. The agent selector is a single dropdown
+/// (`Agent: [<selected> ▼]`); ←/→ cycles it through the presets in that
+/// priority order. We prove the ordering by adjacency — from `claude`, one
+/// `→` lands on `codex`, the next on `opencode` — which is independent of
+/// whichever preset the dropdown happens to open on.
+#[test]
+fn preset_row_lists_prioritised_agents_in_order() {
+    let (_temp, workspace) = set_up_workspace();
+    let mut harness = open_form_on(&workspace);
+
+    focus_agent_preset_stop(&mut harness);
+
+    // Step ←/→ until `claude` is the selected (focused) preset.
+    let mut guard = 0;
+    while !focused_line(&harness.screen_to_string()).contains("claude") {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::NONE)
+            .unwrap();
+        harness.tick_and_render().unwrap();
+        guard += 1;
+        assert!(
+            guard < 8,
+            "cycling the agent dropdown never reached `claude`. Screen:\n{}",
+            harness.screen_to_string(),
+        );
+    }
+
+    // From claude, → advances to codex, then to opencode — the priority order.
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .unwrap();
+    harness.tick_and_render().unwrap();
+    assert!(
+        focused_line(&harness.screen_to_string()).contains("codex"),
+        "`→` from claude must select codex next. Screen:\n{}",
+        harness.screen_to_string(),
+    );
+
+    harness
+        .send_key(KeyCode::Right, KeyModifiers::NONE)
+        .unwrap();
+    harness.tick_and_render().unwrap();
+    assert!(
+        focused_line(&harness.screen_to_string()).contains("opencode"),
+        "`→` from codex must select opencode next. Screen:\n{}",
+        harness.screen_to_string(),
+    );
+}
+
+/// The Agent selector opens its option list as a screen-level FLOATING
+/// pop-over: Enter (routed to the host's `set_dropdown_open`, not the
+/// no-op `activate()`) reveals every preset at once, layered on top of
+/// the form rather than reflowing it, and Esc closes it back to the
+/// single compact `Agent: [<selected> ▼]` trigger. A click on an option
+/// row selects it and closes the list.
+#[test]
+fn agent_dropdown_opens_as_floating_popover() {
+    let (_temp, workspace) = set_up_workspace();
+    let mut harness = open_form_on(&workspace);
+
+    focus_agent_preset_stop(&mut harness);
+
+    // Distinctive preset names; the closed trigger shows exactly one of
+    // them (the selected value), the open pop-over lists several.
+    let names = ["terminal", "claude", "codex", "opencode"];
+    let count_names = |screen: &str| names.iter().filter(|n| screen.contains(**n)).count();
+
+    let closed_before = count_names(&harness.screen_to_string());
+
+    // Enter opens the pop-over. Before the fix, Enter hit `activate()` — a
+    // no-op on a Dropdown — so the list never opened.
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.tick_and_render().unwrap();
+    let open_screen = harness.screen_to_string();
+    let open_count = count_names(&open_screen);
+    assert!(
+        open_count >= 3 && open_count > closed_before,
+        "Enter must float the agent option list open (many presets visible \
+         at once); before={closed_before}, open={open_count}. Screen:\n{open_screen}",
+    );
+
+    // Web-scene parity: the projection the web frontend renders from (the
+    // `/state` route → `widgets_view`) must report the dropdown as OPEN, so
+    // the web floats its own native option pop-over from the same state.
+    {
+        let surfaces = harness.editor().widgets_view();
+        let modal = surfaces
+            .iter()
+            .find(|s| s.kind == "floatingModal")
+            .expect("the New-Workspace form must appear as a floatingModal in the web scene");
+        let inst = modal
+            .instances
+            .get("agent_dropdown")
+            .expect("the web scene must carry the agent_dropdown instance state");
+        assert_eq!(
+            inst.dropdown_open,
+            Some(true),
+            "the web scene must report the agent dropdown as open (so the web \
+             frontend renders the floating option list)",
+        );
+    }
+
+    // Esc closes the pop-over, back to the single-value trigger.
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness.tick_and_render().unwrap();
+    let closed_screen = harness.screen_to_string();
+    assert!(
+        count_names(&closed_screen) < open_count,
+        "Esc must close the pop-over back to the compact trigger. Screen:\n{closed_screen}",
+    );
+
+    // Re-open and pick an option by clicking its row. `claude` is a stable
+    // preset that is not the default selection (`terminal`), so clicking it
+    // both changes the value and closes the list.
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.tick_and_render().unwrap();
+    let (col, row) = harness
+        .find_text_on_screen("claude")
+        .expect("`claude` option row must be visible in the open pop-over");
+    harness.mouse_click(col, row).unwrap();
+    harness.tick_and_render().unwrap();
+    let after_click = harness.screen_to_string();
+    assert!(
+        count_names(&after_click) < open_count,
+        "clicking an option must close the pop-over. Screen:\n{after_click}",
+    );
+    assert!(
+        focused_line(&after_click).contains("claude"),
+        "clicking the `claude` option must select it as the Agent value. Screen:\n{after_click}",
+    );
+
+    // Web-scene parity again: after the click the projection must show the
+    // pop-over closed and the newly-selected index committed — the same
+    // state the web `/state` route would report so selection round-trips.
+    {
+        let surfaces = harness.editor().widgets_view();
+        let modal = surfaces
+            .iter()
+            .find(|s| s.kind == "floatingModal")
+            .expect("form surface in web scene after selection");
+        let inst = modal
+            .instances
+            .get("agent_dropdown")
+            .expect("agent_dropdown instance in web scene after selection");
+        assert_eq!(
+            inst.dropdown_open,
+            Some(false),
+            "picking an option must close the pop-over in the web scene too",
+        );
+        // `claude` is index 1 in the prioritised preset order (terminal, claude,
+        // codex, …), so a successful click committed that selection.
+        assert_eq!(
+            inst.selected_index,
+            Some(1),
+            "the clicked `claude` option must be the committed selection in the web scene",
+        );
+    }
+}
+
+/// Clicking the *closed* `Agent: [<value> ▼]` trigger opens the option
+/// pop-over. The trigger is not focused when the form opens (Project Path
+/// is), so the click must BOTH move focus to the dropdown AND toggle its
+/// list open. Regression: the TUI floating-panel click path only focused
+/// the dropdown and fired the event to the plugin — it never called
+/// `set_dropdown_open`, so a click left the list closed (the pop-over only
+/// opened via the keyboard `Enter` path). A second click on the now-open,
+/// focused trigger must close it again.
+#[test]
+fn clicking_agent_dropdown_trigger_toggles_popover() {
+    let (_temp, workspace) = set_up_workspace();
+    let mut harness = open_form_on(&workspace);
+
+    // Distinctive preset names: the closed trigger shows exactly one (the
+    // selected value), the open pop-over lists several.
+    let names = ["terminal", "claude", "codex", "opencode"];
+    let count_names = |screen: &str| names.iter().filter(|n| screen.contains(**n)).count();
+    let closed_before = count_names(&harness.screen_to_string());
+
+    // Locate the closed trigger by its selected value and click it. `terminal`
+    // is the default Agent value and (with Advanced collapsed) appears only in
+    // the dropdown trigger, so its cell is inside the `[terminal ▼]` button.
+    let (col, row) = harness
+        .find_text_on_screen("terminal")
+        .expect("the Agent dropdown trigger `[terminal ▼]` must be visible");
+    harness.mouse_click(col, row).unwrap();
+    harness.tick_and_render().unwrap();
+
+    let open_screen = harness.screen_to_string();
+    let open_count = count_names(&open_screen);
+    assert!(
+        open_count >= 3 && open_count > closed_before,
+        "clicking the Agent dropdown trigger must open the option pop-over \
+         (many presets visible at once); before={closed_before}, open={open_count}. \
+         Screen:\n{open_screen}",
+    );
+
+    // Click the trigger again (now focused + open) — it must close.
+    let (col2, row2) = harness
+        .find_text_on_screen("terminal")
+        .expect("the Agent trigger stays visible while open");
+    harness.mouse_click(col2, row2).unwrap();
+    harness.tick_and_render().unwrap();
+    assert!(
+        count_names(&harness.screen_to_string()) < open_count,
+        "a second click on the open trigger must close the pop-over. Screen:\n{}",
+        harness.screen_to_string(),
+    );
+}
+
+/// The open Agent pop-over box anchors its top-left corner directly under
+/// the trigger's `[` bracket, not at the panel's left content edge.
+/// Regression: the host drew the floating box at `inner.x` (panel left)
+/// regardless of the trigger's column, so a labeled `Agent: [terminal ▼]`
+/// dropdown showed its option list shifted far to the left of the button.
+#[test]
+fn agent_dropdown_popover_anchored_under_trigger() {
+    let (_temp, workspace) = set_up_workspace();
+    let mut harness = open_form_on(&workspace);
+    focus_agent_preset_stop(&mut harness);
+
+    // Open the pop-over. The trigger arrow flips `▼` → `▲` and the option
+    // list surfaces below.
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness
+        .wait_until(|h| h.screen_to_string().contains("opencode"))
+        .unwrap();
+
+    let screen = harness.screen_to_string();
+    let lines: Vec<&str> = screen.lines().collect();
+
+    // The focused `▸ Agent: [<value> ▲]` trigger row. Its `[` marks the
+    // button's start column (all leading glyphs — `│`, `▸`, spaces, letters
+    // — are one display column wide, so a char count == display column).
+    let trigger_row = lines
+        .iter()
+        .position(|l| l.contains("Agent:") && l.contains('▲'))
+        .expect("the open Agent trigger row (`▸ Agent: [.. ▲]`) must be on screen");
+    let bracket_col = lines[trigger_row]
+        .chars()
+        .position(|c| c == '[')
+        .expect("the trigger row must contain the `[` button bracket");
+
+    // The dialog's own left border is the first `│` on the trigger row; the
+    // pop-over must NOT anchor there (that was the bug).
+    let dialog_left = lines[trigger_row]
+        .chars()
+        .position(|c| c == '│')
+        .expect("the dialog left border `│` must be on the trigger row");
+    assert!(
+        bracket_col > dialog_left + 2,
+        "precondition: the labeled trigger's `[` ({bracket_col}) sits well right \
+         of the dialog's left border ({dialog_left}).",
+    );
+
+    // The pop-over opens one row below the trigger; its top-left corner `┌`
+    // must land exactly on the trigger's `[` column.
+    let corner = harness.get_cell(bracket_col as u16, (trigger_row + 1) as u16);
+    assert_eq!(
+        corner.as_deref(),
+        Some("┌"),
+        "the pop-over's top-left corner `┌` must sit under the trigger's `[` \
+         (col {bracket_col}, row {}); found {:?}. The box must anchor under the \
+         button, not at the panel's left edge.\nScreen:\n{screen}",
+        trigger_row + 1,
+        corner,
+    );
+}
+
+/// Picking a coding agent surfaces its per-agent controls — an "Auto
+/// mode" checkbox and a "Start prompt" box — which are hidden for the
+/// bare `terminal` default. Stepping ←/→ off `terminal` onto the first
+/// agent (claude) reveals both.
+#[test]
+fn selecting_an_agent_reveals_auto_mode_and_start_prompt() {
+    let (_temp, workspace) = set_up_workspace();
+    let mut harness = open_form_on(&workspace);
+
+    // The bare-terminal default carries no agent options.
+    let screen = harness.screen_to_string();
+    assert!(
+        !screen.contains("Auto mode") && !screen.contains("Start prompt"),
+        "the terminal preset must not show agent-only controls. Screen:\n{screen}",
+    );
+
+    focus_agent_preset_stop(&mut harness);
+
+    // ←/→ steps off `terminal` onto the first agent (claude), whose
+    // command fills the field and whose controls appear.
+    let mut guard = 0;
+    while !harness.screen_to_string().contains("Auto mode") {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::NONE)
+            .unwrap();
+        harness.tick_and_render().unwrap();
+        guard += 1;
+        assert!(
+            guard < 8,
+            "stepping the preset selector never surfaced Auto mode. Screen:\n{}",
+            harness.screen_to_string(),
+        );
+    }
+    assert!(
+        harness.screen_to_string().contains("Start prompt"),
+        "an agent that takes a launch prompt must show the Start prompt box. Screen:\n{}",
+        harness.screen_to_string(),
+    );
+}
+
+/// The agent controls adapt to the selected agent: opencode has no
+/// launch bypass-approvals flag (it's config-driven), so it shows the
+/// Start prompt box but *not* the Auto mode checkbox.
+#[test]
+fn opencode_shows_start_prompt_without_auto_mode() {
+    let (_temp, workspace) = set_up_workspace();
+    let mut harness = open_form_on(&workspace);
+
+    focus_agent_preset_stop(&mut harness);
+
+    // Step ←/→ until opencode is the selected value in the focused Agent
+    // dropdown (`▸ Agent: [opencode ▼]`). The dropdown shows only the
+    // selected preset, so the focused line naming opencode is the signal.
+    let mut guard = 0;
+    while !focused_line(&harness.screen_to_string()).contains("opencode") {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::NONE)
+            .unwrap();
+        harness.tick_and_render().unwrap();
+        guard += 1;
+        assert!(
+            guard < 8,
+            "stepping the preset selector never reached opencode. Screen:\n{}",
+            harness.screen_to_string(),
+        );
+    }
+
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("Start prompt"),
+        "opencode takes a launch prompt, so the Start prompt box must show. Screen:\n{screen}",
+    );
+    assert!(
+        !screen.contains("Auto mode"),
+        "opencode has no launch auto-mode flag, so no Auto mode checkbox. Screen:\n{screen}",
+    );
+}
+
+/// The "Teach agent the Fresh CLI" toggle lives under the "Advanced…" fold
+/// (enabled by default, but folded away so it doesn't clutter the common
+/// case). It's an agent-only control: even with Advanced expanded it stays
+/// hidden for the bare `terminal` preset (nothing to teach), and appears once
+/// a supporting agent (claude) is selected.
+#[test]
+fn teach_fresh_cli_toggle_shown_for_agent_hidden_for_terminal() {
+    let (_temp, workspace) = set_up_workspace();
+    let mut harness = open_form_on(&workspace);
+
+    // Collapsed Advanced: the toggle is folded away regardless of agent.
+    assert!(
+        !harness
+            .screen_to_string()
+            .contains("Teach agent the Fresh CLI"),
+        "the Teach Fresh CLI toggle must be hidden while Advanced is collapsed. Screen:\n{}",
+        harness.screen_to_string(),
+    );
+
+    // Expand Advanced. With the bare-terminal default still active, the toggle
+    // stays hidden — a terminal has no system prompt to inject into.
+    expand_advanced(&mut harness);
+    assert!(
+        !harness
+            .screen_to_string()
+            .contains("Teach agent the Fresh CLI"),
+        "the terminal preset must not show the Teach Fresh CLI toggle even under \
+         an expanded Advanced fold. Screen:\n{}",
+        harness.screen_to_string(),
+    );
+
+    // Select the first agent (claude) via the dropdown; the toggle now renders
+    // under the (still-expanded) Advanced fold.
+    focus_agent_preset_stop(&mut harness);
+    let mut guard = 0;
+    while !focused_line(&harness.screen_to_string()).contains("claude") {
+        harness
+            .send_key(KeyCode::Right, KeyModifiers::NONE)
+            .unwrap();
+        harness.tick_and_render().unwrap();
+        guard += 1;
+        assert!(
+            guard < 8,
+            "cycling the agent dropdown never reached `claude`. Screen:\n{}",
+            harness.screen_to_string(),
+        );
+    }
+    assert!(
+        harness
+            .screen_to_string()
+            .contains("Teach agent the Fresh CLI"),
+        "selecting a supporting agent must reveal the Teach Fresh CLI toggle under \
+         the expanded Advanced fold. Screen:\n{}",
+        harness.screen_to_string(),
+    );
 }

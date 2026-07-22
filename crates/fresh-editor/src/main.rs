@@ -3192,6 +3192,312 @@ fn forward_to_session(session: &str, files: &[String]) -> AnyhowResult<bool> {
     Ok(true)
 }
 
+// ===========================================================================
+// Agent command channel client (`fresh --cmd cmd ...`, `split`, `workspace`)
+// ===========================================================================
+
+/// Pull a `--session <id>` override out of a `--cmd` token list.
+///
+/// The override may appear anywhere among the tokens; the pair is removed and
+/// the remaining tokens (verb + operands) are returned in order. A trailing
+/// `--session` with no value is ignored (treated as no override).
+fn extract_session_flag<'a>(tokens: &[&'a str]) -> (Option<String>, Vec<&'a str>) {
+    let mut session: Option<String> = None;
+    let mut rest: Vec<&'a str> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == "--session" {
+            if let Some(val) = tokens.get(i + 1) {
+                session = Some((*val).to_string());
+                i += 2;
+                continue;
+            }
+            // dangling `--session` with no value: drop it, no override
+            i += 1;
+            continue;
+        }
+        rest.push(tokens[i]);
+        i += 1;
+    }
+    (session, rest)
+}
+
+/// Parse `k=v` tokens into an argument map. Tokens without an `=` are ignored;
+/// the value keeps any further `=` (split on the first only), so `a=b=c` maps
+/// `a -> b=c`. An empty key is skipped.
+fn parse_kv_args(tokens: &[&str]) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for tok in tokens {
+        if let Some((k, v)) = tok.split_once('=') {
+            if !k.is_empty() {
+                map.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Resolve the control socket for a command-channel verb.
+///
+/// The default target is the current workspace, named by `$FRESH_SESSION`;
+/// `--session <id>` overrides it. Unlike `run_open_files_command`, this never
+/// spawns a daemon — these verbs only make sense against a live editor, so a
+/// missing session or dead server is a hard error.
+fn resolve_cmd_socket(session_override: Option<&str>) -> AnyhowResult<SocketPaths> {
+    let session = match session_override {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => match std::env::var("FRESH_SESSION") {
+            Ok(s) if !s.trim().is_empty() => s,
+            _ => anyhow::bail!(
+                "not inside a Fresh session; set --session <id> (or run inside a \
+                 Fresh workspace so $FRESH_SESSION is set)"
+            ),
+        },
+    };
+
+    let socket_paths = resolve_session(Some(&session))?;
+    socket_paths.cleanup_if_stale();
+    if !socket_paths.is_server_alive() {
+        anyhow::bail!("no running Fresh editor for session '{}'", session);
+    }
+    Ok(socket_paths)
+}
+
+/// Connect to the resolved socket and complete the client handshake.
+fn connect_cmd(socket_paths: &SocketPaths) -> AnyhowResult<fresh::server::ipc::ClientConnection> {
+    let conn = fresh::server::ipc::ClientConnection::connect(socket_paths)?;
+    if !client_handshake(&conn)? {
+        // client_handshake already printed the mismatch reason.
+        anyhow::bail!("handshake with the Fresh editor failed");
+    }
+    Ok(conn)
+}
+
+/// Read control replies until a `CommandList` arrives (or an error/EOF).
+fn read_command_list(
+    conn: &fresh::server::ipc::ClientConnection,
+) -> AnyhowResult<Vec<fresh::server::protocol::CommandInfo>> {
+    use fresh::server::protocol::ServerControl;
+    loop {
+        match conn.read_control()? {
+            Some(line) => match serde_json::from_str::<ServerControl>(&line)? {
+                ServerControl::CommandList { commands } => return Ok(commands),
+                ServerControl::Error { message } => anyhow::bail!("server error: {}", message),
+                _ => continue,
+            },
+            None => anyhow::bail!("server closed the connection before answering"),
+        }
+    }
+}
+
+/// Read control replies until a `CommandResult` arrives (or an error/EOF).
+/// Returns `(ok, error, output)`.
+fn read_command_result(
+    conn: &fresh::server::ipc::ClientConnection,
+) -> AnyhowResult<(bool, Option<String>, Option<String>)> {
+    use fresh::server::protocol::ServerControl;
+    loop {
+        match conn.read_control()? {
+            Some(line) => match serde_json::from_str::<ServerControl>(&line)? {
+                ServerControl::CommandResult { ok, error, output } => {
+                    return Ok((ok, error, output))
+                }
+                ServerControl::Error { message } => anyhow::bail!("server error: {}", message),
+                _ => continue,
+            },
+            None => anyhow::bail!("server closed the connection before answering"),
+        }
+    }
+}
+
+/// Dispatch a `--cmd cmd ...` / `--cmd split ...` / `--cmd workspace ...`
+/// invocation against a running editor. `tokens` is the full `--cmd` vector
+/// (leading verb included).
+fn run_cmd_command(tokens: &[&str]) -> AnyhowResult<()> {
+    let (session, rest) = extract_session_flag(tokens);
+    let session = session.as_deref();
+
+    match rest.first().copied() {
+        Some("cmd") => {
+            let sub = &rest[1..];
+            match sub {
+                ["list", flags @ ..] => cmd_list(session, flags),
+                ["describe"] => {
+                    eprintln!("usage: fresh --cmd cmd describe <id> [--json]");
+                    std::process::exit(2);
+                }
+                ["describe", id, flags @ ..] => cmd_describe(session, id, flags),
+                ["run"] => {
+                    eprintln!("usage: fresh --cmd cmd run <id> [k=v ...]");
+                    std::process::exit(2);
+                }
+                ["run", id, args @ ..] => cmd_run(session, id, args),
+                // Shorthand: `cmd <id> [k=v ...]` when the 2nd token isn't a
+                // known sub-verb (list/describe/run handled above).
+                [id, args @ ..] => cmd_run(session, id, args),
+                [] => {
+                    eprintln!("usage: fresh --cmd cmd <list|describe|run> ...");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("split") => cmd_split(session, &rest[1..]),
+        Some("workspace") => match &rest[1..] {
+            ["new", dir, ..] => workspace_new(session, dir),
+            _ => {
+                eprintln!("usage: fresh --cmd workspace new <dir>");
+                std::process::exit(2);
+            }
+        },
+        _ => {
+            eprintln!("Unknown command: {}", rest.join(" "));
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `fresh --cmd cmd list [--json]` — enumerate the allowed commands.
+fn cmd_list(session: Option<&str>, flags: &[&str]) -> AnyhowResult<()> {
+    use fresh::server::protocol::ClientControl;
+    let json = flags.contains(&"--json");
+
+    let socket = resolve_cmd_socket(session)?;
+    let conn = connect_cmd(&socket)?;
+    conn.write_control(&serde_json::to_string(&ClientControl::ListCommands {
+        include_args: false,
+    })?)?;
+    let mut commands = read_command_list(&conn)?;
+    commands.sort_by(|a, b| a.id.cmp(&b.id));
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&commands)?);
+    } else {
+        let width = commands.iter().map(|c| c.id.len()).max().unwrap_or(0);
+        for c in &commands {
+            println!("{:width$}  —  {}", c.id, c.name, width = width);
+        }
+    }
+    Ok(())
+}
+
+/// `fresh --cmd cmd describe <id> [--json]` — show one command's schema.
+fn cmd_describe(session: Option<&str>, id: &str, flags: &[&str]) -> AnyhowResult<()> {
+    use fresh::server::protocol::ClientControl;
+    let json = flags.contains(&"--json");
+
+    let socket = resolve_cmd_socket(session)?;
+    let conn = connect_cmd(&socket)?;
+    conn.write_control(&serde_json::to_string(&ClientControl::ListCommands {
+        include_args: true,
+    })?)?;
+    let commands = read_command_list(&conn)?;
+
+    let info = match commands.iter().find(|c| c.id == id) {
+        Some(info) => info,
+        None => {
+            eprintln!(
+                "Command not found (not on this workspace's allowlist): {}",
+                id
+            );
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(info)?);
+    } else {
+        println!("id:       {}", info.id);
+        println!("name:     {}", info.name);
+        if let Some(cat) = &info.category {
+            println!("category: {}", cat);
+        }
+        if info.args.is_empty() {
+            println!("args:     (none)");
+        } else {
+            println!("args:");
+            for a in &info.args {
+                let req = if a.required { "required" } else { "optional" };
+                match &a.description {
+                    Some(d) => println!("  {} ({}) — {}", a.name, req, d),
+                    None => println!("  {} ({})", a.name, req),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `fresh --cmd cmd run <id> [k=v ...]` — dispatch one command by id.
+fn cmd_run(session: Option<&str>, id: &str, arg_tokens: &[&str]) -> AnyhowResult<()> {
+    run_command_id(session, id, parse_kv_args(arg_tokens))
+}
+
+/// `fresh --cmd split [--vertical|--horizontal]` — split alias (default vertical).
+fn cmd_split(session: Option<&str>, flags: &[&str]) -> AnyhowResult<()> {
+    let id = if flags.contains(&"--horizontal") {
+        "split_horizontal"
+    } else {
+        "split_vertical"
+    };
+    run_command_id(session, id, std::collections::HashMap::new())
+}
+
+/// Shared `RunCommand` path: send the command, print output, and set the exit
+/// code (0 on ok, 1 on failure — the process exits directly on failure).
+fn run_command_id(
+    session: Option<&str>,
+    id: &str,
+    args: std::collections::HashMap<String, String>,
+) -> AnyhowResult<()> {
+    use fresh::server::protocol::ClientControl;
+
+    let socket = resolve_cmd_socket(session)?;
+    let conn = connect_cmd(&socket)?;
+    conn.write_control(&serde_json::to_string(&ClientControl::RunCommand {
+        id: id.to_string(),
+        args,
+    })?)?;
+
+    let (ok, error, output) = read_command_result(&conn)?;
+    if let Some(out) = output {
+        if !out.is_empty() {
+            println!("{}", out);
+        }
+    }
+    if !ok {
+        eprintln!(
+            "{}",
+            error.unwrap_or_else(|| format!("command '{}' failed", id))
+        );
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `fresh --cmd workspace new <dir>` — open `<dir>` as a new orchestrator
+/// window (the "new workspace" verb), reusing `ClientControl::OpenWindow`.
+fn workspace_new(session: Option<&str>, dir: &str) -> AnyhowResult<()> {
+    use fresh::server::protocol::ClientControl;
+
+    // Resolve to an absolute path (canonicalize when it exists; otherwise
+    // anchor a relative path at the cwd) so the server gets an unambiguous root.
+    let path = Path::new(dir);
+    let abs = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) if path.is_absolute() => path.to_path_buf(),
+        Err(_) => std::env::current_dir()?.join(path),
+    };
+
+    let socket = resolve_cmd_socket(session)?;
+    let conn = connect_cmd(&socket)?;
+    conn.write_control(&serde_json::to_string(&ClientControl::OpenWindow {
+        path: abs.to_string_lossy().into_owned(),
+    })?)?;
+    // OpenWindow is fire-and-forget (the server sends no reply), matching
+    // `forward_to_session`.
+    Ok(())
+}
+
 /// Attach to an existing daemon, starting one if needed
 fn run_attach_command(args: &Args) -> AnyhowResult<()> {
     run_attach(args.session_name.as_deref(), &args.files)
@@ -3796,6 +4102,22 @@ fn real_main() -> AnyhowResult<()> {
     // Print deprecation warnings for old flags
     print_deprecation_warnings(&cli);
 
+    // Agent command-channel verbs (`cmd`, `split`, `workspace`) run against a
+    // live editor and never spawn a daemon, so handle them here — before the
+    // `Args` conversion, whose slice match would otherwise reject them as
+    // unknown commands. The `_ =>` fallthrough leaves every other `--cmd`
+    // invocation to the existing `Args::from` routing.
+    if !cli.cmd.is_empty() {
+        let cmd_args: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
+        match cmd_args.as_slice() {
+            ["cmd", ..] | ["split", ..] | ["workspace", ..] => {
+                run_cmd_command(&cmd_args)?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     // Convert to legacy Args format for compatibility
     let args: Args = cli.into();
 
@@ -4213,13 +4535,17 @@ fn run_event_loop(
     gpm_client: &Option<GpmClient>,
     terminal_modes: &mut TerminalModes,
 ) -> AnyhowResult<()> {
+    // Host input is read raw and parsed by fresh's own state machine (see
+    // `services::tty_input`), not crossterm — this is what prevents mouse
+    // reports from leaking into focused terminals (#2745).
+    let mut reader = fresh::services::tty_input::TtyReader::new();
     run_event_loop_common(
         editor,
         terminal,
         workspace_enabled,
         key_translator,
         terminal_modes,
-        |timeout| poll_with_gpm(gpm_client.as_ref(), timeout),
+        |timeout| poll_with_gpm(&mut reader, gpm_client.as_ref(), timeout),
     )
 }
 
@@ -4332,19 +4658,17 @@ fn run_event_loop(
     key_translator: &KeyTranslator,
     terminal_modes: &mut TerminalModes,
 ) -> AnyhowResult<()> {
+    // Host input is read raw and parsed by fresh's own state machine (see
+    // `services::tty_input`), not crossterm — this is what prevents mouse
+    // reports from leaking into focused terminals (#2745).
+    let mut reader = fresh::services::tty_input::TtyReader::new();
     run_event_loop_common(
         editor,
         terminal,
         workspace_enabled,
         key_translator,
         terminal_modes,
-        |timeout| {
-            if event_poll(timeout)? {
-                Ok(safe_event_read()?)
-            } else {
-                Ok(None)
-            }
-        },
+        |timeout| reader.poll(timeout),
     )
 }
 
@@ -4616,25 +4940,30 @@ where
 /// Poll for events from both GPM and crossterm (Linux with libgpm available)
 #[cfg(target_os = "linux")]
 fn poll_with_gpm(
+    reader: &mut fresh::services::tty_input::TtyReader,
     gpm_client: Option<&GpmClient>,
     timeout: Duration,
 ) -> AnyhowResult<Option<CrosstermEvent>> {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use std::os::unix::io::{AsRawFd, BorrowedFd};
 
-    // If no GPM client, just use crossterm polling
+    // Serve any already-decoded event (or a pending resize) first.
+    if let Some(ev) = reader.next_buffered() {
+        return Ok(Some(ev));
+    }
+    if let Some(ev) = reader.take_resize() {
+        return Ok(Some(ev));
+    }
+
+    // Without GPM, the reader owns stdin polling + parsing entirely.
     let Some(gpm) = gpm_client else {
-        return if event_poll(timeout)? {
-            Ok(safe_event_read()?)
-        } else {
-            Ok(None)
-        };
+        return reader.poll(timeout);
     };
 
-    // Set up poll for both stdin (crossterm) and GPM fd
+    // With GPM, poll stdin and the GPM fd together so a mouse event on either
+    // wakes us. stdin bytes are still parsed by the reader (fresh's parser).
     let stdin_fd = std::io::stdin().as_raw_fd();
     let gpm_fd = gpm.fd();
-    tracing::trace!("GPM poll: stdin_fd={}, gpm_fd={}", stdin_fd, gpm_fd);
 
     // SAFETY: We're borrowing the fds for the duration of the poll call
     let stdin_borrowed = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
@@ -4648,60 +4977,43 @@ fn poll_with_gpm(
     // Convert timeout to milliseconds, clamping to u16::MAX (about 65 seconds)
     let timeout_ms = timeout.as_millis().min(u16::MAX as u128) as u16;
     let poll_timeout = PollTimeout::from(timeout_ms);
-    let ready = poll(&mut poll_fds, poll_timeout)?;
+    // EINTR (e.g. a SIGWINCH) surfaces as an error; treat it as "nothing ready"
+    // and fall through to the resize check below.
+    let ready = poll(&mut poll_fds, poll_timeout).unwrap_or(0);
 
     if ready == 0 {
-        return Ok(None);
+        return Ok(reader.take_resize());
     }
 
     let stdin_revents = poll_fds[0].revents();
     let gpm_revents = poll_fds[1].revents();
-    tracing::trace!(
-        "GPM poll: ready={}, stdin_revents={:?}, gpm_revents={:?}",
-        ready,
-        stdin_revents,
-        gpm_revents
-    );
 
     // Check GPM first (mouse events are typically less frequent)
     if gpm_revents.is_some_and(|r| r.contains(PollFlags::POLLIN)) {
-        tracing::trace!("GPM poll: GPM fd has data, reading event...");
         match gpm.read_event() {
             Ok(Some(gpm_event)) => {
-                tracing::trace!(
-                    "GPM event received: x={}, y={}, buttons={}, type=0x{:x}",
-                    gpm_event.x,
-                    gpm_event.y,
-                    gpm_event.buttons.0,
-                    gpm_event.event_type
-                );
                 if let Some(mouse_event) = gpm_to_crossterm(&gpm_event) {
-                    tracing::trace!("GPM event converted to crossterm: {:?}", mouse_event);
                     return Ok(Some(CrosstermEvent::Mouse(mouse_event)));
                 } else {
                     tracing::debug!("GPM event could not be converted to crossterm event");
                 }
             }
-            Ok(None) => {
-                tracing::trace!("GPM poll: read_event returned None");
-            }
+            Ok(None) => {}
             Err(e) => {
                 tracing::warn!("GPM poll: read_event error: {}", e);
             }
         }
     }
 
-    // Check stdin (crossterm events)
+    // Then stdin, parsed by fresh's state machine.
     if stdin_revents.is_some_and(|r| r.contains(PollFlags::POLLIN)) {
-        // Use crossterm's read since it handles escape sequence parsing
-        if event_poll(Duration::ZERO)? {
-            if let Some(ev) = safe_event_read()? {
-                return Ok(Some(ev));
-            }
+        reader.drain_stdin();
+        if let Some(ev) = reader.next_buffered() {
+            return Ok(Some(ev));
         }
     }
 
-    Ok(None)
+    Ok(reader.take_resize())
 }
 
 /// Skip stale mouse move events, return the latest one.
@@ -4713,6 +5025,14 @@ fn coalesce_mouse_moves(
 
     // Only coalesce mouse moves
     if !matches!(&event, CrosstermEvent::Mouse(m) if m.kind == MouseEventKind::Moved) {
+        return Ok((event, None));
+    }
+
+    // On Unix, the TtyReader owns stdin and already coalesces motion floods as
+    // it queues them; draining crossterm here would race the reader on fd 0
+    // (and re-introduce crossterm's fragile mouse parsing). Nothing to do.
+    #[cfg(unix)]
+    if fresh::services::tty_input::raw_input_active() {
         return Ok((event, None));
     }
 
@@ -4733,6 +5053,48 @@ fn coalesce_mouse_moves(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_kv_args_basic() {
+        let args = parse_kv_args(&["direction=vertical", "count=2"]);
+        assert_eq!(args.get("direction").map(String::as_str), Some("vertical"));
+        assert_eq!(args.get("count").map(String::as_str), Some("2"));
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_kv_args_ignores_non_kv_and_splits_on_first_eq() {
+        // Tokens without '=' are dropped; only the first '=' splits.
+        let args = parse_kv_args(&["bareword", "expr=a=b=c", "=noval", "k="]);
+        assert_eq!(args.get("expr").map(String::as_str), Some("a=b=c"));
+        assert_eq!(args.get("k").map(String::as_str), Some(""));
+        assert!(!args.contains_key("bareword"));
+        // Empty key is skipped.
+        assert!(!args.contains_key(""));
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_session_flag_removes_pair_anywhere() {
+        let (session, rest) =
+            extract_session_flag(&["cmd", "run", "--session", "proj", "split_vertical"]);
+        assert_eq!(session.as_deref(), Some("proj"));
+        assert_eq!(rest, vec!["cmd", "run", "split_vertical"]);
+    }
+
+    #[test]
+    fn test_extract_session_flag_absent() {
+        let (session, rest) = extract_session_flag(&["cmd", "list", "--json"]);
+        assert_eq!(session, None);
+        assert_eq!(rest, vec!["cmd", "list", "--json"]);
+    }
+
+    #[test]
+    fn test_extract_session_flag_dangling_value_ignored() {
+        let (session, rest) = extract_session_flag(&["cmd", "list", "--session"]);
+        assert_eq!(session, None);
+        assert_eq!(rest, vec!["cmd", "list"]);
+    }
 
     #[test]
     fn test_parse_file_location_simple_path() {
