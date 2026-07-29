@@ -1048,16 +1048,62 @@ impl Editor {
         }
     }
 
-    /// Handle SetSplitRatio command
-    pub(super) fn handle_set_split_ratio(&mut self, split_id: SplitId, ratio: f32) {
-        // Plugin sends arbitrary SplitId — convert to ContainerId at the boundary
-        let container_id = ContainerId(split_id);
-        self.windows
+    /// Handle SetSplitRatio command.
+    ///
+    /// Every split id a plugin can obtain is a *leaf* id (`getActiveSplitId`,
+    /// `listSplits`, `BufferInfo.splits`, `createTerminal` all return leaf
+    /// ids), but only a `SplitNode::Split` *container* carries a resizable
+    /// `ratio`. So we resolve the leaf to its parent container and set the
+    /// parent's ratio — that is exactly "resize the pane the plugin is
+    /// pointing at" (it moves the divider between that leaf and its sibling).
+    ///
+    /// Ratio orientation: a parent `Split`'s `ratio` is the fraction of space
+    /// given to its FIRST child (larger ratio => bigger first child, smaller
+    /// second child). A plugin asking to resize "its" leaf resizes that
+    /// parent split; whether the leaf is the first or second child, adjusting
+    /// the parent ratio is the single, well-defined knob for that divider, and
+    /// the stored value is clamped only to the raw `[0.0, 1.0]` range; a sibling
+    /// pane is kept usable by the layout-time min-pane-size guard rather than a
+    /// fixed percentage floor. Callers wanting a specific pane to grow should
+    /// account for which side it sits on.
+    ///
+    /// Returns `true` if the ratio was applied:
+    /// - a leaf id with a resizable parent `Split` → set the parent's ratio;
+    /// - a container id (rare for plugins) → set it directly (legacy behavior);
+    /// - a lone top-level leaf (no parent container) or unknown id → no-op,
+    ///   `false`. Never panics (issue #2770, follow-up to #2774).
+    pub(super) fn handle_set_split_ratio(&mut self, split_id: SplitId, ratio: f32) -> bool {
+        let manager = self
+            .windows
             .get_mut(&self.active_window)
             .and_then(|w| w.split_manager_mut())
-            .expect("active window must have a populated split layout")
-            .set_ratio(container_id, ratio);
-        tracing::debug!("Set split {:?} ratio to {}", split_id, ratio);
+            .expect("active window must have a populated split layout");
+
+        // Try the id as a container directly first (preserves behavior for a
+        // real container id); `set_ratio` is a no-op returning `false` on a
+        // leaf/grouped/unknown node. If that fails, resolve the (leaf) id to
+        // its parent container and set that.
+        let applied = if manager.set_ratio(ContainerId(split_id), ratio) {
+            true
+        } else if let Some(parent) = manager.parent_container_of(LeafId(split_id)) {
+            manager.set_ratio(parent, ratio)
+        } else {
+            false
+        };
+
+        if applied {
+            // The two panes either side of the container changed width /
+            // height — reflow through the layout funnel so their terminals
+            // follow, same as the separator drag and `adjust_split_size`.
+            self.relayout();
+            tracing::debug!("Set split {:?} ratio to {}", split_id, ratio);
+        } else {
+            tracing::debug!(
+                "setSplitRatio: split {:?} has no resizable parent container; ignoring",
+                split_id
+            );
+        }
+        applied
     }
 
     /// Handle DistributeSplitsEvenly command
@@ -1069,6 +1115,8 @@ impl Editor {
             .and_then(|w| w.split_manager_mut())
             .expect("active window must have a populated split layout")
             .distribute_splits_evenly();
+        // Every pane just changed size — reflow through the layout funnel.
+        self.relayout();
         tracing::debug!("Distributed splits evenly");
     }
 
@@ -1429,7 +1477,12 @@ impl Editor {
         line: Option<usize>,
         column: Option<usize>,
     ) -> AnyhowResult<()> {
-        // Switch to the target split
+        // Validate the target split BEFORE touching any buffer state so a
+        // dead/unknown split id cannot leave an orphan buffer loaded with
+        // nothing on screen. `set_active_split` returns false when the id
+        // doesn't resolve to a live leaf (the split was closed, or its last
+        // tab collapsed it away). Surface that as an error so the failure is
+        // reported instead of masquerading as success (#2769).
         let target_split_id = LeafId(SplitId(split_id));
         if !self
             .windows
@@ -1439,13 +1492,13 @@ impl Editor {
             .set_active_split(target_split_id)
         {
             tracing::error!("Failed to switch to split {}", split_id);
-            return Ok(());
+            anyhow::bail!("openFileInSplit: split {} does not exist", split_id);
         }
 
         // Open the file in the now-active split
         if let Err(e) = self.open_file(&path) {
             tracing::error!("Failed to open file from plugin: {}", e);
-            return Ok(());
+            return Err(e);
         }
 
         // Jump to the specified location (or default to start)
@@ -2018,6 +2071,113 @@ impl Editor {
             state
                 .margins
                 .clear_line_indicators_for_namespace(&namespace);
+        }
+    }
+
+    // ==================== Scrollbar Marker Commands ====================
+
+    /// Convert plugin-supplied markers to byte anchors.
+    ///
+    /// Markers addressed by `line` on a buffer whose line count is not known
+    /// yet (a large file before the incremental line scan) are dropped rather
+    /// than anchored at byte 0 — a wrong position is worse than a missing
+    /// mark, and byte-addressed markers work in that regime.
+    fn resolve_scrollbar_markers(
+        state: &crate::state::EditorState,
+        markers: &[fresh_core::api::ScrollbarMarker],
+    ) -> Vec<crate::view::scrollbar_marker::ResolvedMarker> {
+        let buffer_len = state.buffer.len();
+        markers
+            .iter()
+            .filter_map(|m| {
+                crate::view::scrollbar_marker::ResolvedMarker::from_api(m, |line| {
+                    state.buffer.line_start_offset(line)
+                })
+            })
+            .map(|mut m| {
+                m.start = m.start.min(buffer_len);
+                m.end = m.end.map(|e| e.min(buffer_len));
+                m
+            })
+            .collect()
+    }
+
+    /// Handle SetScrollbarMarkers — replace a namespace's whole marker set.
+    pub(super) fn handle_set_scrollbar_markers(
+        &mut self,
+        buffer_id: BufferId,
+        namespace: String,
+        markers: Vec<fresh_core::api::ScrollbarMarker>,
+    ) {
+        if let Some(state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .expect("active window present")
+            .buffer_state_mut(buffer_id)
+        {
+            let resolved = Self::resolve_scrollbar_markers(state, &markers);
+            let requested = resolved.len();
+            let stored = state.scrollbar_markers.set_markers(&namespace, resolved);
+            if stored < requested {
+                tracing::debug!(
+                    namespace = %namespace,
+                    requested,
+                    stored,
+                    "scrollbar markers truncated at the per-namespace cap"
+                );
+            }
+            #[cfg(feature = "plugins")]
+            {
+                self.plugin_render_requested = true;
+            }
+        }
+    }
+
+    /// Handle SetScrollbarMarkersInRange — replace only the markers anchored
+    /// in `[start, end)`, so a viewport-driven producer can publish the region
+    /// it just scanned without disturbing what it learned elsewhere.
+    pub(super) fn handle_set_scrollbar_markers_in_range(
+        &mut self,
+        buffer_id: BufferId,
+        namespace: String,
+        start: usize,
+        end: usize,
+        markers: Vec<fresh_core::api::ScrollbarMarker>,
+    ) {
+        if let Some(state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .expect("active window present")
+            .buffer_state_mut(buffer_id)
+        {
+            let resolved = Self::resolve_scrollbar_markers(state, &markers);
+            state
+                .scrollbar_markers
+                .set_markers_in_range(&namespace, start, end, resolved);
+            #[cfg(feature = "plugins")]
+            {
+                self.plugin_render_requested = true;
+            }
+        }
+    }
+
+    /// Handle ClearScrollbarMarkers
+    pub(super) fn handle_clear_scrollbar_markers(
+        &mut self,
+        buffer_id: BufferId,
+        namespace: String,
+    ) {
+        if let Some(state) = self
+            .windows
+            .get_mut(&self.active_window)
+            .expect("active window present")
+            .buffer_state_mut(buffer_id)
+        {
+            state.scrollbar_markers.clear_namespace(&namespace);
+            #[cfg(feature = "plugins")]
+            {
+                self.plugin_render_requested = true;
+            }
         }
     }
 
@@ -3174,16 +3334,24 @@ impl Editor {
                     if ins_len > del_len {
                         state.marker_list.adjust_for_insert(pos, ins_len - del_len);
                         state.margins.adjust_for_insert(pos, ins_len - del_len);
+                        state
+                            .scrollbar_markers
+                            .adjust_for_insert(pos, ins_len - del_len);
                     } else if del_len > ins_len {
                         state.marker_list.adjust_for_delete(pos, del_len - ins_len);
                         state.margins.adjust_for_delete(pos, del_len - ins_len);
+                        state
+                            .scrollbar_markers
+                            .adjust_for_delete(pos, del_len - ins_len);
                     }
                 } else if del_len > 0 {
                     state.marker_list.adjust_for_delete(pos, del_len);
                     state.margins.adjust_for_delete(pos, del_len);
+                    state.scrollbar_markers.adjust_for_delete(pos, del_len);
                 } else if ins_len > 0 {
                     state.marker_list.adjust_for_insert(pos, ins_len);
                     state.margins.adjust_for_insert(pos, ins_len);
+                    state.scrollbar_markers.adjust_for_insert(pos, ins_len);
                 }
             }
 

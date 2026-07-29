@@ -72,9 +72,30 @@ type CompletionItem = { value: string; kind?: "history" };
 interface AgentSession {
   // Editor's stable session id.
   id: number;
-  // Display label (defaults to root basename — Orchestrator never
-  // renames externally-created sessions).
+  // Resolved display name shown in the dock / picker. Computed by
+  // `workspaceDisplayName` from three sources, most-specific first: a
+  // manual rename (`renameWorkspace`, persisted per root), else an
+  // auto-name tracking the terminal's tab title (constant workspace
+  // prefix + the terminal/process title), else `hostLabel`.
   label: string;
+  // The raw label the host reports for this window (root basename for a
+  // fresh session). The stable fallback when there's no manual rename and
+  // no terminal to track — kept separate from `label` so the resolver can
+  // recompute the display name without losing the host's own name.
+  hostLabel: string;
+  // Last-seen terminal tab title (combined foreground process + OSC title,
+  // the same string shown on the terminal's tab). Drives the auto-name
+  // when the workspace hasn't been manually renamed. `undefined` until the
+  // session's terminal reports a non-default title.
+  terminalTitle?: string;
+  // Latest explicit OSC activity signal from the session's terminal (OSC
+  // 133 command markers / OSC 9;4 progress): `true` = a command/task is
+  // running, `false` = it has finished. When set, this is authoritative for
+  // the working/idle indicator (see `sessionState`), so an agent that goes
+  // quiet mid-command still reads "working" and a finished one flips to
+  // idle at once. `undefined`/`null` ⇒ no signal, fall back to output
+  // timing.
+  oscRunning?: boolean | null;
   // Absolute filesystem root.
   root: string;
   // Canonical project root this session belongs to (set at
@@ -360,8 +381,21 @@ const SESSION_BACKENDS: { id: SessionBackend; label: string; key: string }[] = [
 ];
 
 interface NewSessionForm {
+  // Where the agent lands: a terminal in the CURRENT workspace, or a brand-new
+  // one. This is the dialog's top-level mode switch — "current" hides every
+  // workspace-creation control (backend tabs, Project Path, Workspace Name,
+  // the Advanced fold), leaving just "which agent, with what options", which
+  // is the whole of the old separate Run-Agent dialog. "new" reveals them all.
+  //
+  // Both entry points open *this* form; they differ only in what they default
+  // this field to (Run Agent → "current", New Workspace → "new"). Keeping one
+  // form is what stops the two launch paths drifting apart — they used to be
+  // separate dialogs with separate submit functions, and the current-workspace
+  // one silently dropped the agent-resume argv.
+  target: RunAgentTarget;
   // Which backend the session runs in (the "Run in:" tab selection). Drives
   // which field set `buildFormSpec` renders and which submit path runs.
+  // Only meaningful (and only rendered) when `target === "new"`.
   backend: SessionBackend;
   // --- SSH backend fields (rendered only when backend === "ssh") ---
   // Host as `host`, `user@host[:port]`, or a pasted `ssh://…` (user optional);
@@ -493,6 +527,12 @@ interface NewSessionForm {
 let form: NewSessionForm | null = null;
 let formPanel: FloatingWidgetPanel | null = null;
 
+// Where a launch lands: a terminal in the CURRENT workspace, or a fresh
+// worktree + window. The New-Workspace form's top-level switch (see
+// `NewSessionForm.target`); "Run Agent…" is that same form opened on
+// "current".
+type RunAgentTarget = "current" | "new";
+
 const NEW_SESSION_MODE = "orchestrator-new-form";
 
 // The "New Folder" dialog — a small centered floating panel with a name
@@ -521,6 +561,11 @@ interface CreateFolderDialogState {
   // create and rename the same UX rather than bouncing rename through
   // the bottom minibuffer prompt. null ⇒ create mode.
   renameId: string | null;
+  // Workspace-rename mode: the session id this dialog renames. Mutually
+  // exclusive with `renameId` (a folder rename). When set, the dialog
+  // prompts for a workspace name and submit pins a manual name on the
+  // session's root. null ⇒ not a workspace rename.
+  renameSessionId: number | null;
 }
 let createFolderDialog: CreateFolderDialogState | null = null;
 let createFolderPanel: FloatingWidgetPanel | null = null;
@@ -543,25 +588,6 @@ let createFolderFocusKey = "folder-name";
 // palette-launched agent is indistinguishable from a dialogue-launched
 // one.
 // ---------------------------------------------------------------------
-const RUN_AGENT_MODE = "orchestrator-run-agent-dialog";
-// Where a Run-Agent launch lands: a terminal in the CURRENT window, or a
-// fresh worktree + window (the dialogue's classic path).
-type RunAgentTarget = "current" | "new";
-interface RunAgentDialogState {
-  // Index into `runAgentProcesses()` (0 = bare terminal, then agents).
-  agentIndex: number;
-  target: RunAgentTarget;
-  // Auto/bypass-approvals mode. Only meaningful (and only shown) for an
-  // agent whose registry entry has an `auto` flag.
-  auto: boolean;
-  // Optional first prompt handed to the agent at launch. Only shown for
-  // an agent that documents a prompt argument.
-  prompt: { value: string; cursor: number };
-}
-let runAgentDialog: RunAgentDialogState | null = null;
-let runAgentPanel: FloatingWidgetPanel | null = null;
-// Persisted last choice so the dialog reopens where the user left it.
-const RUN_AGENT_LAST_KEY = "orchestrator.run_agent.last";
 
 // Open dialog state. `null` ⇒ the picker isn't mounted. Lives
 // alongside the new-session form state but is independent of
@@ -794,6 +820,16 @@ function dockContentCols(dockWidth: number): number {
 // (dispatch_floating_widget_key) reads the panel focus directly to route
 // Enter/Esc/Space//'; this mirror is informational for the plugin.
 let dockFocus: "list" | "filter" = "list";
+// Set just before the dock blurs *because the user picked a workspace*
+// (a row click, Enter on the list, or attaching a discovered worktree
+// with `dive`). The `blur` handler clears the search filter so a stale
+// needle can't silently hide sessions on the next focus (F5) — but a
+// dive isn't "leaving the dock", it's acting on the very list the
+// filter produced. Wiping the needle there forces a retype for every
+// workspace picked out of a search. Consumed (and reset) by the next
+// `blur`; also reset on `focus` so an unconsumed flag can't leak into a
+// later, unrelated blur.
+let dockDiveBlur = false;
 // Full focused-widget mirror for the open dialog (both dock and
 // centered-picker modes). Updated from every `focus` widget_event.
 // Used by `toggleSelectCurrent` so a Space keypress while focus is
@@ -809,23 +845,101 @@ let pickerFocusKey: string = "sessions";
 // updates this and the next open honours it.
 let lastOpenScope: "current" | "all" = "all";
 // Remembered across opens, like `lastOpenScope`: whether the
-// discovered on-disk worktree rows are shown. Defaults to false
-// (worktrees hidden) — surfacing them is opt-in via "Show all
-// worktrees" (Alt+T).
-let lastShowWorktrees = false;
+// discovered on-disk worktree rows are shown. `null` means "not touched
+// this session" — the dock then seeds it from the `showAllWorktrees`
+// plugin setting (default false: worktrees hidden, surfacing them is
+// opt-in via "Show all worktrees" / Alt+T). Flipping the checkbox pins a
+// concrete value that wins for the rest of the session.
+let lastShowWorktrees: boolean | null = null;
 // Remembered across opens: whether "trivial" sessions are hidden.
-// Defaults to true — every editor launch on a throwaway directory or a
-// single file leaves a workspace file behind, which restores as a shell
-// window and clutters the list. Hiding them by default keeps the picker
-// focused on real sessions; the "Show empty/1-file sessions" checkbox
-// (Alt+I) reveals them.
-let lastHideTrivial = true;
-// Dock card density, remembered across opens. "card" (default) shows
-// the three-line rounded pill; "compact" shows one line per session.
-// Toggled by the dock toolbar's "view" button.
+// `null` ⇒ seeded from the `showEmptyWorkspaces` setting, which defaults
+// to true (nothing hidden). A freshly created workspace starts empty, so
+// hiding trivial sessions made it vanish the instant it lost the
+// "active" exemption (issue: "new workspace immediately disappears").
+// Showing all by default keeps new workspaces visible; the "show empty"
+// checkbox (Alt+I) opts back into hiding the throwaway single-file /
+// restored-shell rows.
+let lastHideTrivial: boolean | null = null;
+// Dock card density. "card" (default) shows the three-line rounded pill;
+// "compact" shows one line per session. Read all over the render path,
+// so it stays a plain value rather than a config lookup; the dock
+// re-seeds it from the `defaultView` setting on open unless the user has
+// hit the toolbar's "view" button this session (`dockViewOverride`).
 let dockView: "card" | "compact" = "card";
+let dockViewOverride: "card" | "compact" | null = null;
 // Remembered dock project filter (see `OpenDialogState.projectFilter`).
 let lastDockProjectFilter: string | null = null;
+
+// =============================================================================
+// Dock settings (Settings → Plugin: orchestrator)
+//
+// The dock's start-up defaults are *plugin* config, not core editor
+// config: they only mean anything while this plugin is loaded, and the
+// plugin-config API already gives us schema validation, the layered
+// User/Project/Session merge, and a rendered Settings sub-category for
+// free. Declaring them here is what makes them discoverable — before
+// this, the dock's defaults were module constants only a source-reader
+// could find, and the checkbox/density state was session-only.
+//
+// Each field is the *default* the dock opens with. The in-dock controls
+// (the "view" button, the two Filters checkboxes) still win for the rest
+// of the session — they set the `*Override` / `last*` values above —
+// they just no longer decide where the dock starts.
+editor.defineConfigBoolean("autoOpenDock", {
+  default: false,
+  description:
+    "Open the workspace dock automatically when Fresh starts. The dock opens unfocused, so typing still goes to the editor.",
+});
+editor.defineConfigEnum("defaultView", {
+  values: ["card", "compact"] as const,
+  default: "card",
+  description:
+    "Dock layout the panel opens with: 'card' (multi-line pill per workspace) or 'compact' (one line per workspace). The dock's 'view' button flips it for the current session.",
+});
+editor.defineConfigBoolean("showAllWorktrees", {
+  default: false,
+  description:
+    "Start the dock (and the Open picker) with 'all worktrees' checked, listing on-disk worktrees that have no open workspace.",
+});
+editor.defineConfigBoolean("showEmptyWorkspaces", {
+  default: true,
+  description:
+    "Start the dock (and the Open picker) with 'show empty' checked, listing workspaces with no edited files (freshly created ones included).",
+});
+
+interface DockSettings {
+  autoOpenDock?: boolean;
+  defaultView?: "card" | "compact";
+  showAllWorktrees?: boolean;
+  showEmptyWorkspaces?: boolean;
+}
+
+// Re-read on demand rather than caching the values `defineConfigX`
+// returned at load time: a Settings-UI edit lands in the config snapshot
+// straight away, so the next dock open honours it without a plugin
+// reload or an editor restart.
+function dockSettings(): DockSettings {
+  return (editor.getPluginConfig() ?? {}) as DockSettings;
+}
+
+// Density the dock should open at: the session's own "view" toggle if
+// the user has hit it, otherwise the configured default.
+function configuredDockView(): "card" | "compact" {
+  if (dockViewOverride !== null) return dockViewOverride;
+  return dockSettings().defaultView === "compact" ? "compact" : "card";
+}
+
+// The two Filters checkboxes, same precedence. `hideTrivial` is the
+// inverse of the user-facing "show empty" checkbox.
+function configuredShowWorktrees(): boolean {
+  if (lastShowWorktrees !== null) return lastShowWorktrees;
+  return dockSettings().showAllWorktrees === true;
+}
+
+function configuredHideTrivial(): boolean {
+  if (lastHideTrivial !== null) return lastHideTrivial;
+  return dockSettings().showEmptyWorkspaces === false;
+}
 
 // =============================================================================
 // Dock folder tree
@@ -986,6 +1100,147 @@ function renameFolder(id: string, name: string): void {
     f.name = name;
     saveFolders();
   }
+}
+
+// ── Per-workspace "last active" day — the dock's within-folder sort key ──
+//
+// Within a folder the dock lists the most-recently-active workspaces first,
+// but at DAY granularity so the order is stable through the day and only
+// reshuffles when a workspace crosses a day boundary (a finer key would
+// re-sort — and, since a changed serialized row forces a full panel
+// teardown/rebuild, flicker — on every render; same rationale as
+// `ageString`). We persist the last-active *day number* keyed by canonical
+// root so the recency order survives restarts: the in-memory `lastOutputAt`
+// / `activatedAt` reset each launch and `createdAt` is stamped at reconcile
+// time, so without persistence every workspace would read "active today"
+// after a relaunch and the order would collapse to first-seen.
+const LAST_ACTIVE_KEY = "orchestrator.dock.last_active";
+const MS_PER_DAY = 86_400_000;
+let dockLastActive: Record<string, number> | null = null;
+
+function loadLastActive(): Record<string, number> {
+  if (dockLastActive) return dockLastActive;
+  const raw = editor.getGlobalState(LAST_ACTIVE_KEY);
+  const out: Record<string, number> = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+    }
+  }
+  dockLastActive = out;
+  return out;
+}
+
+function saveLastActive(): void {
+  editor.setGlobalState(LAST_ACTIVE_KEY, (dockLastActive ?? {}) as unknown as object);
+}
+
+function todayDayNumber(): number {
+  return Math.floor(Date.now() / MS_PER_DAY);
+}
+
+// Record that a session was active "today". Writes through to global state
+// only when the stored day actually advances, so a chatty terminal (this
+// fires on every output batch) persists at most once per session per day
+// rather than thrashing the store on every keystroke.
+function markSessionActiveToday(s: AgentSession): void {
+  // On-disk (discovered) rows have no activity of their own — their recency
+  // is meaningless, so don't record (and they sort oldest, see below).
+  if (s.discovered) return;
+  const key = normRoot(s.root);
+  const day = todayDayNumber();
+  const store = loadLastActive();
+  if (store[key] === day) return;
+  store[key] = day;
+  saveLastActive();
+}
+
+// The most recent day this session was active, at day granularity. Prefer
+// the persisted value — it's the real last-active day, updated on every
+// output / activation — so a workspace last used days ago sorts below one
+// used today even though both are live *now* (`createdAt` is stamped at
+// reconcile time and would otherwise pin every restored session to "today").
+// A session with no persisted day yet (never active this run, no history)
+// falls back to today, so a brand-new workspace still sorts as current. A
+// discovered on-disk row is keyed by the same root as the live session it
+// becomes, so opening it never changes its day — hence never its position.
+function sessionLastActiveDay(s: AgentSession): number {
+  const stored = loadLastActive()[normRoot(s.root)];
+  if (stored !== undefined) return stored;
+  const liveMs = Math.max(s.lastOutputAt ?? 0, s.activatedAt ?? 0, s.createdAt ?? 0);
+  return liveMs > 0 ? Math.floor(liveMs / MS_PER_DAY) : todayDayNumber();
+}
+
+// ── Workspace names: manual rename + terminal-tracking auto-name ─────────
+//
+// A workspace's display name comes from three sources, most-specific first:
+//   1. a manual rename (persisted per canonical root, survives restarts),
+//   2. else, when it has a terminal that reports a title, an auto-name that
+//      tracks that terminal: a constant prefix (the workspace's own name, so
+//      you can still tell which workspace it is) + the changing terminal/
+//      process title (the same string the terminal tab shows),
+//   3. else the host's own label (root basename).
+// Manual rename always wins, so naming a workspace pins it against the
+// auto-name (which would otherwise keep overwriting it as the tab title
+// shifts).
+const WORKSPACE_NAMES_KEY = "orchestrator.dock.names";
+// Separator between the constant workspace prefix and the changing terminal
+// title in an auto-name (e.g. `proj · bash — root@host: ~/proj`).
+const WORKSPACE_AUTONAME_SEP = " \u{b7} ";
+let dockNames: Record<string, string> | null = null;
+
+function loadNames(): Record<string, string> {
+  if (dockNames) return dockNames;
+  const raw = editor.getGlobalState(WORKSPACE_NAMES_KEY);
+  const out: Record<string, string> = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof v === "string" && v.length > 0) out[k] = v;
+    }
+  }
+  dockNames = out;
+  return out;
+}
+
+function saveNames(): void {
+  editor.setGlobalState(WORKSPACE_NAMES_KEY, (dockNames ?? {}) as unknown as object);
+}
+
+// The manual name pinned to this session's root, if any.
+function workspaceCustomName(s: AgentSession): string | undefined {
+  return loadNames()[normRoot(s.root)];
+}
+
+// Compute the display name for a session from the three sources above.
+function workspaceDisplayName(s: AgentSession): string {
+  const manual = workspaceCustomName(s);
+  if (manual) return manual;
+  const title = (s.terminalTitle ?? "").trim();
+  if (title && !s.discovered) {
+    const prefix = (s.hostLabel || editor.pathBasename(s.root) || "workspace").trim();
+    return prefix + WORKSPACE_AUTONAME_SEP + title;
+  }
+  return s.hostLabel;
+}
+
+// Recompute and store `s.label` from the current sources. Called whenever an
+// input changes: reconcile (host label), terminal output (title), or a
+// manual rename.
+function applyResolvedLabel(s: AgentSession): void {
+  s.label = workspaceDisplayName(s);
+}
+
+// Set (or, with an empty name, clear) the manual name for a session and
+// refresh its resolved label. Clearing lets the auto-name / host label take
+// over again.
+function renameWorkspace(s: AgentSession, name: string): void {
+  const key = normRoot(s.root);
+  const store = loadNames();
+  const trimmed = name.trim();
+  if (trimmed) store[key] = trimmed;
+  else delete store[key];
+  saveNames();
+  applyResolvedLabel(s);
 }
 
 // Delete a folder. Its child folders and member sessions reparent to the
@@ -1190,17 +1445,69 @@ function sessionNodeEntry(id: number, activeId: number): TextPropertyEntry {
 }
 
 // The dock's "card" density renders each session leaf as a fixed
-// 3-content-row card inside the tree; with `cardBorders` the host
-// wraps those rows in a rounded `╭─…─╮` border (5 screen rows total),
-// restoring the modal picker's pill look: line 1 = glyph · [facet] ·
-// NAME + project; line 2 = branch + git summary (right-aligned against
-// the card border); line 3 = PR badge (blank when none).
-const DOCK_CARD_HEIGHT = 3;
+// 2-content-row card inside the tree; with `cardBorders` the host wraps
+// those rows in a rounded `╭─…─╮` border (4 screen rows total). Two
+// rows, each one "what it is" on the left and "how it's doing" flush
+// right, so the status columns line up down the dock:
+//
+//   ╭──────────────────────────────╮
+//   │ * fresh-27            ↑2 +14 │   name              git
+//   │ ▸ fix/wrapped-nav   PR #2784 │   branch / project  PR
+//   ╰──────────────────────────────╯
+//
+// It was three rows: the third held the PR badge and stood empty on
+// every session without one, and the branch shared the middle row with
+// the git summary as a single right-aligned group — which left it
+// floating in the middle of the card instead of starting at the left
+// edge. The name-repeating branch (a worktree branch usually *is* the
+// workspace name) and the project tag beside the name were dropped for
+// the same reason: they spent a card's scarce width on what the row
+// already said.
+const DOCK_CARD_HEIGHT = 2;
+
+// A card row split into a left group and a right group flush against
+// the card's right border. Tree card rows are plain text entries (no
+// host flex spacer like the modal pill's `flexLine`), so the split
+// point rides along as a byte offset and the host's `render_tree_card`
+// — which knows the card's *actual* inner width, responsive or dragged
+// — inserts the gap. Plugin-side padding could only estimate that width
+// and drifted at every other one.
+function cardSplitRow(left: Entry[], right: Entry[]): TextPropertyEntry {
+  const row = styledRow([...left, ...right] as Parameters<typeof styledRow>[0]);
+  if (right.length === 0) return row;
+  row.properties = {
+    align: "between",
+    splitByte: left.reduce((n, e) => n + utf8Len(e.text), 0),
+  };
+  return row;
+}
+
+// Truncate to `cols` display columns, ellipsising when it doesn't fit.
+// Code-point aware (`Array.from`), so a multi-byte name can't be cut
+// mid-character.
+function capText(s: string, cols: number): string {
+  const chars = Array.from(s);
+  if (chars.length <= cols) return s;
+  return chars.slice(0, Math.max(1, cols - 1)).join("") + "…";
+}
+
+// Columns a group of entries occupies, for the left-group cap below.
+function entriesWidth(entries: Entry[]): number {
+  return entries.reduce((n, e) => n + Array.from(e.text).length, 0);
+}
+
+// Inner width of a card at the dock's default width — an estimate (the
+// dock can be dragged), used only to cap the branch so it doesn't shove
+// the right-hand group off the row. The host does the exact alignment.
+function cardInnerColsEstimate(): number {
+  return Math.max(12, dockContentCols(dockDefaultWidth()) - 2);
+}
 
 // Card line 1 (the tree node's primary text): state glyph, optional
-// remote facet, the name (highlighted when active), then a dim project
-// tag. Distinct from the compact `sessionNodeEntry`, which trails the
-// branch on the single line instead of the project.
+// remote facet, the name (highlighted when active) and — for a remote
+// session — its backend target, with the git summary flush right.
+// Distinct from the compact `sessionNodeEntry`, which trails the git
+// summary on the single line it has.
 function sessionCardPrimary(id: number, activeId: number): TextPropertyEntry {
   const s = orchestratorSessions.get(id);
   if (!s) return styledRow([{ text: editor.t("pill.unknown") }]);
@@ -1216,61 +1523,87 @@ function sessionCardPrimary(id: number, activeId: number): TextPropertyEntry {
     text: s.label,
     style: { fg: isActive ? "ui.help_key_fg" : undefined, bold: true },
   });
-  const proj = editor.pathBasename(projectKeyOf(s));
-  segs.push({ text: "  " + PROJECT_ICON + " ", style: { fg: "ui.menu_disabled_fg" } });
-  segs.push({ text: proj, style: { fg: "ui.menu_disabled_fg", italic: true } });
   // A remote session surfaces its backend target (host / ns·pod) coloured
   // by the connection state — pill parity (the pill shows it at the right
-  // end of line 1). The discovered "· on-disk" tag is NOT repeated here:
-  // the card's third line (prLineEntries) already carries it, exactly like
-  // the pill.
+  // end of line 1).
   if (s.remote) {
     segs.push({
       text: "  " + s.remote.detail,
       style: { fg: remoteStateFg(s.remote.state), italic: true },
     });
   }
-  return styledRow(segs as Parameters<typeof styledRow>[0]);
+  // Right group. A being-created placeholder has no git summary; it gets
+  // the one-key affordance instead ("↵ Retry"), so the row below is free
+  // for the whole status message.
+  if (s.pending) {
+    return cardSplitRow(
+      segs,
+      pendingActionable(s.pending)
+        ? [{
+          text: "↵ " + editor.t("dock.ctx_retry"),
+          style: { fg: "ui.menu_disabled_fg", italic: true },
+        }]
+        : [],
+    );
+  }
+  return cardSplitRow(segs, gitLineParts(s).right);
 }
 
-// Card lines 2 & 3 (continuation rows). Line 2 is the branch + a
-// compact git summary, right-aligned as one group against the card's
-// right border; line 3 is the PR badge (or a blank spacer when there's
-// no PR, keeping every card the same height). Tree card rows are plain
-// text entries (no host flex spacer), so the line carries the
-// `align: "right"` entry property and the host's `render_tree_card` —
-// which knows the card's *actual* inner width, responsive or dragged —
-// pads it flush against the right border.
+// Card line 2 (the continuation row): what this workspace *is* on the
+// left — its branch when that says something the name doesn't, else the
+// project it belongs to — and its PR badge (or the on-disk tag) flush
+// right.
 function sessionCardExtraLines(id: number): TextPropertyEntry[] {
   const s = orchestratorSessions.get(id);
   if (!s) return [];
-  // A being-created placeholder shows its status in place of the git / PR
-  // lines: line 2 is the creating/connecting/error message, line 3 is a
-  // retry/resume hint (blank while still creating).
+  // A being-created placeholder spends the row on its status message
+  // (the retry affordance sits on line 1).
   if (s.pending) {
     const p = s.pending;
-    const actionable = pendingActionable(p);
     return [
-      styledRow([{ text: p.message, style: { fg: pendingMsgFg(p), italic: actionable } }]),
-      styledRow([
-        actionable
-          ? { text: pendingHintText(p), style: { fg: "ui.menu_disabled_fg", italic: true } }
-          : { text: " " },
-      ] as Parameters<typeof styledRow>[0]),
+      styledRow([{
+        text: p.message,
+        style: { fg: pendingMsgFg(p), italic: pendingActionable(p) },
+      }]),
     ];
   }
-  const git = gitLineParts(s);
-  const gitSegs: Entry[] = [...git.left];
-  if (git.right.length) {
-    gitSegs.push({ text: "   " });
-    gitSegs.push(...git.right);
+  const dim = "ui.menu_disabled_fg";
+  const right = prLineEntries(s);
+  // The branch earns the row only when it differs from the workspace
+  // name — a worktree's branch is usually named after it, and printing
+  // it twice was pure noise. Otherwise the project takes the slot: it's
+  // the context the name doesn't carry. `(detached)` is reserved for a
+  // real repo with no branch; a plain directory just shows its project.
+  const branch = s.branch ||
+    (s.discovered
+      ? editor.t("pill.branch_worktree")
+      : s.git?.info
+      ? editor.t("pill.branch_detached")
+      : "");
+  const showBranch = branch !== "" && branch !== s.label;
+  const proj = editor.pathBasename(projectKeyOf(s));
+  const icon = showBranch ? BRANCH_ICON : PROJECT_ICON;
+  const text = showBranch ? branch : proj;
+  // Nothing to say that the name doesn't already say (a plain folder
+  // opened as its own project, whose label *is* the folder). The row
+  // stays empty rather than echoing the line above it.
+  if (text === s.label) {
+    return [cardSplitRow(right.length > 0 ? [] : [{ text: " " }], right)];
   }
-  const gitLine = styledRow(gitSegs as Parameters<typeof styledRow>[0]);
-  gitLine.properties = { align: "right" };
-  const pr = prLineEntries(s);
+  // Cap the branch/project so the badge keeps its columns: the host
+  // truncates the row's *end*, which is the badge. Budget = the card's
+  // inner width less this row's icon (2 cols), the badge, and the one
+  // column that always separates the two groups.
+  const cap = cardInnerColsEstimate() - 2 - entriesWidth(right) -
+    (right.length > 0 ? 1 : 0);
   return [
-    gitLine,
-    styledRow((pr.length ? pr : [{ text: " " }]) as Parameters<typeof styledRow>[0]),
+    cardSplitRow(
+      [
+        { text: icon + " ", style: { fg: dim } },
+        { text: capText(text, Math.max(8, cap)), style: { fg: dim, italic: !showBranch } },
+      ],
+      right,
+    ),
   ];
 }
 
@@ -1406,7 +1739,8 @@ function reconcileSessions(): void {
       if (remote) pendingRemoteFacet = null;
       orchestratorSessions.set(s.id, {
         id: s.id,
-        label: s.label,
+        label: loadNames()[normRoot(s.root)] ?? s.label,
+        hostLabel: s.label,
         root: s.root,
         projectPath: s.project_path,
         sharedWorktree: s.shared_worktree ?? false,
@@ -1420,7 +1754,10 @@ function reconcileSessions(): void {
         remote: remote ?? backendFacet(s),
       });
     } else {
-      existing.label = s.label;
+      // Track the host's raw label, then re-resolve the display name (a
+      // manual rename or terminal auto-name overrides it).
+      existing.hostLabel = s.label;
+      applyResolvedLabel(existing);
       existing.root = s.root;
       existing.projectPath = s.project_path;
       if (s.shared_worktree != null) existing.sharedWorktree = s.shared_worktree;
@@ -1529,14 +1866,16 @@ async function refreshDiscoveredWorktrees(): Promise<void> {
         const label = wt.branch || editor.pathBasename(wt.path);
         const existing = orchestratorSessions.get(id);
         if (existing) {
-          existing.label = label;
+          existing.hostLabel = label;
+          applyResolvedLabel(existing);
           existing.root = wt.path;
           existing.projectPath = listed.mainRoot;
           existing.branch = wt.branch;
         } else {
           orchestratorSessions.set(id, {
             id,
-            label,
+            label: loadNames()[normRoot(wt.path)] ?? label,
+            hostLabel: label,
             root: wt.path,
             projectPath: listed.mainRoot,
             sharedWorktree: false,
@@ -1583,15 +1922,28 @@ const IDLE_AFTER_MS = 5000;
 // stored `state` field is just a cache of this for persistence/sorting.
 // No output ever (or no terminal) ⇒ idle: we have no evidence of work.
 function sessionState(s: AgentSession): AgentState {
+  // An explicit OSC activity signal (shell integration / progress) is
+  // authoritative over the output-timing heuristic: a command running keeps
+  // the workspace "working" even while it prints nothing, and a finished
+  // command flips it idle at once rather than riding out IDLE_AFTER_MS.
+  if (s.oscRunning === true) return "working";
+  if (s.oscRunning === false) return "idle";
   if (s.lastOutputAt === null) return "idle";
   return Date.now() - s.lastOutputAt < IDLE_AFTER_MS ? "working" : "idle";
 }
 
+// Age is shown at DAY granularity on purpose. A finer (s/m/h) counter ticks
+// every second/minute, and because the dock re-renders on the probe-poll
+// cadence, each tick changed the serialized card → a real frame → a full
+// dock teardown/rebuild, i.e. a scrollbar flicker and a dropped scroll
+// gesture for a purely cosmetic counter. At day granularity the string is
+// stable across the whole session's normal lifetime, so idle re-renders
+// diff to nothing and the panel stays still.
 function ageString(createdAt: number): string {
-  const sec = Math.max(0, Math.floor((Date.now() - createdAt) / 1000));
-  if (sec < 60) return `${sec}s`;
-  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
-  return `${Math.floor(sec / 3600)}h`;
+  const days = Math.max(0, Math.floor((Date.now() - createdAt) / 86_400_000));
+  if (days <= 0) return "today";
+  if (days === 1) return "1d";
+  return `${days}d`;
 }
 
 // =============================================================================
@@ -1812,15 +2164,31 @@ function filterSessions(needle: string): number[] {
   };
 
   if (!needle) {
-    // The dock orders ONLY by each session's permanent slot — no project
-    // grouping, no current-project pinning, no label/state keys — so the
-    // list never reorders as the active window switches or a session's
-    // fields change. The modal picker (opened fresh each time) keeps the
-    // grouped, current-project-first browse order.
+    // The dock orders by recency at DAY granularity: most-recently-active
+    // workspaces first, older ones below. Ties within a day (the common
+    // case) fall back to newest-created-first, then to each session's
+    // permanent first-seen slot — both keys are stable through the day, so
+    // the list holds still as the active window switches or a session's
+    // sub-day fields change, and only reorders when a workspace crosses a
+    // day boundary. Folder grouping (which folder a session sits under, and
+    // the folders' own name order) is applied later in `buildDockTree`; this
+    // only orders sessions *within* a group. The modal picker (opened fresh
+    // each time) keeps the grouped, current-project-first browse order.
     const comparator = dockMode
-      ? (a: number, b: number) =>
-          stableOrderKey(orchestratorSessions.get(a)!) -
-          stableOrderKey(orchestratorSessions.get(b)!)
+      ? (a: number, b: number) => {
+          const sa = orchestratorSessions.get(a)!;
+          const sb = orchestratorSessions.get(b)!;
+          const da = sessionLastActiveDay(sa);
+          const db = sessionLastActiveDay(sb);
+          if (da !== db) return db - da; // more recent active-day first
+          // Same day (the common case): fall back to the permanent first-seen
+          // slot — the dock's long-standing stable order. Keeping this
+          // *ascending* means within-day order is unchanged from before the
+          // recency feature, so a discovered worktree keeps its position when
+          // it opens and the persistent dock never reshuffles intra-day; only
+          // a genuine cross-day change floats a workspace up.
+          return stableOrderKey(sa) - stableOrderKey(sb);
+        }
       : byProjectThenStable;
     const ids = allIds.slice().sort(comparator);
     if (scope === "current") {
@@ -1926,10 +2294,12 @@ const PROJECT_ICON = "▣";
 // already uses.
 const BRANCH_ICON = "▸";
 
-// Card line 2: branch (with icon, left) + a compact git summary
-// (right-aligned) that's useful even before any PR exists —
+// The modal pill's branch line: branch (with icon, left) + a compact
+// git summary (right-aligned) that's useful even before any PR exists —
 // ahead/behind the upstream and the uncommitted diffstat
-// (`+added −deleted`), or `clean`.
+// (`+added −deleted`), or `clean`. The dock card takes only the `right`
+// half — its name row carries the summary — so `left` (the branch) is
+// the pill's alone.
 function gitLineParts(s: AgentSession): { left: Entry[]; right: Entry[] } {
   const dim = "ui.menu_disabled_fg";
   let branch = s.branch || (s.discovered ? editor.t("pill.branch_worktree") : editor.t("pill.branch_detached"));
@@ -1951,7 +2321,12 @@ function gitLineParts(s: AgentSession): { left: Entry[]; right: Entry[] } {
   // (only the very first probe, with no prior info, shows the spinner).
   const g = probe?.info;
   if (!g) {
-    if (probe?.status === "loading") {
+    // Show the spinner only on the genuinely FIRST probe (never completed yet,
+    // so `fetchedAt` is still 0). A directory that simply isn't a git repo
+    // never gains `info`, so re-probing it every TTL would otherwise re-enter
+    // "loading" and blink "…" back on each poll — a serialized change that
+    // pushed a redundant widgets frame (dock flicker) every ~15s per session.
+    if (probe?.status === "loading" && !probe.fetchedAt) {
       right.push({ text: "…", style: { fg: dim, italic: true } });
     }
     return { left, right };
@@ -2054,7 +2429,10 @@ function stateGlyphEntry(s: AgentSession): Entry {
   return { text: sym.glyph + " ", style: { fg: sym.fg, bold: true } };
 }
 
-// Build one session row. Two densities, picked by `dockView`:
+// Build one session row for the modal picker's list. (The dock's own
+// tree rows are built by `sessionCardPrimary` / `sessionNodeEntry`; its
+// cards are two rows, not the three below.) Two densities, picked by
+// `dockView`:
 //
 //   card (default): a rounded `labeledSection` pill —
 //     line 1: <state> NAME (bold)              ▣ project
@@ -3367,7 +3745,12 @@ async function probeGit(s: AgentSession): Promise<void> {
       s.root,
     );
     if (st.exit_code !== 0) {
-      s.git = { status: "ok", fetchedAt: Date.now() }; // not a git dir → empty summary
+      // `git status` failed. This is usually transient — an agent holding
+      // `.git/index.lock`, a mid-checkout worktree, etc. — so KEEP the last
+      // known summary instead of blanking it (a genuine non-git dir simply
+      // never had `info`, so this stays empty there). Dropping it made the
+      // card's git segment blink on every failed poll (TUI + web churn).
+      s.git = { status: "ok", fetchedAt: Date.now(), info: s.git?.info };
       return;
     }
     const info = parsePorcelainV2(st.stdout || "");
@@ -3382,13 +3765,18 @@ async function probeGit(s: AgentSession): Promise<void> {
     }
     s.git = { status: "ok", fetchedAt: Date.now(), info };
   } catch (_e) {
-    s.git = { status: "ok", fetchedAt: Date.now() };
+    // Spawn/parse error (git missing, killed, etc.) — same as above: keep the
+    // last known summary rather than blanking the card on a transient failure.
+    s.git = { status: "ok", fetchedAt: Date.now(), info: s.git?.info };
   } finally {
     gitProbesInFlight.delete(s.id);
-    scheduleProbeRefresh();
-    // Refill the slot this probe just freed so the pool keeps draining
-    // between polls (preserves throughput under the concurrency cap).
+    // Refill the slot this probe just freed FIRST, so the pool keeps draining
+    // between polls (preserves throughput under the concurrency cap) and, more
+    // importantly, so the quiescence check in `scheduleProbeRefresh` sees the
+    // newly-started probes — otherwise the last completion of a wave would look
+    // idle while more sessions are still queued, and refresh mid-batch.
     drainGitProbes();
+    scheduleProbeRefresh();
   }
 }
 
@@ -3424,15 +3812,39 @@ function startProbePolling(): void {
   tick();
 }
 
-// Coalesce the re-renders triggered by probe completions: a batch of
-// probes finishing together collapses into one refresh rather than one
-// per probe (the open-time storm that made the panel feel unresponsive).
+// Coalesce the re-renders triggered by probe completions into ONE atomic
+// update per batch. A poll cycle can re-probe many sessions (git + pr), and
+// they finish at different times — a bounded git pool drains in waves, gh is
+// network-latent. Refreshing per completion trickled a frame each, so the
+// dock visibly repainted several times per cycle (flicker, and any in-flight
+// scroll gesture dropped). Instead we hold the refresh until every probe has
+// settled (`gitProbesInFlight` and `prProbesInFlight` both empty) and then
+// repaint once, so the whole batch of new git/pr summaries lands together.
+// The `finally` blocks call this AFTER re-draining, so a still-queued session
+// keeps the pool non-empty and defers the refresh to the true end of the wave.
+//
+// On top of batching, the probe-driven repaint is RATE-LIMITED: a fresh round
+// starts at most once per `PROBE_REFRESH_MIN_INTERVAL_MS`. Even if waves keep
+// settling back-to-back, the dock never repaints from probes more often than
+// this, which caps any residual churn to a slow, unnoticeable cadence. Only
+// this probe path is throttled — interactive updates call `refreshOpenDialog`
+// directly and stay instant.
+const PROBE_REFRESH_MIN_INTERVAL_MS = 4000;
 let probeRefreshPending = false;
+let lastProbeRefreshAt = 0;
 function scheduleProbeRefresh(): void {
+  // Not yet quiescent — a later completion will call back in and land the one
+  // refresh once the batch fully settles.
+  if (gitProbesInFlight.size > 0 || prProbesInFlight.size > 0) return;
   if (probeRefreshPending) return;
   probeRefreshPending = true;
-  void editor.delay(150).then(() => {
+  // Honour both the coalescing debounce (150ms) and the minimum spacing since
+  // the last probe refresh, whichever is longer.
+  const sinceLast = Date.now() - lastProbeRefreshAt;
+  const wait = Math.max(150, PROBE_REFRESH_MIN_INTERVAL_MS - sinceLast);
+  void editor.delay(wait).then(() => {
     probeRefreshPending = false;
+    lastProbeRefreshAt = Date.now();
     if (openPanel) refreshOpenDialog();
   });
 }
@@ -3484,8 +3896,8 @@ function openControlRoom(opts: { dock?: boolean } = {}): void {
     // control / Alt+P updates it for next time.
     scope: lastOpenScope,
     selectedIds: new Set<number>(),
-    showWorktrees: lastShowWorktrees,
-    hideTrivial: lastHideTrivial,
+    showWorktrees: configuredShowWorktrees(),
+    hideTrivial: configuredHideTrivial(),
     bulkInFlight: null,
     projectFilter: asDock ? lastDockProjectFilter : null,
     projectMenuOpen: false,
@@ -3509,6 +3921,10 @@ function openControlRoom(opts: { dock?: boolean } = {}): void {
   if (asDock) {
     dockMode = true;
     dockBlurred = false;
+    // Adopt the configured density on every open (unless the "view"
+    // button already picked one this session), so editing the setting
+    // and reopening the dock is enough to see the change.
+    dockView = configuredDockView();
   } else {
     dockMode = false;
   }
@@ -4241,6 +4657,7 @@ function openCreateFolderDialog(
     parent,
     sessionId,
     renameId: null,
+    renameSessionId: null,
   };
   mountFolderDialog();
 }
@@ -4271,6 +4688,28 @@ function openRenameFolderDialog(id: string): void {
     parent: null,
     sessionId: null,
     renameId: id,
+    renameSessionId: null,
+  };
+  mountFolderDialog();
+}
+
+// Open the shared centered dialog in workspace-rename mode for a session.
+// Pre-fills the current display name so the user edits it in place; an
+// emptied-out name clears the manual rename and restores the auto-name /
+// host label.
+function openRenameWorkspaceDialog(id: number): void {
+  const s = orchestratorSessions.get(id);
+  if (!s) return;
+  // Seed with the manual name if one exists, else the plain host label
+  // (root basename) — a cleaner starting point than the long auto-name.
+  const current = workspaceCustomName(s) ?? s.hostLabel;
+  createFolderDialog = {
+    name: { value: current, cursor: utf8Len(current) },
+    organizeCurrent: false,
+    parent: null,
+    sessionId: null,
+    renameId: null,
+    renameSessionId: id,
   };
   mountFolderDialog();
 }
@@ -4283,7 +4722,12 @@ function mountFolderDialog(): void {
     dockBlurred = true;
     editor.floatingPanelControl(openPanel.id(), "blur", 0);
   }
-  const renaming = createFolderDialog!.renameId !== null;
+  const d0 = createFolderDialog!;
+  const title = d0.renameSessionId !== null
+    ? editor.t("dock.rename_workspace_dialog_title")
+    : d0.renameId !== null
+      ? editor.t("dock.rename_folder_dialog_title")
+      : editor.t("dock.new_folder_dialog_title");
   createFolderPanel = new FloatingWidgetPanel();
   createFolderPanel.mount(buildCreateFolderSpec(), {
     widthPct: 50,
@@ -4292,9 +4736,7 @@ function mountFolderDialog(): void {
     // The dialog's title + border are now native modal-frame chrome
     // (drawn by the host around the WidgetSpec), and `closable` renders
     // a native `[×]` that dismisses via the same cancel path as Esc.
-    title: renaming
-      ? editor.t("dock.rename_folder_dialog_title")
-      : editor.t("dock.new_folder_dialog_title"),
+    title,
     closable: true,
   });
   editor.floatingPanelControl(createFolderPanel.id(), "fullscreen", 1);
@@ -4310,21 +4752,25 @@ function mountFolderDialog(): void {
 // Cancel / Create Folder buttons.
 function buildCreateFolderSpec(): WidgetSpec {
   const d = createFolderDialog!;
-  const renaming = d.renameId !== null;
+  const renamingSession = d.renameSessionId !== null;
+  const renaming = d.renameId !== null || renamingSession;
   const sess = d.sessionId != null ? orchestratorSessions.get(d.sessionId) : undefined;
+  const promptLabel = renamingSession
+    ? editor.t("dock.rename_workspace_prompt")
+    : editor.t("dock.new_folder_prompt");
   const children: WidgetSpec[] = [
-    // Render the label inline ("Folder name: ") so the ": " separator
-    // appears the same way in the TUI and the web UI.
+    // Render the label inline ("Folder name: " / "Workspace name: ") so the
+    // ": " separator appears the same way in the TUI and the web UI.
     row(
       raw([
         styledRow([
-          { text: editor.t("dock.new_folder_prompt") + ": ", style: { fg: "ui.menu_disabled_fg" } },
+          { text: promptLabel + ": ", style: { fg: "ui.menu_disabled_fg" } },
         ]),
       ]),
       text({
         value: d.name.value,
         cursorByte: d.name.cursor,
-        placeholder: editor.t("dock.new_folder_default"),
+        placeholder: renamingSession ? "" : editor.t("dock.new_folder_default"),
         fieldWidth: 32,
         key: "folder-name",
       }),
@@ -4360,6 +4806,15 @@ function buildCreateFolderSpec(): WidgetSpec {
 function submitCreateFolder(): void {
   const d = createFolderDialog;
   if (!d) return;
+  if (d.renameSessionId !== null) {
+    // Workspace rename: an empty name clears the manual name and lets the
+    // auto-name / host label take back over.
+    const s = orchestratorSessions.get(d.renameSessionId);
+    if (s) renameWorkspace(s, d.name.value);
+    closeCreateFolderDialog();
+    if (openPanel && dockMode) refreshOpenDialog();
+    return;
+  }
   if (d.renameId !== null) {
     // Rename mode: an emptied-out name keeps the current one (renaming
     // to nothing is never what the user meant).
@@ -4518,6 +4973,7 @@ function buildDockMenuSpec(state: DockMenuState): WidgetSpec {
       styledRow([{ text: `${label}`, style: { bold: true } }]),
     ] },
     button(editor.t("dock.ctx_visit"), { intent: "primary", key: "ctx-visit" }),
+    button(editor.t("dock.ctx_rename"), { key: "ctx-rename-session" }),
     button(editor.t("dock.ctx_move"), { key: "ctx-move" }),
     button(editor.t("dock.ctx_archive"), { key: "ctx-archive", disabled: !canArchive }),
     button(editor.t("dock.ctx_delete"), { intent: "danger", key: "ctx-delete", disabled: !canDelete }),
@@ -4649,6 +5105,13 @@ function dockMenuEnterConfirm(action: "archive" | "delete"): void {
   editor.floatingPanelControl(dockMenuPanel.id(), "center", 0);
   editor.floatingPanelControl(dockMenuPanel.id(), "fullscreen", 1);
   renderDockMenu();
+  // Pin Cancel, exactly as the modal picker's `enterConfirm` does. Today the
+  // host would land here anyway (the outgoing `ctx-delete` focus key isn't
+  // tabbable in the confirm spec, so it falls back to the first one), but
+  // relying on that makes the safe default a property of the button *order* —
+  // swap the pair and a destructive action becomes one Enter away. State the
+  // intent instead of inheriting it.
+  dockMenuPanel.setFocusKey("confirm-cancel");
 }
 
 function closeDockContextMenu(): void {
@@ -4762,6 +5225,9 @@ function diveDockSelectionFromClick(fromEdge: "top" | "bottom" | null): void {
     else editor.setActiveWindow(id);
   }
   // Hand keyboard focus to the activated window (mirror `dock_activate`).
+  // Picking a row is not "leaving the dock", so the search filter that
+  // produced this row survives the blur (see `dockDiveBlur`).
+  dockDiveBlur = true;
   dockBlurred = true;
   editor.floatingPanelControl(openPanel.id(), "blur", 0);
   editor.setEditorMode(null);
@@ -4919,7 +5385,7 @@ async function ensureReplacementWindow(projectRoot: string): Promise<boolean> {
       label,
       cwd: projectRoot,
       // Always mint the workspace's capability token (see runLocalCreate).
-      commandAllowlist: FRESH_CLI_DEFAULT_ALLOWLIST,
+      allowScript: FRESH_CLI_ALLOW_SCRIPT,
     });
     // `createWindowWithTerminal` fires `window_created`, which reconciles
     // the new window into the model; set it eagerly too so the immediate
@@ -4927,6 +5393,7 @@ async function ensureReplacementWindow(projectRoot: string): Promise<boolean> {
     orchestratorSessions.set(result.windowId, {
       id: result.windowId,
       label,
+      hostLabel: label,
       root: projectRoot,
       projectPath: projectRoot,
       sharedWorktree: false,
@@ -5047,6 +5514,10 @@ async function archiveOne(id: number): Promise<LifecycleResult> {
       orchestratorSessions.delete(id);
       discoveredIdByPath.delete(s.root);
     }
+    // The worktree moved to the graveyard, so the original root is gone;
+    // forget its now-dangling persisted workspace explicitly rather than
+    // leaning on boot-time GC to notice the directory vanished.
+    editor.deleteWorkspace(s.root);
     return { ok: true, repoRoot };
   }
 
@@ -5066,6 +5537,11 @@ async function archiveOne(id: number): Promise<LifecycleResult> {
   });
   saveArchiveManifest(repoRoot, manifest);
   orchestratorSessions.delete(id);
+  // In-place archive leaves the directory on disk, so its persisted
+  // workspace must be forgotten too — otherwise discovery re-adds it as a
+  // live session on the next launch, double-listed with its archive entry.
+  // Unarchive reopens from the manifest, so the dropped layout is expendable.
+  editor.deleteWorkspace(s.root);
   return { ok: true, repoRoot };
 }
 
@@ -5342,6 +5818,13 @@ async function deleteOne(id: number): Promise<LifecycleResult> {
     // could linger in the model and "come back" when the dialog reopens.
     orchestratorSessions.delete(id);
   }
+  // Permanently forget the persisted workspace so boot-time session
+  // discovery can't resurrect this row on the next launch. A worktree
+  // session already had its directory removed above (discovery GCs the
+  // now-dangling file), but an in-place / launch session keeps its
+  // directory, so its `workspaces/<root>.json` must be dropped explicitly
+  // or the row reappears after a restart.
+  editor.deleteWorkspace(s.root);
   return { ok: true, repoRoot };
 }
 
@@ -5690,8 +6173,29 @@ function rebuildFormFocusCycle(): void {
   // backend's fields, then the shared Session Name / Agent Command,
   // then the buttons. ←/→ moves within the radio groups, never Tab —
   // so each group is a single Tab stop.
-  const activeBackend = SESSION_BACKENDS.find((b) => b.id === form.backend);
-  const cycle: string[] = activeBackend ? [activeBackend.key] : [];
+  // The target switch leads the cycle in both modes; everything
+  // workspace-shaped after it exists only while creating one.
+  const cycle: string[] = ["target_dropdown"];
+  // Bind once: `form` is a mutable module-level slot, so TypeScript drops the
+  // non-null narrowing across every call below.
+  const f = form;
+  if (f.target === "current") {
+    // `cmd` renders inline here (no Advanced fold in this shape), so it is a
+    // Tab stop right after the selector that fills it — and, crucially, a
+    // *reachable* focus target for the "custom…" preset, which hands focus to
+    // it. Without the entry the setFocusKey was dropped and focus fell back to
+    // the top of the form, so the next ←/→ silently flipped "Launch in".
+    cycle.push("agent_dropdown", "cmd");
+    const agent = activeAgentEntry();
+    if (agent?.auto) cycle.push("auto_mode");
+    if (agent?.prompt) cycle.push("start_prompt");
+    cycle.push("create-visit", "cancel");
+    formFocusCycle = cycle;
+    if (formFocusIndex >= cycle.length) formFocusIndex = 0;
+    return;
+  }
+  const activeBackend = SESSION_BACKENDS.find((b) => b.id === f.backend);
+  if (activeBackend) cycle.push(activeBackend.key);
   if (form.backend === "local") {
     const worktreeEnabled = form.projectPathIsGit !== false;
     const effectiveCreateWorktree = worktreeEnabled && form.createWorktree;
@@ -6022,26 +6526,73 @@ const AGENT_REGISTRY: AgentEntry[] = [
   },
 ];
 
-// Command ids the workspace's capability token is minted for. Conservative and
-// safe: these two back the `fresh --cmd split` alias, letting a process in the
-// workspace split its own view without exposing the full command surface.
-// Passed to the host as `commandAllowlist` on *every* workspace creation, which
-// binds the minted `FRESH_CMD_TOKEN` to exactly these ids on the new window —
-// the token is always present; the "Teach Fresh CLI" toggle only controls
-// whether the agent is *told* about it (the system-prompt injection).
-const FRESH_CLI_DEFAULT_ALLOWLIST = ["split_vertical", "split_horizontal"];
+// Whether a workspace's spawned agent gets a capability token at all. Passed to
+// the host as `allowScript` on *every* workspace creation, which mints a
+// `FRESH_CMD_TOKEN` bound to the new window — the token is always present; the
+// "Teach Fresh CLI" toggle only controls whether the agent is *told* about it
+// (the system-prompt injection).
+//
+// The grant is all-or-nothing: a script can call anything the plugin API
+// exposes, so there is no narrower honest setting. What bounds an agent is the
+// window its token is bound to, not a list of verbs.
+const FRESH_CLI_ALLOW_SCRIPT = true;
 
 // System prompt injected (via flag or AGENTS.md) when "Teach Fresh CLI" is on.
 // Teaches the agent the verbatim `fresh` CLI verbs it can drive the editor
 // with. Keep the command strings exact — they're the agent's only reference.
 const FRESH_CLI_SYSTEM_PROMPT = [
-  "You are running inside a Fresh editor workspace and can control it from the shell via the `fresh` CLI.",
-  "Always invoke it through the `$FRESH_BIN` environment variable — it points at the exact editor binary running this workspace, so its `--cmd` verbs and `--help` match this build (never rely on a bare `fresh` from PATH, which may be a different version).",
-  'Discover what you can do: `"$FRESH_BIN" --cmd cmd list --json` (lists the commands you\'re allowed to run in this workspace).',
-  'Run one: `"$FRESH_BIN" --cmd cmd run <id>` (e.g. `"$FRESH_BIN" --cmd cmd run split_vertical`), or the shortcut `"$FRESH_BIN" --cmd split --vertical`.',
-  'Open a file in this workspace: `"$FRESH_BIN" <path>` (this blocks until you close the file, so use it for hand-offs, not quick peeks).',
-  'Open another project as a new workspace: `"$FRESH_BIN" --cmd workspace new <dir>`.',
-  "These commands act only on the current workspace.",
+  "You are running inside a Fresh editor workspace and can drive it \u2014 arrange panes, open files, show output, start other agents \u2014 by submitting TypeScript to the editor's plugin runtime.",
+  "Always invoke the CLI through $FRESH_BIN: it is the exact binary running this workspace.",
+  "",
+  "Run a script (the body is an async function: top-level `await` works, `return value` is the answer and prints as JSON, a throw exits non-zero):",
+  "    \"$FRESH_BIN\" --cmd script run <<'EOF'",
+  "    return editor.describeWorkspace();",
+  "    EOF",
+  "",
+  "The loop: orient with describeWorkspace(), find the call with `script api <query>`, then act and verify in one script.",
+  "",
+  "RECIPES \u2014 copy and adapt:",
+  "",
+  "  // current layout: panes left-to-right, with geometry, kind (terminal/file/virtual) and focus",
+  "  return editor.describeWorkspace();",
+  "",
+  "  // README in a new pane to the RIGHT of what is there now",
+  "  await editor.splitWindow({ direction: \"vertical\", place: \"after\", file: \"README.md\" });",
+  "",
+  "  // ...to the LEFT instead, or stacked below",
+  "  await editor.splitWindow({ direction: \"vertical\", place: \"before\", file: \"README.md\" });",
+  "  await editor.splitWindow({ direction: \"horizontal\", place: \"after\", file: \"notes.md\" });",
+  "",
+  "  // ...without stealing focus from the pane the user is working in",
+  "  await editor.splitWindow({ direction: \"horizontal\", place: \"after\", file: \"notes.md\", keepFocus: true });",
+  "",
+  "  // open a file at a line, in a pane you name",
+  "  const ws = editor.describeWorkspace();",
+  "  editor.openFileInSplit(ws.panes[0].splitId, \"src/main.rs\", 42);",
+  "",
+  "  // show text you produced: write a file, then open it \u2014 you get highlighting, search, save, and ANSI colour",
+  "  await editor.splitWindow({ file: \"/tmp/report.md\" });",
+  "",
+  "  // new workspace on its own git worktree, running an agent; resolves once it is up",
+  "  const orch = editor.getPluginApi(\"orchestrator\");",
+  "  return await orch.newWorkspace({ path: \"/repo\", agent: \"claude\", prompt: \"fix the flaky test\", newBranch: \"fix/flaky\" });",
+  "",
+  "  // an agent in THIS workspace, and what workspaces exist",
+  "  await orch.runAgent({ agent: \"claude\", prompt: \"...\" });",
+  "  return orch.listWorkspaces();",
+  "",
+  "  // after a mutation that does not answer, flush before reading",
+  "  editor.setSplitRatio(splitId, 0.3);",
+  "  await editor.flush();",
+  "  return editor.describeWorkspace();",
+  "",
+  "`direction` names the divider: \"vertical\" = side by side, \"horizontal\" = stacked. `place` is \"before\" (left/top) or \"after\" (right/bottom, the default).",
+  "Mutations are queued, so a read in the same script sees the state from before them \u2014 await the mutation (those that answer resolve once applied) or `await editor.flush()`.",
+  "Finding anything else: `\"$FRESH_BIN\" --cmd script api <query>` searches the whole API by name and docs; `--cmd script check <file>` flags unknown editor.* names without running; `--cmd script types` prints the .d.ts paths.",
+  "Launches answer with {\"workspaceId\",\"windowId\",\"root\"} \u2014 record workspaceId, it survives editor restarts; windowId does not.",
+  "FRESH_WINDOW_ID is your window. After an `await` the focused pane may be someone else's, so prefer calls taking an explicit id.",
+  "You are changing a workspace a human is watching: prefer reversible moves, do not close or overwrite panes you were not asked to touch, and read back what you changed before reporting success.",
+  "Scripts run to completion and are then forgotten; whatever they create outlives them.",
 ].join("\n");
 
 // Marker wrapping the injected block so an existing user file (codex/opencode
@@ -6552,6 +7103,21 @@ function firstBodyFieldKey(backend: SessionBackend): string {
 // "Run in:" tab row. One button per backend; the active one is `primary`. The
 // body below (`backendBodyFields`) swaps to match. The tab buttons carry keys
 // (`type-local` …) so they sit in the form's Tab cycle; ←/→ also switches.
+// The dialog's top-level switch: run the agent in the workspace you're in, or
+// make a new one for it. Everything workspace-shaped below is conditioned on
+// this, so "current" collapses the form down to the old Run-Agent dialog.
+function targetRow(): WidgetSpec {
+  const sel = form ? form.target : "new";
+  return dropdown(
+    [editor.t("run_agent.target_current"), editor.t("run_agent.target_new")],
+    {
+      selectedIndex: sel === "current" ? 0 : 1,
+      label: editor.t("form.launch_in").replace(/:\s*$/, ""),
+      key: "target_dropdown",
+    },
+  );
+}
+
 function backendTabsRow(): WidgetSpec {
   const sel: SessionBackend = form ? form.backend : "local";
   const parts: WidgetSpec[] = [
@@ -6629,7 +7195,9 @@ function cmdField(): WidgetSpec {
 }
 
 function agentOptionsFields(): WidgetSpec[] {
-  if (!form || form.backend !== "local") return [];
+  // Agent options are wired for the local backend and for "run in the current
+  // workspace" (which is always local to the window you're in).
+  if (!form || (form.target === "new" && form.backend !== "local")) return [];
   const entry = activeAgentEntry();
   if (!entry) return [];
   const fields: WidgetSpec[] = [];
@@ -7049,8 +7617,26 @@ function buildConnectingView(): WidgetSpec {
 // guards the submit paths so an empty form can't be submitted via Enter.
 function formIsSubmittable(): boolean {
   if (!form) return false;
+  // Running in the current workspace needs no input at all — worst case it
+  // opens a bare terminal here, which is always possible.
+  if (form.target === "current") return true;
   switch (form.backend) {
     case "local":
+      // Mirror `captureCreateSpec`'s fallback chain EXACTLY: a local
+      // workspace can always be created against `localProjectDefault()`
+      // (the cwd) even before the async canonical-root probe
+      // (`probeProjectPathDefaults`) has filled `defaultProjectPath`.
+      // Omitting that same fallback here — while capture uses it — let a
+      // Ctrl+Enter / Create that arrived during the probe window fail this
+      // gate and be silently dropped (`if (!formIsSubmittable()) return`).
+      // The dialog then never advanced and an unbounded `wait_until` hung
+      // until the CI timeout; the probe's `git` round-trip is slow enough
+      // under load (macOS CI) to widen that window into the common case.
+      return !!(
+        form.projectPath.value.trim() ||
+        form.defaultProjectPath ||
+        localProjectDefault()
+      );
     case "devcontainer":
       return !!(form.projectPath.value.trim() || form.defaultProjectPath);
     case "ssh":
@@ -7068,44 +7654,58 @@ function buildFormSpec(): WidgetSpec {
   // Disabled/connecting state: read-only summary + Cancel-only (item 3).
   if (form.submitting) return buildConnectingView();
 
+  const creating = form.target === "new";
   const children: WidgetSpec[] = [
-    // The title ("ORCHESTRATOR :: New Workspace") + border are now
-    // native modal-frame chrome drawn by the host (see `openForm`), so
-    // the spec starts straight at the "Run in:" session-type tabs.
-    // === "Run in:" session-type tabs. ============================
-    backendTabsRow(),
+    // The title + border are native modal-frame chrome drawn by the host
+    // (see `openForm`), so the spec starts straight at the target switch.
+    targetRow(),
     spacer(0),
-    // === Backend-specific top fields (swap with the tab). ========
-    ...backendBodyFields(),
-    // === Shared fields: Session Name + Agent Command. ============
-    // Labels are plain — the input's own focused-bg styling (set by
-    // the host based on the panel's focus_key) is the authoritative
-    // focus cue.
-    labeledSection({
-      label: editor.t("form.workspace_name"),
-      child: text({
-        value: form.name.value,
-        cursorByte: form.name.cursor,
-        // Concrete default (e.g. "session-3") rather than the
-        // literal `(auto-generated)` — the user sees the exact
-        // name an empty submit would create. Empty while the
-        // ref probe runs.
-        placeholder: form.defaultSessionName || editor.t("form.auto_generating"),
-        fullWidth: true,
-        key: "name",
+  ];
+  if (creating) {
+    children.push(
+      // === "Run in:" session-type tabs. ==========================
+      backendTabsRow(),
+      spacer(0),
+      // === Backend-specific top fields (swap with the tab). ======
+      ...backendBodyFields(),
+      // === Workspace Name. ======================================
+      // Labels are plain — the input's own focused-bg styling (set by
+      // the host based on the panel's focus_key) is the authoritative
+      // focus cue.
+      labeledSection({
+        label: editor.t("form.workspace_name"),
+        child: text({
+          value: form.name.value,
+          cursorByte: form.name.cursor,
+          // Concrete default (e.g. "session-3") rather than the
+          // literal `(auto-generated)` — the user sees the exact
+          // name an empty submit would create. Empty while the
+          // ref probe runs.
+          placeholder: form.defaultSessionName || editor.t("form.auto_generating"),
+          fullWidth: true,
+          key: "name",
+        }),
       }),
-    }),
+    );
+  }
+  children.push(
     agentPresetRow(),
-    // On remote backends the command box stays inline (no Advanced fold to hold
-    // it); on local it moves into Advanced (appended in `advancedSection`).
-    ...(form.backend === "local" ? [] : [cmdField()]),
+    // The command box stays inline wherever there's no Advanced fold to hold
+    // it: on remote backends, and whenever we're running in the current
+    // workspace (the fold is workspace-shaped, so it's gone entirely). Only a
+    // local *new workspace* moves it into Advanced (via `advancedSection`).
+    //
+    // It has to be reachable in current-workspace mode: the agent list ends in
+    // "custom…", and picking it with nowhere to type left the form claiming an
+    // agent the user could not actually name.
+    ...(!creating || form.backend !== "local" ? [cmdField()] : []),
     // Agent-specific controls (Auto mode / Start prompt), adaptive to the
     // resolved agent. Empty for a bare terminal / unknown command.
     ...agentOptionsFields(),
-  ];
-  // Worktree + branch controls are local-only and live behind the
-  // collapsible "Advanced…" fold.
-  if (form.backend === "local") {
+  );
+  // Worktree + branch controls create a workspace, so the whole Advanced fold
+  // is meaningless when running in the current one.
+  if (creating && form.backend === "local") {
     children.push(...advancedSection());
   }
   // Remote backends connect asynchronously and the dialog stays open until the
@@ -7134,22 +7734,34 @@ function buildFormSpec(): WidgetSpec {
     // on a narrow form instead of "Create Session" being clipped off the
     // right edge. The wrap path ignores the leading flex spacer (and
     // trims a blank that would lead a line), so the pair left-packs.
-    wrappingRow(
-      button(editor.t("form.btn_create"), {
-        intent: "primary",
-        key: "create-visit",
-        disabled: !formIsSubmittable(),
-        focusable: true,
-      }),
-      spacer(2),
-      button(editor.t("form.btn_create_bg"), {
-        key: "create-bg",
-        disabled: !formIsSubmittable(),
-        focusable: true,
-      }),
-      spacer(2),
-      button(editor.t("form.btn_cancel"), { intent: "danger", key: "cancel" }),
-    ),
+    // Running in the current workspace creates nothing, so there is no
+    // foreground/background distinction to offer — just "Run".
+    creating
+      ? wrappingRow(
+        button(editor.t("form.btn_create"), {
+          intent: "primary",
+          key: "create-visit",
+          disabled: !formIsSubmittable(),
+          focusable: true,
+        }),
+        spacer(2),
+        button(editor.t("form.btn_create_bg"), {
+          key: "create-bg",
+          disabled: !formIsSubmittable(),
+          focusable: true,
+        }),
+        spacer(2),
+        button(editor.t("form.btn_cancel"), { intent: "danger", key: "cancel" }),
+      )
+      : wrappingRow(
+        button(editor.t("run_agent.btn_run"), {
+          intent: "primary",
+          key: "create-visit",
+          focusable: true,
+        }),
+        spacer(2),
+        button(editor.t("form.btn_cancel"), { intent: "danger", key: "cancel" }),
+      ),
     spacer(0),
     // === Footer: keybinding helper, centered. ====================
     row(
@@ -7194,10 +7806,13 @@ function renderForm(): void {
   formPanel.update(buildFormSpec());
 }
 
-function openForm(options?: { fromPicker?: boolean }): void {
+function openForm(options?: { fromPicker?: boolean; target?: RunAgentTarget }): void {
   const lastCmd =
     (editor.getGlobalState("orchestrator.last_cmd") as string | undefined) ?? "";
   form = {
+    // Defaults to creating a workspace; "Run Agent…" opens the same form
+    // pre-switched to the current one.
+    target: options?.target ?? "new",
     backend: "local",
     sshHost: { value: "", cursor: 0 },
     sshPath: { value: "", cursor: 0 },
@@ -7245,6 +7860,23 @@ function openForm(options?: { fromPicker?: boolean }): void {
     completion: { field: null, items: [], selectedIndex: 0, anchor: "", token: 0 },
   };
   formPanel = new FloatingWidgetPanel();
+  mountFormPanel();
+  // Kick off the placeholder probes (canonical repo root,
+  // default branch, next session name) against the editor's
+  // cwd. Each probe is async and re-renders on completion.
+  void probeProjectPathDefaults();
+}
+
+/// Mount (or re-mount) the form panel and land initial focus.
+///
+/// Re-mounted when the "Launch in" switch flips, because the frame *title*
+/// is mount-time chrome: leaving it alone would keep a form that now creates
+/// a workspace labelled "Run Agent". The form state itself is untouched, so
+/// the agent, auto mode and prompt survive the flip; only focus moves, to the
+/// first field of the shape the user just switched to.
+function mountFormPanel(focusKey?: string): void {
+  if (!form || !formPanel) return;
+  const creating = form.target === "new";
   // Width 60 / height 90: the host shrinks the panel to its actual
   // content height when content is shorter than the requested cap,
   // so a generous height ceiling doesn't waste space on tall
@@ -7263,7 +7895,9 @@ function openForm(options?: { fromPicker?: boolean }): void {
     // (drawn by the host around the WidgetSpec) rather than the in-body
     // "ORCHESTRATOR :: New Workspace" banner, and `closable` renders a
     // native `[×]` that dismisses via the same cancel path as Esc.
-    title: `${editor.t("form.header_keyword")} :: ${editor.t("form.header_label")}`,
+    title: `${editor.t("form.header_keyword")} :: ${
+      creating ? editor.t("form.header_label") : editor.t("run_agent.title")
+    }`,
     closable: true,
   });
   // The New-Session form is a global orchestrator feature too: center it
@@ -7278,14 +7912,15 @@ function openForm(options?: { fromPicker?: boolean }): void {
   // (`project_path` for Local), preserving the original "open and type"
   // behaviour; the tabs stay reachable via Shift+Tab / ←→ / click.
   rebuildFormFocusCycle();
-  const firstField = firstBodyFieldKey(form.backend);
-  formPanel.setFocusKey(firstField);
-  snapFormFocusTo(firstField);
-
-  // Kick off the placeholder probes (canonical repo root,
-  // default branch, next session name) against the editor's
-  // cwd. Each probe is async and re-renders on completion.
-  void probeProjectPathDefaults();
+  // Land on the first thing the user actually wants to set: the agent when
+  // running here (there is nothing else to fill in), the backend's first
+  // input when creating a workspace. A caller that re-mounts mid-edit passes
+  // `focusKey` to keep focus where the user left it — flipping the "Launch in"
+  // switch must not fling focus away from the control just used, or the next
+  // ←/→ silently lands on whatever inherited focus instead.
+  const field = focusKey ?? (creating ? firstBodyFieldKey(form.backend) : "agent_dropdown");
+  formPanel.setFocusKey(field);
+  snapFormFocusTo(field);
 }
 
 /// The local directory a brand-new *local* workspace should default to.
@@ -7895,6 +8530,7 @@ function startPendingWorkspace(
     // one persisted alongside the spec); a fresh row starts from the spec's
     // capture-time display label.
     label: opts?.label || spec.displayLabel,
+    hostLabel: opts?.label || spec.displayLabel,
     // Synthetic root — a placeholder owns no real directory yet, and a unique
     // key keeps it in its own stable dock-order slot.
     root: `pending:${id}`,
@@ -7916,15 +8552,16 @@ function startPendingWorkspace(
   savePendingSpecs();
   if (!restored) {
     closeForm();
-    showDockForPending();
+    showDockUnfocused();
     launchPendingCreate(id);
   }
   return id;
 }
 
-// Ensure the dock is visible so a just-created placeholder is seen, without
-// stealing keyboard focus — the user asked to keep working ("stay put").
-function showDockForPending(): void {
+// Ensure the dock is visible without stealing keyboard focus — the user
+// asked to keep working ("stay put"). Used for a just-created placeholder
+// (so it's seen), and for the `autoOpenDock` setting at startup.
+function showDockUnfocused(): void {
   // Open the dock if nothing is up yet. (Structured so the module-level
   // `openPanel`'s narrowing survives the `openControlRoom` reassignment —
   // mirrors `openMoveToFolderForCurrent`.)
@@ -7949,6 +8586,50 @@ function launchPendingCreate(id: number): void {
   if (!s || !s.pending) return;
   if (s.pending.spec.backend === "local") void runLocalCreate(id);
   else enqueueRemoteCreate(id);
+}
+
+// =============================================================================
+// Create completion — for callers that need the result, not just the row
+//
+// A workspace create is deliberately non-blocking: the dialog closes, the dock
+// shows a pending row, and the user keeps working. A *caller* (the headless
+// `orchestrator_agent_new`, driven from an agent's shell) has no dock to watch
+// and nothing to do until the workspace exists, so it needs the outcome — above
+// all the new workspace's durable id, which only exists once the window is born.
+//
+// Resolvers registered here are settled by the create worker at exactly the
+// points that end a create: success, failure, and dismissal. Nothing else may
+// resolve them, or a caller would be told a workspace exists that doesn't.
+// =============================================================================
+
+interface CreateOutcome {
+  ok: boolean;
+  /// Per-process window handle. Valid until this editor exits.
+  windowId?: number;
+  /// Durable workspace identity — the id to keep. Survives restarts.
+  workspaceId?: string;
+  /// The workspace's root directory (its worktree, when it has one).
+  root?: string;
+  error?: string;
+}
+
+const createOutcomeResolvers = new Map<number, (r: CreateOutcome) => void>();
+
+// Await the outcome of the pending create `id`. The promise settles exactly
+// once; a create that is dismissed or fails settles with `ok: false`.
+function awaitCreateOutcome(id: number): Promise<CreateOutcome> {
+  return new Promise((resolve) => {
+    createOutcomeResolvers.set(id, resolve);
+  });
+}
+
+// Settle a pending create's outcome, if anyone is waiting on it. Safe to call
+// on every terminal path — a create nobody awaited simply has no resolver.
+function settleCreateOutcome(id: number, outcome: CreateOutcome): void {
+  const resolve = createOutcomeResolvers.get(id);
+  if (!resolve) return;
+  createOutcomeResolvers.delete(id);
+  resolve(outcome);
 }
 
 // Update a placeholder's status line (a no-op once the row is gone).
@@ -7980,6 +8661,9 @@ function failPending(id: number, reason: string): void {
   editor.setStatus(editor.t("status.prefix", { msg: s.pending.message }));
   savePendingSpecs();
   if (openPanel) refreshOpenDialog();
+  // The row stays for the user to retry or dismiss, but a caller waiting on
+  // this create is done — it gets the reason rather than hanging.
+  settleCreateOutcome(id, { ok: false, error: s.pending.message });
 }
 
 // Return keyboard focus to the window that was active before a spawn/attach
@@ -8217,6 +8901,7 @@ async function runLocalCreate(id: number): Promise<void> {
     // Dismissed while the worktree was being added — remove what we just
     // created so a dismissed create leaves nothing orphaned on disk.
     if (addedWorktree) await discardCreatedWorktree(repoRoot, root);
+    settleCreateOutcome(id, { ok: false, error: "workspace creation was dismissed" });
     return;
   }
 
@@ -8267,10 +8952,11 @@ async function runLocalCreate(id: number): Promise<void> {
       command: launchArgv.length > 0 ? launchArgv : undefined,
       title: launchArgv.length > 0 ? launchArgv[0] : undefined,
       resume: resumeArgv,
-      // Always mint the capability token bound to this window + allowlist so
-      // `fresh --cmd cmd ...` from inside the workspace is authorised — whether
-      // or not the agent was taught about it. `teach` only gates the prompt.
-      commandAllowlist: FRESH_CLI_DEFAULT_ALLOWLIST,
+      // Always mint the capability token bound to this window so
+      // `fresh --cmd script ...` from inside the workspace is authorised —
+      // whether or not the agent was taught about it. `teach` only gates the
+      // prompt.
+      allowScript: FRESH_CLI_ALLOW_SCRIPT,
     });
     const winId = result.windowId;
     // Dismissed during the (awaited) spawn: the window was born and dove in,
@@ -8288,6 +8974,7 @@ async function runLocalCreate(id: number): Promise<void> {
       if (result.terminalId) editor.signalWindow(winId, "SIGKILL");
       editor.closeWindow(winId);
       if (addedWorktree) await discardCreatedWorktree(repoRoot, root);
+      settleCreateOutcome(id, { ok: false, error: "workspace creation was dismissed" });
       return;
     }
     editor.setWindowState("project_path", effectiveProjectPath);
@@ -8302,7 +8989,8 @@ async function runLocalCreate(id: number): Promise<void> {
     savePendingSpecs();
     orchestratorSessions.set(winId, {
       id: winId,
-      label: sessionName,
+      label: loadNames()[normRoot(root)] ?? sessionName,
+      hostLabel: sessionName,
       root,
       projectPath: effectiveProjectPath,
       sharedWorktree,
@@ -8310,6 +8998,15 @@ async function runLocalCreate(id: number): Promise<void> {
       state: "running",
       createdAt: Date.now(),
       branch: reportedBranch || undefined,
+    });
+    // The workspace exists and is running: hand a waiting caller its ids. The
+    // durable `stableId` is minted with the window, so it is already final —
+    // this is the only moment it can be reported from.
+    settleCreateOutcome(id, {
+      ok: true,
+      windowId: winId,
+      workspaceId: result.stableId,
+      root,
     });
     if (visit) {
       // Create & Visit: `createWindowWithTerminal` already dove into the new
@@ -8468,13 +9165,29 @@ function recoverPendingWorkspaces(): void {
     startPendingWorkspace(spec, { restored: true, label });
     restored++;
   }
-  if (restored > 0) showDockForPending();
+  if (restored > 0) showDockUnfocused();
 }
 
 // `visit`: "Create & Visit" — focus follows into the workspace once it's real.
 // `!visit`: "Create in Background" — stay put. Both are non-blocking.
 async function submitForm(visit: boolean): Promise<void> {
   if (!form) return;
+  // "Run in the current workspace": no workspace to create, no spec to
+  // validate — just launch the chosen agent here. Same argv resolution
+  // (`resolveAgentLaunch`, including the resume spec) as the create path.
+  if (form.target === "current") {
+    const agent = activeAgentEntry();
+    const opts: RunAgentLaunchOpts = {
+      auto: !!agent?.auto && form.autoMode,
+      prompt: agent?.prompt ? form.startPrompt.value.trim() : "",
+      teachFreshCli: !!agent?.systemPrompt && form.teachFreshCli,
+    };
+    const cmd = form.cmd.value;
+    closeForm();
+    restoreDockAfterForm();
+    void launchAgentInCurrentWorkspace(cmd, opts);
+    return;
+  }
   // Resolve the form's inputs into a self-contained spec. A validation
   // failure (bad ssh host, missing pod) keeps the form open with the error;
   // otherwise the form closes and the create runs in the background.
@@ -8520,7 +9233,7 @@ async function attachToWorktree(opts: {
       label: opts.label,
       cwd: opts.root,
       // Always mint the workspace's capability token (see runLocalCreate).
-      commandAllowlist: FRESH_CLI_DEFAULT_ALLOWLIST,
+      allowScript: FRESH_CLI_ALLOW_SCRIPT,
     });
     const id = result.windowId;
     editor.setWindowState("project_path", opts.projectPath);
@@ -8531,7 +9244,8 @@ async function attachToWorktree(opts: {
     }
     orchestratorSessions.set(id, {
       id,
-      label: opts.label,
+      label: loadNames()[normRoot(opts.root)] ?? opts.label,
+      hostLabel: opts.label,
       root: opts.root,
       projectPath: opts.projectPath,
       sharedWorktree: false,
@@ -8548,6 +9262,8 @@ async function attachToWorktree(opts: {
     // (arrow-nav, row click) deliberately keep the dock focused, exactly
     // like switching to a live session does.
     if (opts.dive && dockMode && openPanel) {
+      // A dive out of the dock keeps the search filter (see `dockDiveBlur`).
+      dockDiveBlur = true;
       dockBlurred = true;
       editor.floatingPanelControl(openPanel.id(), "blur", 0);
       editor.setEditorMode(null);
@@ -8574,26 +9290,12 @@ function startNewSession(): void {
 }
 
 // =============================================================================
-// "Run Agent…" — launch a starting process from an existing session
+// "Run Agent…" — launch a starting process into the CURRENT workspace
+//
+// The dialog itself is the New-Workspace form with its "Launch in" switch set
+// to "current" (see `NewSessionForm.target`); only the launch below is
+// specific to this target.
 // =============================================================================
-
-// A starting process the Run-Agent dialog can launch: a bare terminal plus
-// every registered agent (the same non-custom presets the New-Workspace
-// dropdown lists). `cmd` is the argv the dialogue's Command field would hold.
-interface RunAgentProcess {
-  cmd: string;
-  label: string;
-  entry: AgentEntry | null;
-}
-function runAgentProcesses(): RunAgentProcess[] {
-  const list: RunAgentProcess[] = [
-    { cmd: "", label: editor.t("form.agent_terminal"), entry: null },
-  ];
-  for (const e of AGENT_REGISTRY) {
-    list.push({ cmd: e.id, label: e.label ?? e.id, entry: e });
-  }
-  return list;
-}
 
 // Options a Run-Agent launch carries, mirroring the dialogue's per-agent
 // controls. `auto`/`prompt`/`teachFreshCli` are only honoured for an agent
@@ -8619,13 +9321,17 @@ async function launchAgentInCurrentWorkspace(
   const entry = agentEntryForCmd(trimmedCmd);
   // "Teach Fresh CLI": inject the CLI system prompt (via flag on launch, or by
   // writing AGENTS.md for file-style agents). The capability token is minted
-  // regardless (see `commandAllowlist` below) — `teach` only gates the prompt.
+  // regardless (see `allowScript` below) — `teach` only gates the prompt.
   const teach = opts.teachFreshCli && entry?.systemPrompt ? entry.systemPrompt : null;
   if (teach?.via === "file") {
     writeFreshCliPromptFile(editor.pathJoin(cwd, teach.path));
   }
   const argv = splitAgentCmd(trimmedCmd);
-  const { launch } = resolveAgentLaunch(argv, {
+  // Keep the resume argv: it is what lets a finished agent be picked back up
+  // (status-bar "Resume claude", or a workspace restore) instead of relaunching
+  // as a brand-new conversation. Dropping it here was why an agent started in
+  // the current workspace restarted as a bare shell.
+  const { launch, resume } = resolveAgentLaunch(argv, {
     auto: opts.auto,
     prompt: opts.prompt,
     systemPrompt: teach?.via === "flag" ? FRESH_CLI_SYSTEM_PROMPT : undefined,
@@ -8635,12 +9341,13 @@ async function launchAgentInCurrentWorkspace(
     await editor.createTerminal({
       cwd,
       command: launch.length > 0 ? launch : undefined,
+      resume,
       title: launch.length > 0 ? editor.pathBasename(launch[0]) || launch[0] : undefined,
       // Always mint the capability token bound to THIS window + allowlist, so
       // `fresh --cmd ...` from inside the terminal is authorised — matching the
       // dialogue, where the token is always present and only the prompt is
       // gated by "Teach Fresh CLI".
-      commandAllowlist: FRESH_CLI_DEFAULT_ALLOWLIST,
+      allowScript: FRESH_CLI_ALLOW_SCRIPT,
       focus: true,
     });
   } catch (e) {
@@ -8650,234 +9357,241 @@ async function launchAgentInCurrentWorkspace(
   }
 }
 
-// Launch `cmd` in a fresh worktree + window — the dialogue's classic path,
-// reached without opening the form. Builds the same `CreateSpec` a default
-// submit would and runs it through `startPendingWorkspace` → `runLocalCreate`.
-async function launchAgentInNewWorkspace(
-  cmd: string,
-  opts: RunAgentLaunchOpts,
-): Promise<void> {
-  const trimmedCmd = cmd.trim();
-  // Resolve the Project Path the way the dialogue's probe does: the active
-  // window's local default, resolved to its canonical repo root when it sits
-  // inside a git tree. `runLocalCreate` re-resolves this itself, so the
-  // worktree fork point is identical either way — this is for the display row.
-  const localDefault = localProjectDefault();
-  const canonical = await resolveCanonicalRepoRoot(localDefault);
-  const projectPath = canonical || localDefault;
-  const entry = agentEntryForCmd(trimmedCmd);
-  startPendingWorkspace(
-    {
-      backend: "local",
-      projectPath,
-      name: "",
-      cmd: trimmedCmd,
-      auto: !!entry?.auto && opts.auto,
-      startPrompt: entry?.prompt ? opts.prompt.trim() : "",
-      teachFreshCli: !!entry?.systemPrompt && opts.teachFreshCli,
-      branch: "",
-      newBranch: "",
-      // A fresh worktree like the dialogue; `runLocalCreate` demotes this to an
-      // in-place open when the project path isn't a git tree.
-      createWorktree: true,
-      displayLabel: editor.pathBasename(projectPath) ||
-        editor.t("dock.pending_default_name"),
-      displayProject: projectPath,
-    },
-    // Land in the new workspace — an explicit "run this agent" reads as "take
-    // me there", matching the dialogue's "Create & Visit".
-    { visit: true },
-  );
+// =============================================================================
+// The orchestrator's plugin API — what a script (or another plugin) can drive
+//
+// The two dialogs above are how a *human* launches an agent. An agent driving
+// the editor from its shell has no way to fill in a form, so each dialog gets a
+// programmatic twin taking the same parameters and submitting through the very
+// same path (`launchAgentInCurrentWorkspace` / `captureCreateSpec` +
+// `startPendingWorkspace`). One launch pipeline, two front doors — a fix or a
+// new agent flag reaches both without being implemented twice.
+//
+// Published through `editor.exportPluginApi`, so a script reaches it the way
+// any plugin reaches another's surface:
+//
+//   const orch = editor.getPluginApi("orchestrator");
+//   const ws = await orch.newWorkspace({ path: "/repo", agent: "claude" });
+//
+// The types below are emitted into `~/.config/fresh/types/plugins.d.ts`, which
+// is what makes that call *typed* at the call site rather than a string
+// incantation an agent has to be told about.
+// =============================================================================
+
+/// What a launch answers with. `workspaceId` is the durable identity — the one
+/// still valid after a restart — and is what a caller should record;
+/// `windowId` is a per-process handle, useful only for the rest of this run.
+export type AgentLaunchResult = {
+  workspaceId: string;
+  windowId: number;
+  root: string;
+};
+
+/// Options shared by both launch verbs. Every field is optional; an omitted one
+/// takes the dialog's own default, so `runAgent({})` is the dialog's defaults
+/// with no agent.
+export type RunAgentOptions = {
+  /** Agent command line, e.g. `claude` or `claude --model opus`. A bare
+   *  terminal when empty or omitted. */
+  agent?: string;
+  /** Initial prompt handed to the agent at launch (agents that accept one). */
+  prompt?: string;
+  /** Run the agent in its reduced-approval mode. Default false. Ignored for an
+   *  agent whose registry entry has no such mode. */
+  auto?: boolean;
+  /** Inject the Fresh system prompt so the agent knows it can drive the editor.
+   *  Default true. */
+  teach?: boolean;
+};
+
+export type NewWorkspaceOptions = RunAgentOptions & {
+  /** Project directory the workspace roots at. Default: this workspace's
+   *  project. Must exist. */
+  path?: string;
+  /** Workspace name. Default: the next auto-generated `<project>-N`. */
+  name?: string;
+  /** Existing branch to check out in the new worktree. Default: the repo's
+   *  default branch. */
+  branch?: string;
+  /** Create the worktree on a new branch of this name, cut from `branch`. */
+  newBranch?: string;
+  /** Create a git worktree for the workspace. Default true; ignored for a
+   *  non-git path. */
+  worktree?: boolean;
+  /** Move focus into the new workspace once it is up. Default false — an agent
+   *  asking for a workspace should not yank the human's focus into it. */
+  visit?: boolean;
+};
+
+/// One workspace, as `listWorkspaces()` reports it.
+export type WorkspaceSummary = {
+  /** Durable identity — survives editor restarts. Record this one. */
+  workspaceId: string;
+  /** Per-process window id; valid only for this editor run. */
+  windowId: number;
+  /** Display name shown on the dock. */
+  name: string;
+  /** Filesystem root (the worktree, for a worktree workspace). */
+  root: string;
+  /** The project this workspace was cut from. */
+  projectPath: string;
+  /** Checked-out branch, when known. */
+  branch?: string;
+  /** Whether the agent in this workspace is producing output right now. */
+  agentState: "working" | "idle";
+  /** Terminal tab title — in practice the agent's command line, since the
+   *  launcher titles the tab with it. Empty when the pane has no title. */
+  title: string;
+  /** Working-tree summary, when a git probe has completed. `dirty` counts
+   *  changed paths; `ahead`/`behind` are relative to the upstream. */
+  git?: { branch?: string; dirty?: number; ahead?: number; behind?: number };
+  /** Backend kind for a remote workspace (`ssh`, `docker`, …), absent for
+   *  a local one. */
+  backend?: string;
+};
+
+/// Public surface of the bundled `orchestrator` plugin, reachable through
+/// `editor.getPluginApi("orchestrator")`.
+export type OrchestratorApi = {
+  /** Launch a coding agent in THIS workspace — the headless twin of the
+   *  "Run Agent…" dialog. Resolves once the agent's terminal is up. */
+  runAgent(options?: RunAgentOptions): Promise<AgentLaunchResult>;
+  /** Create a workspace (a git worktree by default) and launch a coding agent
+   *  in it — the headless twin of the "New Workspace" dialog.
+   *
+   *  Unlike the dialog, which returns to the user immediately and reports
+   *  progress on the dock, this waits for the create to finish: a caller has no
+   *  dock to watch, the durable workspace id does not exist until the window is
+   *  born, and waiting is what lets a failed create reject rather than
+   *  silently do nothing. */
+  newWorkspace(options?: NewWorkspaceOptions): Promise<AgentLaunchResult>;
+  /** Every workspace the dock is tracking, in dock order — what a caller
+   *  needs to find the one it made earlier, or to report on all of them.
+   *  Reads the live model, so it reflects creations made moments ago. */
+  listWorkspaces(): WorkspaceSummary[];
+};
+
+declare global {
+  interface FreshPluginRegistry {
+    orchestrator: OrchestratorApi;
+  }
 }
 
-// Persist the dialog's current choice (agent + target + auto) so the next open
-// starts where the user left off. The start prompt is deliberately not
-// persisted — it's a per-invocation message, not a setting.
-function saveRunAgentLast(cmd: string, target: RunAgentTarget, auto: boolean): void {
-  editor.setGlobalState(RUN_AGENT_LAST_KEY, { cmd, target, auto });
-}
-
-// The dialog's initial state, seeded from the last-used choice (falling back
-// to a bare terminal in the current workspace).
-function initialRunAgentState(): RunAgentDialogState {
-  const last = editor.getGlobalState(RUN_AGENT_LAST_KEY) as
-    | { cmd?: unknown; target?: unknown; auto?: unknown }
-    | undefined;
-  const procs = runAgentProcesses();
-  const lastCmd = typeof last?.cmd === "string" ? last.cmd : "";
-  const idx = Math.max(0, procs.findIndex((p) => p.cmd === lastCmd));
-  const target: RunAgentTarget = last?.target === "new" ? "new" : "current";
+// The active workspace's ids, for a launch that ran in place.
+function currentWorkspaceIds(): AgentLaunchResult {
+  const id = editor.activeWindow();
+  const info = editor.listWindows().find((w) => w.id === id);
   return {
-    agentIndex: idx,
-    target,
-    auto: last?.auto === true,
-    prompt: { value: "", cursor: 0 },
+    workspaceId: info?.stable_id ?? "",
+    windowId: id,
+    root: info?.root ?? editor.getCwd(),
   };
 }
 
-// Open the Run-Agent dialog. No-op if it (or another orchestrator dialog) is
-// already up.
-function openRunAgentDialog(): void {
-  if (runAgentDialog || form || createFolderDialog) return;
-  runAgentDialog = initialRunAgentState();
-  mountRunAgentDialog();
+function trimmed(value: string | undefined): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
-function mountRunAgentDialog(): void {
-  // Yield the dock's keyboard while the dialog owns it (mirrors the
-  // new-session form and the folder dialog).
-  if (openPanel && dockMode) {
-    dockBlurred = true;
-    editor.floatingPanelControl(openPanel.id(), "blur", 0);
-  }
-  runAgentPanel = new FloatingWidgetPanel();
-  runAgentPanel.mount(buildRunAgentSpec(), {
-    widthPct: 55,
-    // A generous cap; both frontends size to the form's real content (the TUI
-    // shrinks to fit, the web modal uses `height:auto`), so this only bounds
-    // the dialog on a very short terminal.
-    heightPct: 60,
-    focusMarker: true,
-    title: `${editor.t("form.header_keyword")} :: ${editor.t("run_agent.title")}`,
-    closable: true,
+async function runAgent(options: RunAgentOptions = {}): Promise<AgentLaunchResult> {
+  const cmd = trimmed(options.agent);
+  const entry = agentEntryForCmd(cmd);
+  // Mirror `submitForm`'s current-workspace branch: the per-agent options are
+  // only honoured for an agent whose registry entry supports each, so a bare
+  // terminal never gets stray flags appended.
+  await launchAgentInCurrentWorkspace(cmd, {
+    auto: !!entry?.auto && (options.auto ?? false),
+    prompt: entry?.prompt ? trimmed(options.prompt) : "",
+    teachFreshCli: !!entry?.systemPrompt && (options.teach ?? true),
   });
-  editor.floatingPanelControl(runAgentPanel.id(), "fullscreen", 1);
-  editor.setEditorMode(RUN_AGENT_MODE);
-  // Land focus on the agent picker so ↑/↓ (with the list open) or Tab flow
-  // naturally from there.
-  runAgentPanel.setFocusKey("run-agent-agent");
+  // The agent runs in the workspace the caller is already in; returning its ids
+  // means a caller never has to correlate "which workspace did that land in".
+  return currentWorkspaceIds();
 }
 
-// Shared label-column width for the form. Pads every label so the `:`
-// separators and value cells line up in a single column ("Auto mode" is the
-// longest label at 9 cols, so 11 leaves a two-space gutter before the colon).
-const RUN_AGENT_LABEL_WIDTH = 11;
-
-// A blank spacer row — one empty line — used to pad the top/bottom of the form
-// and separate the field groups, per the dialog layout.
-function runAgentBlankRow(): WidgetSpec {
-  return raw([styledRow([{ text: "" }])]);
-}
-
-// The dialog spec: a padded, single-column form — agent picker, target picker,
-// optional Auto-mode toggle (with a muted inline hint) and Start-prompt field
-// (both agent-dependent), then the centered Cancel / Run buttons. Every control
-// shares `RUN_AGENT_LABEL_WIDTH` so their `label :` columns and value cells
-// align; blank rows give the form vertical breathing room.
-function buildRunAgentSpec(): WidgetSpec {
-  const d = runAgentDialog!;
-  const procs = runAgentProcesses();
-  const proc = procs[d.agentIndex] ?? procs[0];
-  const lw = RUN_AGENT_LABEL_WIDTH;
-  const children: WidgetSpec[] = [
-    runAgentBlankRow(),
-    dropdown(procs.map((p) => p.label), {
-      selectedIndex: d.agentIndex,
-      label: editor.t("run_agent.agent_label"),
-      labelWidth: lw,
-      key: "run-agent-agent",
-    }),
-    runAgentBlankRow(),
-    dropdown(
-      [editor.t("run_agent.target_current"), editor.t("run_agent.target_new")],
-      {
-        selectedIndex: d.target === "new" ? 1 : 0,
-        label: editor.t("run_agent.target_label"),
-        labelWidth: lw,
-        key: "run-agent-target",
-      },
-    ),
-  ];
-  // Auto mode: only for an agent that documents a bypass/auto flag. Rendered
-  // form-style (`Auto mode : [v]`) so its chip aligns under the other value
-  // cells, with the rationale as a muted hint trailing the chip.
-  if (proc.entry?.auto) {
-    children.push(
-      runAgentBlankRow(),
-      row(
-        toggle(d.auto, editor.t("run_agent.auto_label"), {
-          labelFirst: true,
-          labelWidth: lw,
-          key: "run-agent-auto",
-        }),
-        raw([
-          styledRow([
-            { text: " (" + editor.t("run_agent.auto_help") + ")", style: { fg: "ui.menu_disabled_fg" } },
-          ]),
-        ]),
-      ),
-    );
+async function newWorkspace(
+  options: NewWorkspaceOptions = {},
+): Promise<AgentLaunchResult> {
+  const cmd = trimmed(options.agent);
+  const entry = agentEntryForCmd(cmd);
+  const requestedPath = trimmed(options.path);
+  const projectPath = requestedPath || localProjectDefault();
+  const name = trimmed(options.name);
+  // A path the caller passed has to exist. The dialog's field completes against
+  // the filesystem, so a human sees a wrong path immediately; a caller passing
+  // `path` by hand does not, and the create would otherwise "succeed" into a
+  // workspace rooted at a directory that isn't there.
+  if (requestedPath && !editor.fileExists(editor.localPath(requestedPath))) {
+    throw new Error(`project path does not exist: ${requestedPath}`);
   }
-  // Start prompt: only for an agent that documents a prompt argument. Uses the
-  // text widget's own form label so its bracketed field aligns with the rest.
-  if (proc.entry?.prompt) {
-    children.push(
-      runAgentBlankRow(),
-      text({
-        value: d.prompt.value,
-        cursorByte: d.prompt.cursor,
-        placeholder: editor.t("run_agent.prompt_placeholder"),
-        label: editor.t("run_agent.prompt_label"),
-        labelWidth: lw,
-        fieldWidth: 26,
-        key: "run-agent-prompt",
-      }),
-    );
-  }
-  // Centered Cancel / Run group with a wide gutter, then bottom padding.
-  children.push(
-    runAgentBlankRow(),
-    row(
-      flexSpacer(),
-      button(editor.t("run_agent.btn_cancel"), { intent: "danger", key: "run-agent-cancel" }),
-      spacer(6),
-      button(editor.t("run_agent.btn_run"), { intent: "primary", key: "run-agent-run" }),
-      flexSpacer(),
-    ),
-    runAgentBlankRow(),
-  );
-  return col(...children);
-}
-
-// Commit the dialog: launch the selected process against the chosen target,
-// remember the choice, and close.
-function submitRunAgent(): void {
-  const d = runAgentDialog;
-  if (!d) return;
-  const procs = runAgentProcesses();
-  const proc = procs[d.agentIndex] ?? procs[0];
-  const opts: RunAgentLaunchOpts = {
-    auto: !!proc.entry?.auto && d.auto,
-    prompt: proc.entry?.prompt ? d.prompt.value.trim() : "",
-    // Teach Fresh CLI on by default (matches the dialogue), where supported.
-    teachFreshCli: !!proc.entry?.systemPrompt,
+  // Local backend only: ssh/kubernetes workspaces need connection details that
+  // deserve their own verb (and their own validation), and a caller asking for
+  // a sibling workspace wants the local case.
+  const spec: CreateSpec = {
+    backend: "local",
+    projectPath,
+    // "" ⇒ `runLocalCreate` allocates the next `<project>-N` name, the same
+    // default the dialog's placeholder shows.
+    name,
+    cmd,
+    auto: !!entry?.auto && (options.auto ?? false),
+    startPrompt: entry?.prompt ? trimmed(options.prompt) : "",
+    teachFreshCli: !!entry?.systemPrompt && (options.teach ?? true),
+    branch: trimmed(options.branch),
+    newBranch: trimmed(options.newBranch),
+    // Worktree by default (the dialog's default too); `runLocalCreate` demotes
+    // it to false on its own when the path isn't a git tree.
+    createWorktree: options.worktree ?? true,
+    displayLabel: name || editor.pathBasename(projectPath) ||
+      editor.t("dock.pending_default_name"),
+    displayProject: projectPath,
   };
-  const target = d.target;
-  const cmd = proc.cmd;
-  saveRunAgentLast(cmd, target, d.auto);
-  closeRunAgentDialog();
-  if (target === "current") {
-    void launchAgentInCurrentWorkspace(cmd, opts);
-  } else {
-    void launchAgentInNewWorkspace(cmd, opts);
+  const pendingId = startPendingWorkspace(spec, { visit: options.visit ?? false });
+  const outcome = await awaitCreateOutcome(pendingId);
+  if (!outcome.ok) {
+    // Thrown, not returned: a failed create must reject the caller's promise
+    // (and so fail its script), not hand it a result object it might mistake
+    // for a workspace. The dock keeps the row for a human to retry or dismiss.
+    throw new Error(outcome.error || "workspace creation failed");
   }
+  return {
+    workspaceId: outcome.workspaceId ?? "",
+    windowId: outcome.windowId ?? 0,
+    root: outcome.root ?? "",
+  };
 }
 
-// Tear down the dialog and hand keyboard focus back to the dock (if up).
-function closeRunAgentDialog(): void {
-  if (runAgentPanel) {
-    runAgentPanel.unmount();
-    runAgentPanel = null;
-  }
-  runAgentDialog = null;
-  editor.setEditorMode(null);
-  if (openPanel && dockMode) {
-    dockBlurred = false;
-    editor.floatingPanelControl(openPanel.id(), "focus", 0);
-    openPanel.setFocusKey("sessions");
-    refreshOpenDialog();
-  }
+function listWorkspaces(): WorkspaceSummary[] {
+  // Reconcile first: a workspace created seconds ago (by a script, or by
+  // the dialog) is only in the model once the host's window list has been
+  // folded in, and a caller listing right after creating should see it.
+  reconcileSessions();
+  const windows = editor.listWindows();
+  return [...orchestratorSessions.values()].map((session) => {
+    const win = windows.find((w) => w.id === session.id);
+    const git = session.git?.info;
+    return {
+      workspaceId: win?.stable_id ?? "",
+      windowId: session.id,
+      name: session.label,
+      root: session.root,
+      projectPath: session.projectPath,
+      branch: session.branch ?? git?.branch,
+      agentState: session.state,
+      title: session.terminalTitle ?? "",
+      git: git
+        ? {
+          branch: git.branch,
+          dirty: git.dirty,
+          ahead: git.ahead,
+          behind: git.behind,
+        }
+        : undefined,
+      backend: session.remote?.kind,
+    };
+  });
 }
+
+editor.exportPluginApi("orchestrator", { runAgent, newWorkspace, listWorkspaces });
 
 // Form key bindings — each delegates to smart-key dispatch on the
 // panel, which routes to the focused widget. `mode_text_input`
@@ -8924,18 +9638,6 @@ const FOLDER_DIALOG_MODE_BINDINGS: [string, string][] = [
 ];
 editor.defineMode(CREATE_FOLDER_MODE, FOLDER_DIALOG_MODE_BINDINGS, true, true);
 
-// Run-Agent dialog: only Ctrl+Enter is bound (submit from anywhere). Plain
-// Enter, Tab, ↑/↓, Space and Esc all fall through to the panel's default
-// smart-key routing — so Enter opens/commits the focused dropdown or activates
-// the focused button, Tab cycles fields, and Esc closes an open dropdown (then,
-// with nothing open, fires the panel `cancel` event handled in `widget_event`).
-const RUN_AGENT_MODE_BINDINGS: [string, string][] = [
-  ["C-Enter", "orchestrator_run_agent_submit"],
-];
-editor.defineMode(RUN_AGENT_MODE, RUN_AGENT_MODE_BINDINGS, true, true);
-registerHandler("orchestrator_run_agent_submit", () => {
-  if (runAgentDialog) submitRunAgent();
-});
 
 registerHandler("orchestrator_folder_submit", () => {
   if (!createFolderDialog) return;
@@ -9255,61 +9957,6 @@ editor.on("widget_event", (e) => {
   // "Run Agent…" dialog: agent picker, target picker, Auto toggle,
   // Start-prompt field, Cancel / Run.
   // ---------------------------------------------------------------------
-  if (runAgentPanel && runAgentDialog && e.panel_id === runAgentPanel.id()) {
-    const d = runAgentDialog;
-    if (e.event_type === "cancel") {
-      // Esc / click-outside: the host already unmounted the panel, so just
-      // drop our handle and refocus the dock.
-      runAgentPanel = null;
-      runAgentDialog = null;
-      editor.setEditorMode(null);
-      if (openPanel && dockMode) {
-        dockBlurred = false;
-        editor.floatingPanelControl(openPanel.id(), "focus", 0);
-        openPanel.setFocusKey("sessions");
-        refreshOpenDialog();
-      }
-      return;
-    }
-    if (e.event_type === "change" && e.widget_key === "run-agent-agent") {
-      const idx = (e.payload as { index?: unknown })?.index;
-      if (typeof idx === "number") {
-        d.agentIndex = idx;
-        // Rebuild: the Auto toggle and Start-prompt field appear/disappear
-        // with the selected agent's capabilities.
-        runAgentPanel.update(buildRunAgentSpec());
-      }
-      return;
-    }
-    if (e.event_type === "change" && e.widget_key === "run-agent-target") {
-      const idx = (e.payload as { index?: unknown })?.index;
-      if (typeof idx === "number") d.target = idx === 1 ? "new" : "current";
-      return;
-    }
-    if (e.event_type === "change" && e.widget_key === "run-agent-prompt") {
-      const payload = (e.payload ?? {}) as Record<string, unknown>;
-      if (typeof payload.value === "string") d.prompt.value = payload.value;
-      if (typeof payload.cursorByte === "number") d.prompt.cursor = payload.cursorByte;
-      return;
-    }
-    if (e.event_type === "toggle" && e.widget_key === "run-agent-auto") {
-      const checked = (e.payload as { checked?: unknown })?.checked;
-      d.auto = typeof checked === "boolean" ? checked : !d.auto;
-      // Rebuild so the checkbox glyph reflects the new state (the toggle's
-      // visual comes from the spec, like the folder dialog's checkbox).
-      runAgentPanel.update(buildRunAgentSpec());
-      return;
-    }
-    if (e.event_type === "activate" && e.widget_key === "run-agent-cancel") {
-      closeRunAgentDialog();
-      return;
-    }
-    if (e.event_type === "activate" && e.widget_key === "run-agent-run") {
-      submitRunAgent();
-      return;
-    }
-    return;
-  }
   // ---------------------------------------------------------------------
   // Dock session context menu (right-click): Visit / Archive / Delete.
   // ---------------------------------------------------------------------
@@ -9368,6 +10015,12 @@ editor.on("widget_event", (e) => {
         // Visit dives into the editor — no dock refocus.
         closeDockContextMenu();
         dockMenuVisit(id);
+        return;
+      }
+      if (e.widget_key === "ctx-rename-session") {
+        // Same centered dialog as folder rename; it blurs the dock itself.
+        closeDockContextMenuAndRestoreDock();
+        openRenameWorkspaceDialog(id);
         return;
       }
       if (e.widget_key === "ctx-move") {
@@ -9436,6 +10089,22 @@ editor.on("widget_event", (e) => {
       // Host-authoritative open/closed signal for the option pop-over.
       const payload = (e.payload ?? {}) as Record<string, unknown>;
       agentDropdownOpen = payload.open === true;
+      return;
+    }
+    if (e.event_type === "change" && e.widget_key === "target_dropdown") {
+      // Flipping the target reshapes the whole form: "new" reveals the
+      // backend tabs, Project Path, Workspace Name and the Advanced fold;
+      // "current" hides them all, leaving the agent controls.
+      const payload = (e.payload ?? {}) as Record<string, unknown>;
+      const index = payload.index;
+      if (typeof index === "number") {
+        const next: RunAgentTarget = index === 0 ? "current" : "new";
+        if (next !== form.target) {
+          form.target = next;
+          form.lastError = null;
+          mountFormPanel("target_dropdown");
+        }
+      }
       return;
     }
     if (e.event_type === "change" && e.widget_key === "agent_dropdown") {
@@ -9659,16 +10328,27 @@ editor.on("widget_event", (e) => {
       // leave, editor click, or an unhandled chord like Ctrl+P). The
       // dock stays visible; the host stops routing keys to it.
       if (dockMode) {
+        const wasDive = dockDiveBlur;
+        dockDiveBlur = false;
         dockBlurred = true;
-        // Leaving the dock also closes the project dropdown so it
-        // doesn't linger over the blurred dock.
+        // Leaving the dock also closes its dropdowns so they don't
+        // linger over the blurred dock. `dockMenu` covers the "New
+        // Task… ▾" and "Move to Folder…" overlays: they are menus, and
+        // clicking away from a menu dismisses it.
         openDialog.projectMenuOpen = false;
+        openDialog.dockMenu = null;
         // Leaving the dock resets the filter so re-entering always
         // shows the full session list. A stale filter (e.g. an old
         // "/gamma") otherwise silently hides sessions on the next
         // focus, with only the filter box as a clue — and there is no
         // one-key clear from the list. (See F5.)
-        if (openDialog.filter.value !== "") {
+        //
+        // A *dive* is the exception: clicking a row (or Enter on it) is
+        // acting on the filtered list, not abandoning it, so the needle
+        // stays put and the next workspace can be picked out of the same
+        // search without retyping it. Esc/editor-click still clear, so
+        // the one-key escape from a stale filter is unchanged.
+        if (!wasDive && openDialog.filter.value !== "") {
           openDialog.filter.value = "";
           openDialog.filter.cursor = 0;
           dockFocus = "list";
@@ -9701,6 +10381,9 @@ editor.on("widget_event", (e) => {
         pickerFocusKey = e.widget_key;
       }
       if (dockMode) {
+        // A dive that never produced a `blur` (already blurred, say)
+        // must not leave the flag armed for the next, unrelated one.
+        dockDiveBlur = false;
         const wasBlurred = dockBlurred;
         dockBlurred = false;
         dockFocus = e.widget_key === "filter" ? "filter" : "list";
@@ -9768,6 +10451,9 @@ editor.on("widget_event", (e) => {
       if (typeof id === "number" && id > 0 && id !== editor.activeWindow()) {
         editor.setActiveWindow(id);
       }
+      // Same as the row click: the filter that surfaced this row is kept
+      // across the dive (see `dockDiveBlur`).
+      dockDiveBlur = true;
       dockBlurred = true;
       editor.floatingPanelControl(openPanel.id(), "blur", 0);
       editor.setEditorMode(null);
@@ -9896,6 +10582,11 @@ editor.on("widget_event", (e) => {
           // also dives (hands keyboard focus to the window). A discovered
           // on-disk worktree has no window, so both paths attach a fresh
           // session instead.
+          // Reaching the tree at all means the pointer (or the arrow
+          // keys) landed outside any open dropdown — the overlay is
+          // opaque to clicks over its own rows — so dismiss it, the way
+          // any menu goes away when you act elsewhere.
+          openDialog.dockMenu = null;
           const key = typeof payload.key === "string"
             ? payload.key
             : (openDialog.dockKeys[idx] ?? null);
@@ -10062,6 +10753,9 @@ editor.on("widget_event", (e) => {
     // Dock "view" button → flip card ⇄ compact density and re-render.
     if (e.event_type === "activate" && e.widget_key === "view-toggle") {
       dockView = dockView === "card" ? "compact" : "card";
+      // Pin it for the rest of the session — the configured default only
+      // decides where the dock *starts*.
+      dockViewOverride = dockView;
       if (openPanel) openPanel.update(buildDockSpec());
       return;
     }
@@ -10241,6 +10935,14 @@ editor.on("window_closed", (e) => {
 // resumes (Enter) or dismisses — nothing auto-runs (§ recoverPendingWorkspaces).
 editor.on("ready", () => {
   recoverPendingWorkspaces();
+  // Auto-open the dock when the user asked for it in Settings (Plugin:
+  // orchestrator → autoOpenDock). Runs after the recovery pass, which
+  // may already have shown the dock for a restored placeholder —
+  // `showDockUnfocused` is a no-op on an open panel, so the two can't
+  // fight. Like the pending-workspace case, the dock comes up *blurred*:
+  // it's a switcher, not something to type into, so the keyboard stays
+  // with whatever the editor restored.
+  if (dockSettings().autoOpenDock === true) showDockUnfocused();
 });
 
 // Grace window after a session becomes active during which terminal
@@ -10251,7 +10953,12 @@ const ACTIVATION_GRACE_MS = 1500;
 
 editor.on("active_window_changed", () => {
   const s = orchestratorSessions.get(editor.activeWindow());
-  if (s) s.activatedAt = Date.now();
+  if (s) {
+    s.activatedAt = Date.now();
+    // Switching into a workspace counts as activity for the dock's recency
+    // order (persisted at day granularity).
+    markSessionActiveToday(s);
+  }
   refreshOpenDialog();
   // A passive (blurred) dock mirrors the active window, so keep its
   // highlighted row in sync when focus moves to another window from
@@ -10335,6 +11042,34 @@ editor.on("terminal_output", (payload) => {
     // any non-render reader see a fresh value too.
     s.lastOutputAt = Date.now();
     s.state = "working";
+    // Terminal output is activity — feed the dock's day-granularity recency
+    // order (persists at most once per session per day).
+    markSessionActiveToday(s);
+    // Adopt any explicit OSC activity signal (OSC 133 / OSC 9;4) from the
+    // session's own terminal — authoritative for the working/idle dot. Only
+    // the session's agent terminal (when it has one), so a second shell in
+    // the same window can't drive the indicator. `null`/`undefined` leaves
+    // the previous state (a program that emits markers, then a batch without
+    // one, is still considered running/idle per the last marker).
+    if (
+      (s.terminalId === null || s.terminalId === payload.terminal_id) &&
+      (payload.osc_activity === true || payload.osc_activity === false)
+    ) {
+      s.oscRunning = payload.osc_activity;
+    }
+    // Track the terminal's tab title so an un-renamed workspace names itself
+    // after whatever it's running. Only adopt the session's own agent
+    // terminal (when it has one) so a second shell the user opened in the
+    // same window can't hijack the workspace name.
+    const title = (payload.terminal_title ?? "").trim();
+    if (
+      title &&
+      (s.terminalId === null || s.terminalId === payload.terminal_id) &&
+      s.terminalTitle !== title
+    ) {
+      s.terminalTitle = title;
+      applyResolvedLabel(s);
+    }
     refreshOpenDialog();
     // Ensure the row flips back to idle once output stops, even if no
     // further event arrives to trigger a render.
@@ -10352,6 +11087,10 @@ editor.on("terminal_exit", (payload) => {
     // `terminal_output` re-marks it working within the debounce window.
     s.lastOutputAt = null;
     s.state = "idle";
+    // The terminal is gone, so any running OSC marker is stale — clear it so
+    // a command that never emitted its "done" marker (killed, detached)
+    // doesn't leave the row stuck "working".
+    s.oscRunning = null;
     refreshOpenDialog();
   }
 });
@@ -10412,7 +11151,11 @@ editor.registerCommand(
 // what it does — start a coding agent — with no "workspace"/"orchestrator" in
 // the label. `terminalBypass` keeps it reachable from a keyboard-focused
 // terminal pane, like the other orchestrator commands.
-registerHandler("orchestrator_run_agent", openRunAgentDialog);
+// "Run Agent…" and "New Workspace" are the same dialog; they differ only in
+// which way its "Launch in" switch starts. One form, one submit path — the two
+// used to be separate dialogs, and the current-workspace one silently dropped
+// the agent-resume argv.
+registerHandler("orchestrator_run_agent", () => openForm({ target: "current" }));
 editor.registerCommand(
   "%cmd.run_agent",
   "%cmd.run_agent_desc",

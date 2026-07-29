@@ -64,7 +64,7 @@ impl Editor {
 
         for window in self.windows.values_mut() {
             window.sync_terminal_titles();
-            window.enforce_terminal_no_wrap();
+            window.enforce_terminal_grid_wrap();
         }
 
         // Carve a full-height left column for a docked floating panel
@@ -75,11 +75,15 @@ impl Editor {
         // painted last alongside the centered-overlay path.
         let (dock_area, chrome_area) = self.compute_dock_split(size);
 
-        // Let active animations snapshot the previous frame's buffer
-        // from the runner's own cache. We can't read the live
-        // `frame.buffer_mut()` — ratatui resets it before each draw —
-        // so the runner keeps a post-apply clone from the last frame.
-        self.active_window_mut().animations.capture_before_all();
+        // Let active animations snapshot the previous frame's buffer.
+        // We can't read the live `frame.buffer_mut()` — ratatui resets it
+        // before each draw — so the editor keeps a post-apply clone of
+        // the last frame and hands it in.
+        let previous_frame = self.last_rendered_frame.take();
+        self.active_window_mut()
+            .animations
+            .capture_before_all(previous_frame.as_ref());
+        self.last_rendered_frame = previous_frame;
 
         // Save frame dimensions for recompute_layout (used by macro replay)
         self.active_chrome_mut().last_frame.width = size.width;
@@ -381,6 +385,22 @@ impl Editor {
                 let commands = self.plugin_manager.write().unwrap().process_commands();
                 let dispatched_any = !commands.is_empty();
                 for command in commands {
+                    // A command that changes *which window this frame is
+                    // being painted for* cannot run here: the menu bar,
+                    // the file-explorer sidebar, the tab bar and the
+                    // splits above have already been drawn for the
+                    // outgoing window, and only the buffer content and
+                    // bottom row are still to come. Running it anyway
+                    // stitches one frame out of two workspaces — the
+                    // reported "the sidebar hangs over the wrong
+                    // workspace for a moment" when clicking between dock
+                    // cards. Hold it until the paint is finished, at the
+                    // very bottom of this function.
+                    if Self::plugin_command_must_run_between_frames(&command) {
+                        self.deferred_plugin_commands.push(command);
+                        self.plugin_render_requested = true;
+                        continue;
+                    }
                     if let Err(e) = self.handle_plugin_command(command) {
                         tracing::error!("Error handling plugin command: {}", e);
                     }
@@ -915,17 +935,13 @@ impl Editor {
         // Update menu context with current editor state
         self.update_menu_context();
 
-        // Settings / calibration-wizard / keybinding-editor / event-debug
-        // modals, dimming the chrome behind each. Rendered before the menu
-        // bar so open menus overlay them.
-        self.render_modal_overlays(frame, chrome_area);
-
-        // The workspace-trust prompt is a blocking, top-most security modal.
-        // It dims the *entire* frame (the dock included) and centres in the
-        // full window, so it is rendered at the very end of this method —
-        // after the dock and floating panels — rather than here, where the
-        // dock's later pass would overpaint its left edge. See the bottom of
-        // `render`.
+        // The full-screen modals (settings, calibration wizard, keybinding
+        // editor, event-debug dialog) and the blocking workspace-trust prompt
+        // each dim the *entire* frame — the dock included — and centre in the
+        // full window, so they are rendered at the very end of this method,
+        // after the dock and floating panels, rather than here, where the
+        // dock's later pass would overpaint their left edge. See the bottom of
+        // `render` and `render_panels_and_modals`.
 
         // Menu bar, drawn last so its dropdowns sit above all other content.
         self.render_menu_bar(frame, menu_bar_area);
@@ -964,19 +980,20 @@ impl Editor {
             }
         }
 
-        // Convert all colors for terminal capability (256/16 color fallback)
-        crate::view::color_support::convert_buffer_colors(
-            frame.buffer_mut(),
-            self.color_capability,
-        );
-
-        // Frame-buffer animations run last so they mutate the final paint.
+        // Frame-buffer animations run after the main draw so they mutate the
+        // final paint.
         self.active_window_mut()
             .animations
             .apply_all(frame.buffer_mut());
 
-        // Dock, floating panel, theme-info popup, and the workspace-trust
-        // modal — the topmost layers, drawn above prompts/popups/animations.
+        // Keep the post-apply paint so the next frame's effects can push
+        // it out of view. Cloned because ratatui resets the current
+        // buffer before the next draw.
+        self.last_rendered_frame = Some(frame.buffer_mut().clone());
+
+        // Dock, full-screen modals, floating panel, theme-info popup, and the
+        // workspace-trust modal — the topmost layers, drawn above
+        // prompts/popups/animations.
         self.render_panels_and_modals(
             frame,
             size,
@@ -985,6 +1002,31 @@ impl Editor {
             top_is_trust_modal,
             &theme_clone,
         );
+
+        // Convert all colors for terminal capability (256/16 color fallback).
+        // Dead last, so the layers painted above — dock, full-screen modals,
+        // animations — go through the fallback too instead of emitting
+        // truecolor SGR on a terminal that cannot render it.
+        crate::view::color_support::convert_buffer_colors(
+            frame.buffer_mut(),
+            self.color_capability,
+        );
+
+        // Commands the mid-render drain held back because they change which
+        // window the frame belongs to. The paint is finished, so they can no
+        // longer split it across two workspaces — and running them here
+        // rather than at the top of the next render keeps them from lagging a
+        // frame behind everything else the same drain dispatched.
+        //
+        // Deliberately after `last_rendered_frame` was captured above: the
+        // wipe a switch starts takes that frame as its "before", and it has
+        // to be the one still showing the window being left.
+        #[cfg(feature = "plugins")]
+        for command in std::mem::take(&mut self.deferred_plugin_commands) {
+            if let Err(e) = self.handle_plugin_command(command) {
+                tracing::error!("Error handling deferred plugin command: {}", e);
+            }
+        }
     }
 
     /// Render the search-options bar into `area` when `show_search_options`
@@ -1318,8 +1360,9 @@ impl Editor {
     }
 
     /// Render the topmost layers: the dock and floating widget panel (each in
-    /// its own slot), the theme-info popup, and the blocking workspace-trust
-    /// modal. Drawn after every other layer so they sit on top.
+    /// its own slot), the full-screen modals (settings, keybinding editor,
+    /// …), the theme-info popup, and the blocking workspace-trust modal.
+    /// Drawn after every other layer so they sit on top.
     fn render_panels_and_modals(
         &mut self,
         frame: &mut Frame,
@@ -1339,6 +1382,14 @@ impl Editor {
                 self.render_floating_widget_panel(frame, dock, super::PanelSlot::Dock);
             }
         }
+
+        // Settings / calibration-wizard / keybinding-editor / event-debug —
+        // full-screen modals. They get the whole frame (`size`), not the
+        // chrome region right of the dock: each dims everything behind it,
+        // the dock included, and centres in the full window. Drawn here,
+        // after the dock's own pass, so the dock cannot overpaint the
+        // modal's left edge.
+        self.render_modal_overlays(frame, size);
 
         // The theme-info popup (Ctrl+Right-Click) anchors to an absolute
         // screen cell that may sit over the dock column, so draw it after
@@ -1786,6 +1837,7 @@ impl Editor {
 
         // Get update availability info
         let update_available = self.latest_version().map(|v| v.to_string());
+        let self_update_phase = self.self_update_phase();
 
         // Render status bar (hidden when toggled off, or when suggestions/file browser popup is shown)
         if self.active_window().status_bar_visible && !has_suggestions && !has_file_browser {
@@ -1841,8 +1893,10 @@ impl Editor {
                 .contains(&(u64::MAX - self.active_window_id().0))
                 && self.active_window().authority_spec.is_remote();
 
-            // Get session name for display (only in session mode)
-            let session_name = self.session_name().map(|s| s.to_string());
+            // Get session label for display (only in session mode). The display
+            // name, not `session_name`: an unnamed working-directory daemon has
+            // no daemon name but is still labelled with its directory.
+            let session_name = self.session_display_name().map(|s| s.to_string());
 
             let active_split = self.effective_active_split();
             let active_buf = self.active_buffer();
@@ -1865,6 +1919,16 @@ impl Editor {
             // Active session's trust level for the always-present `{trust}`
             // indicator — read here (Copy) before the mutable window borrow.
             let workspace_trust_level = self.authority().workspace_trust.level();
+            // Restart affordance for a terminal buffer whose process quit.
+            // `exited_terminal` is `Some` only in exactly that state, so the
+            // indicator can't offer to restart a live agent.
+            let terminal_restart = self.active_window().exited_terminal(active_buf).map(|e| {
+                crate::view::ui::status_bar::TerminalRestartState {
+                    program: e.program_name().map(str::to_string),
+                    exit_code: e.exit_code,
+                    resumes_agent: e.resumes_agent() && self.config.terminal.resume_agents,
+                }
+            });
             // Single window borrow, split into buffers + cursors so the
             // status-bar context can hold both.
             let __active_id = self.active_window;
@@ -1897,6 +1961,7 @@ impl Editor {
                         keybindings,
                         chord_state: &chord_state_cloned,
                         update_available: update_available.as_deref(),
+                        update_phase: self_update_phase,
                         warning_level,
                         general_warning_count,
                         hovered: status_bar_hovered,
@@ -1914,6 +1979,7 @@ impl Editor {
                         remote_indicator_on_bar: false,
                         dynamic_status_bar_elements: dynamic_status_bar_elements.clone(),
                         workspace_trust_level,
+                        terminal_restart: terminal_restart.clone(),
                     };
                     let mut sb_rec =
                         crate::app::types::CellThemeRecorder::new(&mut status_bar_runs);
@@ -1935,15 +2001,27 @@ impl Editor {
             status_bar.clickable = status_bar_layout.clickable;
             status_bar.plugin_token_areas = status_bar_layout.plugin_token_areas;
             status_bar.segments = status_bar_layout.segments;
+        } else {
+            // No bar this frame — the user hid it, or a suggestions / file-
+            // browser popup took the row. Drop last frame's capture instead of
+            // leaving it to go stale: `status_view` would keep projecting a
+            // status bar the web then draws under its prompt row (the TUI's
+            // ghost-text bug), and the click/hover hit-tests would keep
+            // resolving segments that are no longer on screen.
+            self.active_chrome_mut().status_bar = Default::default();
         }
     }
 
-    /// Render the modal overlays that dim the chrome behind them: settings,
+    /// Render the modal overlays that dim everything behind them: settings,
     /// calibration wizard, keybinding editor, and event-debug dialog. Each is
     /// drawn only for the TUI (`!suppress_chrome_cells`); the web projects
-    /// them natively. Rendered before the menu bar so open menus overlay them.
-    fn render_modal_overlays(&mut self, frame: &mut Frame, chrome_area: ratatui::layout::Rect) {
-        // Render settings modal (before menu bar so menus can overlay)
+    /// them natively.
+    ///
+    /// `area` is the whole frame — these are full-screen modals, so the dim
+    /// pass covers the dock column too and each dialog centres in the full
+    /// window. They are called from `render_panels_and_modals` (after the
+    /// dock paints) so the dock cannot overpaint them.
+    fn render_modal_overlays(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
         // Check visibility first to avoid borrow conflict with dimming
         // The web renders Settings natively from `settings_view`; paint cells
         // only for the TUI.
@@ -1955,10 +2033,12 @@ impl Editor {
                 .map(|s| s.visible)
                 .unwrap_or(false);
         if settings_visible {
-            // Dim the editor content behind the settings modal. Use the
-            // chrome area (right of a left dock) so the modal sits beside
-            // the persistent dock instead of being overlapped by it.
-            crate::view::dimming::apply_dimming(frame, chrome_area);
+            // Dim everything behind the settings modal — the editor chrome
+            // *and* the dock. The dock is input-inaccessible while the modal
+            // is up (`dispatch_modal_mouse` routes every click to settings),
+            // so leaving it at full brightness read as if it were still live
+            // beside a dialog that had already swallowed its input.
+            crate::view::dimming::apply_dimming(frame, area);
         }
         if let Some(ref mut settings_state) = self.settings_state {
             if !draw_settings {
@@ -1973,7 +2053,7 @@ impl Editor {
                 settings_state.update_focus_states();
                 let settings_layout = crate::view::settings::render_settings(
                     frame,
-                    chrome_area,
+                    area,
                     settings_state,
                     &self.theme.read().unwrap(),
                 );
@@ -1986,10 +2066,10 @@ impl Editor {
         if !self.suppress_chrome_cells {
             if let Some(ref wizard) = self.calibration_wizard {
                 // Dim the editor content behind the wizard modal
-                crate::view::dimming::apply_dimming(frame, chrome_area);
+                crate::view::dimming::apply_dimming(frame, area);
                 crate::view::calibration_wizard::render_calibration_wizard(
                     frame,
-                    chrome_area,
+                    area,
                     wizard,
                     &self.theme.read().unwrap(),
                 );
@@ -2004,10 +2084,10 @@ impl Editor {
         // paint cells only for the TUI.
         if draw_aux {
             if let Some(ref mut kb_editor) = self.keybinding_editor {
-                crate::view::dimming::apply_dimming(frame, chrome_area);
+                crate::view::dimming::apply_dimming(frame, area);
                 crate::view::keybinding_editor::render_keybinding_editor(
                     frame,
-                    chrome_area,
+                    area,
                     kb_editor,
                     &self.theme.read().unwrap(),
                 );
@@ -2018,10 +2098,10 @@ impl Editor {
         if draw_aux {
             if let Some(ref debug) = self.active_window().event_debug {
                 // Dim the editor content behind the dialog modal
-                crate::view::dimming::apply_dimming(frame, chrome_area);
+                crate::view::dimming::apply_dimming(frame, area);
                 crate::view::event_debug::render_event_debug(
                     frame,
-                    chrome_area,
+                    area,
                     debug,
                     &self.theme.read().unwrap(),
                 );
@@ -2097,6 +2177,21 @@ impl Editor {
     /// The mid-render drain (after `compute_dock_split`) runs too late for
     /// those: the dock area would be computed from stale state and the freed
     /// columns would render blank until the next input event.
+    /// True for plugin commands that may only be handled between frames,
+    /// never in the mid-render drain. Today that is exactly the
+    /// active-window switches: everything the editor paints — chrome,
+    /// sidebar, splits, status bar — is derived from the active window, so
+    /// moving that pointer part-way through a paint yields a frame
+    /// assembled from two different workspaces.
+    #[cfg(feature = "plugins")]
+    fn plugin_command_must_run_between_frames(command: &fresh_core::api::PluginCommand) -> bool {
+        use fresh_core::api::PluginCommand;
+        matches!(
+            command,
+            PluginCommand::SetActiveWindow { .. } | PluginCommand::SetActiveWindowAnimated { .. }
+        )
+    }
+
     fn drain_pre_layout_plugin_commands(&mut self) {
         #[cfg(feature = "plugins")]
         {
@@ -2445,6 +2540,10 @@ impl Editor {
                 width,
                 height: max_height,
             };
+            // Web renders the browser natively from `file_browser_view`; skip
+            // its cell drawing (layout, spans and the list viewport are still
+            // computed, and the projection reads them).
+            let fb_draw = !self.suppress_chrome_cells;
             let __win = self.active_window_mut();
             let Some(file_open_state) = &mut __win.file_open_state else {
                 return;
@@ -2456,6 +2555,7 @@ impl Editor {
                 &theme,
                 &hover_target,
                 Some(&kb_clone),
+                fb_draw,
             );
             return;
         }
@@ -4215,6 +4315,9 @@ impl Editor {
                     self.config.editor.show_horizontal_scrollbar,
                     self.config.editor.diagnostics_inline_text,
                     self.config.editor.show_tilde,
+                    crate::view::bracket_highlight_overlay::BracketHighlightSettings::from_config(
+                        &self.config.editor,
+                    ),
                 )
             })
             .expect("active window must have a populated split layout");
@@ -4449,7 +4552,18 @@ impl Editor {
             super::PanelPlacement::Centered => {
                 let requested = Self::centered_overlay_rect(area, width_pct, height_pct);
                 let needed_h = (entries.len() as u16).saturating_add(2);
-                let effective_h = needed_h.min(requested.height).max(3);
+                // Fit the content in BOTH directions: the requested height is
+                // a hint, never a guillotine. Shorter content shrinks the box
+                // (the original Bug 7 fix); content taller than the requested
+                // percentage GROWS it, up to the frame. Capping at the request
+                // silently amputated the tail of the spec — on a 24-row
+                // terminal the dock's delete confirmation (mounted at 44%,
+                // i.e. 10 rows) lost its `[ Cancel ] [ Confirm Delete ]` row
+                // entirely, so the modal read as "up but not focused" while
+                // the (invisible) focused button still answered Enter.
+                // Clipping is only acceptable when the frame itself is too
+                // small, which `area.height` already expresses.
+                let effective_h = needed_h.clamp(3, area.height.max(3));
                 ratatui::layout::Rect {
                     x: requested.x,
                     y: area.y + (area.height.saturating_sub(effective_h)) / 2,

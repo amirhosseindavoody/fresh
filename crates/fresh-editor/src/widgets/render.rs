@@ -1145,6 +1145,12 @@ fn collect_col(
             }
             for mut h in child_out.hits {
                 h.buffer_row += row_offset;
+                // Mark them as the popup's own: their byte ranges are
+                // measured against the overlay's row text, which is what
+                // the user sees at these rows — the covered row's text
+                // is invisible and must not resolve clicks. See
+                // `WidgetRegistry::overlay_hit_test`.
+                h.overlay = true;
                 hits.push(h);
             }
             // Focus cursor inside an overlay (rare but
@@ -1268,6 +1274,7 @@ fn collect_toggle(
         (entry, (0, end))
     };
     out.hits.push(HitArea {
+        overlay: false,
         widget_key: key.unwrap_or("").to_string(),
         widget_kind: "toggle",
         buffer_row: 0,
@@ -1327,6 +1334,7 @@ fn collect_number(
     // A click on the value cell begins in-place editing host-side
     // (see `deliver_widget_hit`'s `number_value` special case).
     out.hits.push(HitArea {
+        overlay: false,
         widget_key: key.unwrap_or("").to_string(),
         widget_kind: "number",
         buffer_row: 0,
@@ -1424,6 +1432,7 @@ fn collect_dropdown(
     // A click on the `[value ▼]` button toggles the option list open
     // (see `deliver_widget_hit`'s `dropdown_toggle` special case).
     out.hits.push(HitArea {
+        overlay: false,
         widget_key: widget_key.clone(),
         widget_kind: "dropdown",
         buffer_row: 0,
@@ -1489,6 +1498,7 @@ fn collect_button(
     if !disabled {
         let byte_end = entry.text.len();
         out.hits.push(HitArea {
+            overlay: false,
             widget_key: key.unwrap_or("").to_string(),
             widget_kind: "button",
             buffer_row: 0,
@@ -1878,6 +1888,7 @@ fn collect_list(
                 let hit_row = entries.len() as u32;
                 entries.push(entry);
                 hits.push(HitArea {
+                    overlay: false,
                     widget_key: item_key.clone(),
                     widget_kind: "list",
                     buffer_row: hit_row,
@@ -1909,6 +1920,7 @@ fn collect_list(
             let item_key = item_keys.get(i).cloned().unwrap_or_default();
             let hit_row = (entries.len() - 1) as u32;
             hits.push(HitArea {
+                overlay: false,
                 widget_key: item_key.clone(),
                 widget_kind: "list",
                 buffer_row: hit_row,
@@ -2480,6 +2492,7 @@ fn render_widget_text(
             // (see the single-line branch / #2234 item 1).
             if let Some(k) = key.filter(|k| !k.is_empty()) {
                 out.hits.push(HitArea {
+                    overlay: false,
                     widget_key: k.to_string(),
                     widget_kind: "text",
                     buffer_row: row_idx as u32,
@@ -2563,6 +2576,7 @@ fn render_widget_text(
         if let Some(k) = key.filter(|k| !k.is_empty()) {
             let inner_start = marker_bytes + rendered.inner_byte_start;
             out.hits.push(HitArea {
+                overlay: false,
                 widget_key: k.to_string(),
                 widget_kind: "text",
                 buffer_row: 0,
@@ -2877,6 +2891,7 @@ fn render_widget_tree(
             out.entries.push(extra);
             if extra_byte_end > 0 {
                 out.hits.push(HitArea {
+                    overlay: false,
                     widget_key: tree_spec_key.clone(),
                     widget_kind: "tree",
                     buffer_row: (out.entries.len() - 1) as u32,
@@ -2897,6 +2912,7 @@ fn render_widget_tree(
         // expansion changes.
         if let Some(disc_range) = rendered.disclosure_range {
             out.hits.push(HitArea {
+                overlay: false,
                 widget_key: tree_spec_key.clone(),
                 widget_kind: "tree",
                 buffer_row: hit_row,
@@ -2919,6 +2935,7 @@ fn render_widget_tree(
         if let Some(cb_range) = rendered.checkbox_range {
             let new_checked = !nodes[abs_idx].checked.unwrap_or(false);
             out.hits.push(HitArea {
+                overlay: false,
                 widget_key: tree_spec_key.clone(),
                 widget_kind: "tree",
                 buffer_row: hit_row,
@@ -2942,6 +2959,7 @@ fn render_widget_tree(
         };
         if body_start < row_byte_end {
             out.hits.push(HitArea {
+                overlay: false,
                 widget_key: tree_spec_key.clone(),
                 widget_kind: "tree",
                 buffer_row: hit_row,
@@ -4465,6 +4483,7 @@ fn collect_dual_list(
         // cursor row.
         if left_val.is_some() {
             out.hits.push(HitArea {
+                overlay: false,
                 widget_key: widget_key.clone(),
                 widget_kind: "dual_list",
                 buffer_row: row,
@@ -4476,6 +4495,7 @@ fn collect_dual_list(
         }
         if right_val.is_some() {
             out.hits.push(HitArea {
+                overlay: false,
                 widget_key: widget_key.clone(),
                 widget_kind: "dual_list",
                 buffer_row: row,
@@ -4910,18 +4930,49 @@ fn render_tree_card(node: &TreeNode, item_height: u32, panel_width: u32) -> Rend
         // The pad is ASCII spaces (1 byte == 1 char each), so shifting
         // overlay offsets by the pad length is unit-correct for both
         // byte- and char-unit overlays.
-        let align_right = src
+        let align = src
             .properties
             .get("align")
             .and_then(|v| v.as_str())
-            .map(|v| v == "right")
-            .unwrap_or(false);
-        if align_right {
+            .unwrap_or("")
+            .to_string();
+        // `align: "between"` splits the row into a left group and a
+        // right one flush against the border — the card equivalent of
+        // the flex spacer a widget `Row` gets. The split point is a byte
+        // offset into the row's own text (`splitByte`), so the plugin
+        // says *where* the groups meet and the host, which alone knows
+        // the card's real width, decides how much space goes between
+        // them. Overflowing rows get a single separating space and fall
+        // through to the usual end-truncation.
+        let split = if align == "between" {
+            src.properties
+                .get("splitByte")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .filter(|&b| b <= src.text.len() && src.text.is_char_boundary(b))
+        } else {
+            None
+        };
+        // Where the padding goes: the row's start (right-aligned) or the
+        // group boundary (space-between).
+        let pad_at = match (align.as_str(), split) {
+            ("right", _) => Some(0),
+            ("between", Some(b)) => Some(b),
+            _ => None,
+        };
+        if let Some(at) = pad_at {
             let width = src.text.chars().count();
-            if width < inner_width {
-                let pad = " ".repeat(inner_width - width);
-                src.text.insert_str(0, &pad);
-                for o in src.inline_overlays.iter_mut() {
+            // A "between" row always keeps at least one space between
+            // the groups so they can't run together when the card is too
+            // narrow to hold both.
+            let pad_cols = inner_width.saturating_sub(width).max(usize::from(at > 0));
+            if pad_cols > 0 {
+                let pad = " ".repeat(pad_cols);
+                src.text.insert_str(at, &pad);
+                // The pad is ASCII spaces (1 byte == 1 char each), so
+                // shifting the overlays that sit after it is unit-correct
+                // for both byte- and char-unit overlays.
+                for o in src.inline_overlays.iter_mut().filter(|o| o.start >= at) {
                     o.start += pad.len();
                     o.end += pad.len();
                 }
@@ -7778,6 +7829,72 @@ mod tests {
         assert!(
             trimmed.ends_with("ab   "),
             "row should be padded after segment concat, got {trimmed:?}"
+        );
+    }
+
+    /// One `align: "between"` card row: `left` and `right` groups meet
+    /// at `splitByte`, rendered in a card `width` columns wide.
+    fn between_card_row(left: &str, right: &str, width: u32) -> String {
+        let mut node = tnode("name", 0, false);
+        let mut line = TextPropertyEntry::text(format!("{left}{right}"));
+        line.properties.insert(
+            "align".to_string(),
+            serde_json::Value::String("between".to_string()),
+        );
+        line.properties.insert(
+            "splitByte".to_string(),
+            serde_json::Value::Number((left.len() as u64).into()),
+        );
+        node.extra_lines = vec![line];
+        let spec = WidgetSpec::Tree {
+            nodes: vec![node],
+            item_keys: vec!["x".to_string()],
+            selected_index: -1,
+            visible_rows: 10,
+            expanded_keys: vec![],
+            checkable: false,
+            item_height: 2,
+            card_borders: true,
+            key: Some("T".to_string()),
+        };
+        let out = render_spec(&spec, &HashMap::new(), "", width);
+        // Top border, name row, the split row, bottom border.
+        out.entries[2].text.trim_end_matches('\n').to_string()
+    }
+
+    /// A card row (the orchestrator dock's workspace cards) can ask for
+    /// its right-hand group to sit flush against the card border while
+    /// the left group starts at the left one — `align: "between"` with
+    /// the group boundary as a byte offset. Only the host knows the
+    /// card's real width (the dock is resizable), so it owns the gap.
+    #[test]
+    fn tree_card_between_alignment_pushes_the_right_group_to_the_border() {
+        let row = between_card_row("branch", "PR #7", 30);
+        assert!(
+            row.starts_with("│branch") && row.ends_with("PR #7│"),
+            "left group hugs the left border and the right group the right one, got {row:?}"
+        );
+        // Padding only between them — not a plugin-side guess that
+        // leaves both groups floating mid-card.
+        let inner = row.trim_start_matches('│').trim_end_matches('│');
+        assert!(
+            inner["branch".len()..inner.len() - "PR #7".len()]
+                .chars()
+                .all(|c| c == ' '),
+            "the two groups are separated by padding only, got {inner:?}"
+        );
+    }
+
+    /// The groups still get a separating space when the card has no room
+    /// to spare — they must never run together into one unreadable word,
+    /// even at the exact width where they would just barely both fit.
+    #[test]
+    fn tree_card_between_alignment_keeps_a_gap_when_the_row_is_full() {
+        // Inner width 15 = exactly "abcdefghij" + "PR #7".
+        let row = between_card_row("abcdefghij", "PR #7", 17);
+        assert!(
+            !row.contains("ijPR"),
+            "a full row still separates the groups, got {row:?}"
         );
     }
 

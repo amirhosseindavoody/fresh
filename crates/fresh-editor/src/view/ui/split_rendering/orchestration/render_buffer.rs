@@ -9,7 +9,8 @@
 use super::super::folding::fold_adjusted_visible_count;
 use super::super::gutter::render_compose_margins;
 use super::super::layout::{
-    calculate_compose_layout, calculate_view_anchor, calculate_viewport_end, ComposeLayout,
+    calculate_compose_layout, calculate_view_anchor, calculate_viewport_end, visible_source_span,
+    ComposeLayout,
 };
 use super::super::post_pass::{
     apply_background_to_lines, render_column_guides, render_cursor_column_bg, render_ruler_bg,
@@ -24,6 +25,7 @@ use crate::model::cursor::Cursors;
 use crate::model::event::{BufferId, EventLog};
 use crate::primitives::ansi_background::AnsiBackground;
 use crate::state::{EditorState, ViewMode};
+use crate::view::bracket_highlight_overlay::BracketHighlightSettings;
 use crate::view::folding::FoldManager;
 use crate::view::theme::Theme;
 use crate::view::viewport::Viewport;
@@ -114,6 +116,7 @@ pub(crate) fn compute_buffer_layout(
     indentation_guide: IndentationGuideMode,
     indentation_guide_glyph: &str,
     rainbow_indentation: bool,
+    bracket_highlight: BracketHighlightSettings,
     cell_theme_map: Option<(&mut Vec<CellThemeInfo>, u16)>,
 ) -> BufferLayoutOutput {
     let _span = tracing::trace_span!("compute_buffer_layout").entered();
@@ -333,6 +336,25 @@ pub(crate) fn compute_buffer_layout(
         render_area.width as usize,
     );
 
+    // `calculate_viewport_end` walks *logical lines* from `top_byte` and
+    // clamps each to one screen row's worth of columns — the right model for
+    // horizontal scrolling, where a long line shows one row's window of
+    // itself. Under soft wrap neither half holds: the drawn rows can all
+    // belong to one logical line and can start `top_view_line_offset`
+    // segments into it, so the byte window to decorate is the one the rows
+    // themselves cover. Without this, scrolling into a long wrapped line
+    // leaves every row past the first few undecorated — no syntax colours,
+    // no overlays — because the request never moved off the line's start
+    // (issue #2843).
+    let (viewport_start, viewport_end) = if line_wrap {
+        let first_drawn = viewport.top_view_line_offset.min(view_data.lines.len());
+        let drawn = &view_data.lines[first_drawn..];
+        let drawn = &drawn[..drawn.len().min(adjusted_visible_count)];
+        visible_source_span(drawn).unwrap_or((viewport_start, viewport_end))
+    } else {
+        (viewport_start, viewport_end)
+    };
+
     let decorations = decoration_context(
         state,
         viewport_start,
@@ -343,6 +365,7 @@ pub(crate) fn compute_buffer_layout(
         highlight_context_bytes,
         &view_mode,
         diagnostics_inline_text,
+        bracket_highlight,
         &view_data.lines,
     );
 
@@ -659,6 +682,7 @@ pub(crate) fn render_buffer_in_split(
         indentation_guide,
         indentation_guide_glyph,
         rainbow_indentation,
+        bracket_highlight,
         ..
     } = cfg;
     let layout_output = compute_buffer_layout(
@@ -686,6 +710,7 @@ pub(crate) fn render_buffer_in_split(
         indentation_guide,
         indentation_guide_glyph,
         rainbow_indentation,
+        bracket_highlight,
         Some((cell_theme_map, screen_width)),
     );
 

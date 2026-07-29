@@ -14,8 +14,21 @@
 //!     file-explorer pane) is emitted as **semantic regions** (role + rect, with
 //!     thumb/orientation as needed) so the frontend draws real UI elements.
 //!
-//! Transport (single-threaded — the editor is not `Send`, everything stays on
-//! this one thread):
+//! Two hosts, one [`WebBridge`] (single-threaded either way — the editor is not
+//! `Send`, so everything stays on the thread that owns it):
+//!
+//!   - [`run`] builds its own editor and serves only browsers. This is the
+//!     `webui_server` example, the Playwright suite and the scene-parity
+//!     harness — and the only place `POST /reset` may rebuild the editor.
+//!   - `fresh --web` runs the **session daemon** (`crate::server::EditorServer`)
+//!     with the bridge hosted inside it, so browsers and `fresh -a` terminals
+//!     are two transports onto ONE editor: type in either and the other sees
+//!     it, close either and the session lives on. The daemon owns the tick and
+//!     the grid size (the element-wise min of the browsers' viewports and the
+//!     primary terminal's), and chrome suppression is scoped to the browser's
+//!     render — the terminals still get chrome drawn into their cells.
+//!
+//! Transport:
 //!
 //! **WebSocket push (`GET /ws`)** is the browser's live channel
 //! (docs/internal/web-ui.md §3.1). Hand-rolled RFC 6455, matching the
@@ -31,11 +44,25 @@
 //! "settings"|"kbedit"|"paste"|"resize"}` — each carrying the same fields as
 //! the HTTP POST bodies below.
 //!
-//! Session model: exactly ONE WebSocket client at a time. A second upgrade
-//! attempt while one is connected is answered with a plain HTTP
-//! `409 Conflict` before any upgrade (the editor is one single-threaded
-//! session; interleaving two browsers' input would be an accident, not a
-//! feature — multi-session is §3.7, PLANNED). The `Origin` header, when
+//! Session model: MANY WebSocket clients, ALL mirroring the one single-threaded
+//! editor (shared-view). Every `/ws` upgrade JOINS the client set — a second
+//! tab, another device, or the page you load after a server restart all connect
+//! and stay live; none is bounced (the old first-come-`409` model locked out
+//! the newcomer, so a stale/half-open background tab could hold the single slot
+//! until a server restart — the exact "can't load the page" failure this
+//! replaced). The scene is built once per tick and pushed to each client as its
+//! own region diff; input is accepted from all of them and applied to the one
+//! editor (for one user across tabs/devices the interleaving is the point;
+//! independent per-client cursors/viewports are the deeper §3.7 work, still
+//! PLANNED). Because there is one editor and one grid but clients have
+//! different window sizes, the render is fit to the element-wise MIN of every
+//! client's viewport (`effective_size`) so it fits all of them — bigger windows
+//! letterbox. A liveness heartbeat keeps this honest: the server pings every
+//! `WS_PING_INTERVAL` and reaps a client gone silent past `WS_LIVENESS_TIMEOUT`
+//! (browsers auto-pong, so a live-but-idle client stays), so a half-open peer —
+//! a tab killed without a clean close, a slept laptop — can't linger and, in
+//! particular, can't pin the shared grid to a dead small window's size. The
+//! `Origin` header, when
 //! present, must have the same host as the request's `Host` header (i.e. the
 //! request is same-origin) AND that host must be a loopback/LAN literal or our
 //! bind address, or the upgrade is rejected with `403 Forbidden`. The
@@ -86,8 +113,10 @@ use crate::config_io::DirectoryContext;
 use crate::model::filesystem::{FileSystem, StdFileSystem};
 
 /// Default terminal size the bridge boots / resets to (cols, rows). One source
-/// so `run()` and the `/reset` route can't drift apart.
-const DEFAULT_SIZE: (u16, u16) = (140, 44);
+/// so `run()`, the `/reset` route, and the daemon's pre-client grid (a browser
+/// may be the first thing to attach, before any terminal reports a size) can't
+/// drift apart.
+pub const DEFAULT_SIZE: (u16, u16) = (140, 44);
 
 /// The web-UI frontend served at `GET /`, embedded at compile time from the
 /// page assembled by `build.rs` out of the split sources under `web-ui/`
@@ -272,75 +301,184 @@ const SLEEP_IDLE: Duration = Duration::from_millis(25);
 /// How long a connection may take to finish sending its request head + body
 /// before we drop it (browsers open speculative sockets that never send).
 const HTTP_READ_DEADLINE: Duration = Duration::from_secs(10);
+/// WebSocket liveness heartbeat. We ping the client every `WS_PING_INTERVAL`;
+/// a live browser auto-pongs (any inbound frame refreshes the session's
+/// last-heard-from clock), so a client that goes silent past
+/// `WS_LIVENESS_TIMEOUT` (a few missed pings) is a half-open peer — a tab
+/// killed without a clean close, a slept laptop, a dropped network — and is
+/// reaped. Without this a dead connection is invisible (no clean FIN ever
+/// arrives): it would linger in the client set forever and, worse, keep
+/// constraining the shared grid to its (now dead) window's size via
+/// `effective_size`, shrinking every live client until a server restart.
+const WS_PING_INTERVAL: Duration = Duration::from_secs(15);
+const WS_LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
 /// Cap on a buffered HTTP request (head + body). Pastes are the biggest
 /// legitimate payload; anything larger is a runaway client.
 const HTTP_REQUEST_CAP: usize = 8 << 20;
 
-pub fn run(addr: &str, files: &[PathBuf]) -> Result<()> {
-    let (mut cols, mut rows) = DEFAULT_SIZE;
-    let mut editor = build_editor(cols, rows, files)?;
-    let mut clip = ClipboardSync::new(&editor);
+/// What one [`WebBridge::poll`] pass did, so the host loop knows what the
+/// shared editor needs before it renders.
+#[derive(Default)]
+pub struct BridgePoll {
+    /// Browser input (a WebSocket message or an HTTP route) reached the editor,
+    /// so the host should render and push this pass instead of waiting for a
+    /// tick deadline.
+    pub mutated: bool,
+    /// A client joined, left, or reported a new viewport, so the host should
+    /// refit the shared grid — see [`WebBridge::wanted_size`].
+    pub resize_dirty: bool,
+}
 
-    // Bind the in-process control socket so a `fresh` run inside an embedded
-    // terminal can forward opens *and* drive the command channel
-    // (`ListCommands` / `RunCommand`) back to this editor — same as the TUI
-    // path (main.rs). Web mode previously skipped this, so an agent workspace
-    // got a `FRESH_CMD_TOKEN` with no socket to reach. Best-effort: on failure
-    // the editor still runs, nested launches just open inline.
-    if let Err(e) = crate::server::local_control::start() {
-        eprintln!("[webui] local control socket unavailable: {e}");
+/// The browser-facing half of the web UI, decoupled from *who owns the editor*.
+///
+/// Two hosts drive this same struct, so the transports cannot drift:
+///
+///   - [`run`] — the standalone bridge (the `webui_server` example and the
+///     Playwright / scene-parity harnesses). It builds and owns the editor it
+///     serves; nothing else is watching.
+///   - [`crate::server::EditorServer`] — the session daemon, which owns the
+///     editor *and* the IPC socket. Hosting the bridge there is what makes
+///     `fresh --web` a real session: the browser and any number of `fresh -a`
+///     terminals attach to ONE editor, and either can be closed and reopened
+///     without losing it (docs/internal/web-ui.md §3.7).
+///
+/// The host owns the editor's tick and picks the grid size; the bridge only
+/// reports the size its browsers want ([`wanted_size`](Self::wanted_size)),
+/// which the daemon mins against its attached terminals.
+pub struct WebBridge {
+    listener: TcpListener,
+    /// Host part of the bind address — only the fallback for the WS-upgrade
+    /// Origin check when a request carries no Host header (the check prefers
+    /// the request's Host header; see `origin_host_matches`).
+    bind_host: String,
+    /// In-flight HTTP requests whose head/body hasn't fully arrived yet (reads
+    /// are nonblocking so a slow client can never stall the host's loop).
+    pending: Vec<PendingConn>,
+    /// Every connected WebSocket client. All mirror the SAME editor
+    /// (shared-view, see the module docs): input is accepted from all, the
+    /// scene is built once per tick and pushed to each, and the rendered grid
+    /// is fit to the smallest viewport so it fits every window (bigger windows
+    /// letterbox). Each client keeps its own diff cache.
+    ws: Vec<WsSession>,
+    clip: ClipboardSync,
+    /// Files the `/reset` parity route re-opens in the rebuilt editor.
+    files: Vec<PathBuf>,
+    /// Whether `POST /reset` may replace the editor wholesale. True only for
+    /// the standalone bridge, which owns its editor. Under the daemon the
+    /// editor carries session state — the recovery session, the restored
+    /// workspace, attached terminals — that a silent replacement would drop on
+    /// the floor, so the route is refused there instead.
+    allow_reset: bool,
+}
+
+impl WebBridge {
+    /// Bind the HTTP/WebSocket listener. `editor` seeds the outbound clipboard
+    /// mirror so the first scene doesn't replay pre-existing content into the
+    /// browser's clipboard; `files` / `allow_reset` configure the `/reset`
+    /// parity route (see [`WebBridge`]).
+    pub fn bind(addr: &str, editor: &Editor, files: &[PathBuf], allow_reset: bool) -> Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        let bind_host = addr
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(addr)
+            .to_string();
+        Ok(Self {
+            listener,
+            bind_host,
+            pending: Vec::new(),
+            ws: Vec::new(),
+            clip: ClipboardSync::new(editor),
+            files: files.to_vec(),
+            allow_reset,
+        })
     }
 
-    let listener = TcpListener::bind(addr)?;
-    listener.set_nonblocking(true)?;
-    // Host part of the bind address — only the fallback for the WS-upgrade
-    // Origin check when a request carries no Host header (the check prefers
-    // the request's Host header; see `origin_host_matches`).
-    let bind_host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
-    eprintln!(
-        "fresh web bridge on http://{addr}  (real render pipeline, no mocks; WS push on /ws)"
-    );
+    /// True while a browser is connected or a request is mid-assembly. The
+    /// host paces its loop by this — and the daemon also keeps its idle
+    /// timeout from reaping a session someone is using from a browser.
+    pub fn is_busy(&self) -> bool {
+        !self.ws.is_empty() || !self.pending.is_empty()
+    }
 
-    // In-flight HTTP requests whose head/body hasn't fully arrived yet (reads
-    // are nonblocking so a slow client can never stall the editor loop).
-    let mut pending: Vec<PendingConn> = Vec::new();
-    // THE WebSocket client (single-client model — see module docs).
-    let mut ws: Option<WsSession> = None;
-    let mut next_tick = Instant::now();
+    /// How many browsers are connected.
+    pub fn client_count(&self) -> usize {
+        self.ws.len()
+    }
 
-    loop {
-        // 0) Drain nested-forward command requests (file/dir opens, and the
-        //    `fresh --cmd` command channel) before anything else, exactly like
-        //    the TUI loop (main.rs). `pump` is a cheap no-op until `start()`
-        //    has bound the socket and never blocks. Its result is folded into
-        //    `had_input` below so the queued work is applied and pushed in this
-        //    same iteration rather than waiting for the idle tick.
-        let control_changed = crate::server::local_control::pump(&mut editor);
+    /// Re-seed the clipboard mirror against a freshly built editor — the daemon
+    /// rebuilds in place on an authority / working-directory change. Without
+    /// this the next scene would bump `seq` for a clipboard nobody touched and
+    /// the browser would paste stale text into its system clipboard.
+    pub fn rebound_editor(&mut self, editor: &Editor) {
+        self.clip = ClipboardSync::new(editor);
+    }
 
-        // 1) Drain the WS input batch FIRST (this also detects a client that
-        //    closed, e.g. a browser reload, so its replacement upgrade in
-        //    step 2/3 isn't bounced with a 409). Read/parse errors drop the
-        //    client; the editor and the loop live on, a reconnect gets a
-        //    fresh hello.
+    /// The grid size that fits every connected browser: the element-wise MIN of
+    /// their wanted (cols, rows), so each can see the whole grid (bigger
+    /// windows letterbox). Clients that haven't reported a size yet
+    /// (`want == None`) don't constrain it. `None` when none has reported — the
+    /// caller then leaves the current size untouched (nothing to fit to).
+    pub fn wanted_size(&self) -> Option<(u16, u16)> {
+        let mut acc: Option<(u16, u16)> = None;
+        for c in &self.ws {
+            if let Some((wc, wr)) = c.want {
+                acc = Some(match acc {
+                    Some((ac, ar)) => (ac.min(wc), ar.min(wr)),
+                    None => (wc, wr),
+                });
+            }
+        }
+        acc
+    }
+
+    /// Accept, read and apply everything the browsers sent this pass.
+    ///
+    /// Order matters and matches what the standalone loop always did: drain
+    /// input from every existing client FIRST (which also detects clients that
+    /// closed, e.g. a browser reload), then accept new connections, then serve
+    /// the requests that completed, then apply the whole input batch in order.
+    /// So a reload's disconnect and its reconnect land in the same pass.
+    pub fn poll(&mut self, editor: &mut Editor, cols: &mut u16, rows: &mut u16) -> BridgePoll {
+        let mut out = BridgePoll::default();
+
+        // 1) Drain input from every client. `resize` messages update only the
+        //    sending client's own wanted grid size (the effective size is the
+        //    min across clients, refit by the host) and are NOT applied to the
+        //    editor directly — every other message joins one shared input batch
+        //    applied to the single editor. Read/parse errors drop just that
+        //    client; the editor and the loop live on, and its reconnect gets a
+        //    fresh hello. A dropped client may have been the size constraint,
+        //    so flag a refit.
         let mut inputs: Vec<Value> = Vec::new();
-        if let Some(client) = ws.as_mut() {
-            match client.drain_messages() {
+        let mut i = 0;
+        while i < self.ws.len() {
+            match self.ws[i].drain_messages() {
                 Ok(msgs) => {
-                    inputs = msgs
-                        .iter()
-                        .map(|m| serde_json::from_str(m).unwrap_or_else(|_| json!({})))
-                        .collect()
+                    for m in &msgs {
+                        let v: Value = serde_json::from_str(m).unwrap_or_else(|_| json!({}));
+                        if v.get("type").and_then(|t| t.as_str()) == Some("resize") {
+                            if self.ws[i].note_resize(&v) {
+                                out.resize_dirty = true;
+                            }
+                        } else {
+                            inputs.push(v);
+                        }
+                    }
+                    i += 1;
                 }
                 Err(e) => {
                     eprintln!("[webui] ws client disconnected: {e}");
-                    ws = None;
+                    self.ws.remove(i);
+                    out.resize_dirty = true;
                 }
             }
         }
 
         // 2) Accept new connections into the pending pool (nonblocking).
         loop {
-            match listener.accept() {
+            match self.listener.accept() {
                 Ok((stream, _)) => {
                     // The pump relies on nonblocking reads; a socket we can't
                     // configure is dropped rather than risked stalling the
@@ -349,7 +487,7 @@ pub fn run(addr: &str, files: &[PathBuf]) -> Result<()> {
                     if stream.set_nonblocking(true).is_err() || stream.set_nodelay(true).is_err() {
                         continue;
                     }
-                    pending.push(PendingConn {
+                    self.pending.push(PendingConn {
                         stream,
                         buf: Vec::new(),
                         since: Instant::now(),
@@ -363,108 +501,214 @@ pub fn run(addr: &str, files: &[PathBuf]) -> Result<()> {
             }
         }
 
-        // 3) Pump pending connections; serve the complete ones. A `/ws`
-        //    upgrade becomes THE client (or gets 409/403); anything else runs
-        //    through the HTTP routes, blocking only for its short localhost
-        //    response write. An HTTP route that mutated the editor (input
-        //    routes, /step, /reset) counts as input so the connected WS client
-        //    gets the resulting diff pushed this pass.
-        let mut http_mutated = false;
+        // 3) Pump pending connections; serve the complete ones. A `/ws` upgrade
+        //    JOINS the client set (or gets 403); anything else runs through the
+        //    HTTP routes, blocking only for its short localhost response write.
+        //    An HTTP route that mutated the editor (input routes, /step,
+        //    /reset) counts as input so connected clients get the resulting
+        //    diff pushed this pass.
         let mut i = 0;
-        while i < pending.len() {
-            match pump_pending(&mut pending[i]) {
-                Pump::NeedMore if pending[i].since.elapsed() <= HTTP_READ_DEADLINE => i += 1,
+        while i < self.pending.len() {
+            match pump_pending(&mut self.pending[i]) {
+                Pump::NeedMore if self.pending[i].since.elapsed() <= HTTP_READ_DEADLINE => i += 1,
                 Pump::NeedMore | Pump::Closed => {
-                    pending.remove(i);
+                    self.pending.remove(i);
                 }
                 Pump::Ready(req) => {
-                    let conn = pending.remove(i);
+                    let conn = self.pending.remove(i);
                     match serve_request(
                         conn.stream,
                         &req,
-                        &mut editor,
-                        &mut cols,
-                        &mut rows,
-                        files,
-                        &mut clip,
-                        ws.is_some(),
-                        bind_host,
+                        editor,
+                        cols,
+                        rows,
+                        &self.files,
+                        &mut self.clip,
+                        &self.bind_host,
+                        self.allow_reset,
                     ) {
-                        Ok(Served::WsClient(session)) => ws = Some(session),
-                        Ok(Served::Http { mutated }) => http_mutated |= mutated,
+                        Ok(Served::WsClient(mut session)) => {
+                            // A new client mirrors the same editor. Seed its
+                            // wanted size from the current effective grid so it
+                            // doesn't momentarily shrink everyone to the default
+                            // before its own `resize` lands; its real viewport
+                            // arrives in the hello handler's resize a tick later.
+                            session.want = Some((*cols, *rows));
+                            self.ws.push(session);
+                        }
+                        Ok(Served::Http { mutated }) => out.mutated |= mutated,
                         Err(e) => eprintln!("conn error: {e}"),
                     }
                 }
             }
         }
 
-        // 4) Apply the whole input batch in order via the same dispatch the
-        //    HTTP routes use — but do NOT render per message.
-        let mut applied_input = false;
+        // 4) Apply the whole (non-resize) input batch in order via the same
+        //    dispatch the HTTP routes use — but do NOT render per message.
+        //    Input from several mirrored clients interleaves here; for one user
+        //    across tabs/devices that's the point, and the editor applies each
+        //    message atomically regardless of origin.
         for v in &inputs {
             let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if apply_message(&mut editor, kind, v, &mut cols, &mut rows) {
-                applied_input = true;
+            if apply_message(editor, kind, v, cols, rows) {
+                out.mutated = true;
             } else {
                 eprintln!("[webui] ignoring unknown ws message type {kind:?}");
             }
         }
 
-        // 5) One tick per loop pass at most: immediately after input, else on
+        out
+    }
+
+    /// Build the scene ONCE and push each client its own region diff.
+    ///
+    /// Does NOT tick — the host owns that (the standalone loop ticks just
+    /// before calling this; the daemon drains async work in its own loop).
+    /// Each client's diff is against ITS OWN last-sent cache (they connected at
+    /// different times), so one shared scene still yields correct per-client
+    /// frames. A client whose push fails is dropped.
+    pub fn push_scene(&mut self, editor: &mut Editor, cols: u16, rows: u16) {
+        if self.ws.is_empty() {
+            return;
+        }
+        let scene = build_scene(editor, cols, rows, &mut self.clip);
+        let mut i = 0;
+        while i < self.ws.len() {
+            if let Err(e) = self.ws[i].push_diff(&scene) {
+                eprintln!("[webui] ws push failed, dropping client: {e}");
+                self.ws.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Heartbeat + drain buffered outbound bytes for EACH client — a periodic
+    /// ping (and the liveness check that reaps a silent half-open peer, so a
+    /// dead small window can't pin everyone's grid to its size), leftover frame
+    /// bytes for a slow-but-alive peer, and pongs queued while draining input.
+    /// `flush` is nonblocking; a peer whose backlog blows past the cap is
+    /// dropped here rather than allowed to stall the loop.
+    ///
+    /// Returns true when the client set shrank — reaping a client can free the
+    /// size constraint, so the host should refit.
+    pub fn maintain(&mut self) -> bool {
+        let before = self.ws.len();
+        let mut i = 0;
+        while i < self.ws.len() {
+            if let Err(e) = self.ws[i].heartbeat().and_then(|()| self.ws[i].flush()) {
+                eprintln!("[webui] ws dropped: {e}");
+                self.ws.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        self.ws.len() != before
+    }
+}
+
+/// Run the standalone bridge: build an editor, serve it to browsers, forever.
+///
+/// This is the editor-owning host (the `webui_server` example, the Playwright
+/// and scene-parity harnesses). `fresh --web` does NOT come here — it runs the
+/// session daemon, which hosts the same [`WebBridge`] alongside the IPC socket
+/// so TUI clients can attach to the very same editor.
+pub fn run(addr: &str, files: &[PathBuf]) -> Result<()> {
+    let (mut cols, mut rows) = DEFAULT_SIZE;
+    let mut editor = build_editor(cols, rows, files)?;
+
+    // Bind the in-process control socket so a `fresh` run inside an embedded
+    // terminal can forward opens *and* drive the command channel
+    // (`ListCommands` / `RunCommand`) back to this editor — same as the TUI
+    // path (main.rs). Web mode previously skipped this, so an agent workspace
+    // got a `FRESH_CMD_TOKEN` with no socket to reach. Best-effort: on failure
+    // the editor still runs, nested launches just open inline.
+    if let Err(e) = crate::server::local_control::start() {
+        eprintln!("[webui] local control socket unavailable: {e}");
+    }
+
+    let mut bridge = WebBridge::bind(addr, &editor, files, true)?;
+    eprintln!(
+        "fresh web bridge on http://{addr}  (real render pipeline, no mocks; WS push on /ws)"
+    );
+
+    let mut next_tick = Instant::now();
+
+    loop {
+        // 0) Drain nested-forward command requests (file/dir opens, and the
+        //    `fresh --cmd` command channel) before anything else, exactly like
+        //    the TUI loop (main.rs). `pump` is a cheap no-op until `start()`
+        //    has bound the socket and never blocks. Its result is folded into
+        //    `had_input` below so the queued work is applied and pushed in this
+        //    same iteration rather than waiting for the idle tick.
+        let control_changed = crate::server::local_control::pump(&mut editor);
+
+        // 1) Everything the browsers sent: input, joins, HTTP routes.
+        let poll = bridge.poll(&mut editor, &mut cols, &mut rows);
+
+        // 2) Refit the shared grid to the smallest viewport whenever a client
+        //    resized, joined, or left. Resizing the editor counts as input so
+        //    the new fit is pushed to everyone this pass.
+        let mut resized_editor = false;
+        if poll.resize_dirty {
+            resized_editor = refit(&mut editor, &bridge, &mut cols, &mut rows);
+        }
+
+        // 3) One tick per loop pass at most: immediately after input, else on
         //    the tick deadline. The editor keeps ticking at the idle cadence
         //    even with no client connected (async LSP/plugin/file events must
-        //    not stall); without a client we skip the scene build entirely —
-        //    the diff cache belongs to the connected session, and a reconnect
+        //    not stall); with no clients we skip the scene build entirely —
+        //    the diff caches belong to the connected sessions, and a reconnect
         //    starts over with a fresh hello anyway.
         let now = Instant::now();
         // `control_changed` (a `fresh --cmd` request applied above) forces the
         // tick + scene push this iteration so command effects show immediately.
-        let had_input = applied_input || http_mutated || control_changed;
+        let had_input = poll.mutated || control_changed || resized_editor;
         if had_input || now >= next_tick {
             let needs_render = tick_only(&mut editor);
             let active_hint = poll_active(&editor);
-            if let Some(client) = ws.as_mut() {
-                // Build + diff + push — but only when something can have
-                // changed: input was applied (over WS or an HTTP route), the
-                // tick reported needs-render (the TUI's own redraw signal),
-                // or time-driven UI is in flight (animations / LSP spinner —
-                // `poll_active`, refreshed on the fast cadence below). An
-                // unchanged scene would diff to nothing anyway; this just
-                // avoids paying the render to find that out, keeping a
-                // connected-but-idle session near zero CPU.
-                if had_input || needs_render || active_hint {
-                    let scene = build_scene(&mut editor, cols, rows, &mut clip);
-                    if let Err(e) = client.push_diff(&scene) {
-                        eprintln!("[webui] ws push failed, dropping client: {e}");
-                        ws = None;
-                    }
-                }
+            // Push only when something can have changed: input was applied
+            // (over WS or an HTTP route), the tick reported needs-render (the
+            // TUI's own redraw signal), or time-driven UI is in flight
+            // (animations / LSP spinner — `poll_active`, refreshed on the fast
+            // cadence below). An unchanged scene diffs to nothing anyway;
+            // skipping the build keeps connected-but-idle sessions near 0% CPU.
+            if had_input || needs_render || active_hint {
+                bridge.push_scene(&mut editor, cols, rows);
             }
             let interval = if active_hint { TICK_ACTIVE } else { TICK_IDLE };
             next_tick = Instant::now() + interval;
         }
 
-        // 5b) Drain any buffered outbound bytes the socket couldn't take yet —
-        //     leftover frame bytes for a slow-but-alive peer, and pongs queued
-        //     while draining input. `flush` is nonblocking; a peer whose
-        //     backlog blows past the cap is dropped here rather than allowed to
-        //     stall the loop (the old per-write 5s spin is gone).
-        if let Some(client) = ws.as_mut() {
-            if let Err(e) = client.flush() {
-                eprintln!("[webui] ws flush failed, dropping client: {e}");
-                ws = None;
-            }
+        // 4) Heartbeat / flush; a reap here shrank the constraint set, so refit.
+        if bridge.maintain() {
+            refit(&mut editor, &bridge, &mut cols, &mut rows);
         }
 
-        // 6) Pace the loop without a busy spin. Stay snappy while a WS client
+        // 5) Pace the loop without a busy spin. Stay snappy while any WS client
         //    is connected (input latency) or an HTTP request is mid-assembly
         //    (its bytes usually land one iteration after the accept); idle
         //    slowly otherwise — CPU stays near zero either way.
-        std::thread::sleep(if ws.is_some() || !pending.is_empty() {
+        std::thread::sleep(if bridge.is_busy() {
             SLEEP_CONNECTED
         } else {
             SLEEP_IDLE
         });
+    }
+}
+
+/// Fit the standalone editor to the smallest connected viewport. Returns
+/// whether the size actually moved. (The daemon has its own refit — it must
+/// also fit the attached terminals, not just the browsers.)
+fn refit(editor: &mut Editor, bridge: &WebBridge, cols: &mut u16, rows: &mut u16) -> bool {
+    match bridge.wanted_size() {
+        Some((ec, er)) if (ec, er) != (*cols, *rows) => {
+            *cols = ec;
+            *rows = er;
+            editor.resize(*cols, *rows);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -579,7 +823,7 @@ enum Served {
     Http { mutated: bool },
 }
 
-/// Serve one complete request: WS upgrades become THE client; everything else
+/// Serve one complete request: a WS upgrade joins the client set; everything else
 /// goes through the HTTP routes with `Connection: close`. State-mutating POSTs
 /// are gated by the same-origin/Host guard so a foreign page can't drive the
 /// editor over HTTP (see below).
@@ -592,8 +836,8 @@ fn serve_request(
     rows: &mut u16,
     files: &[PathBuf],
     clip: &mut ClipboardSync,
-    ws_busy: bool,
     bind_host: &str,
+    allow_reset: bool,
 ) -> Result<Served> {
     // Serve the response blocking for simplicity — but bound the write. `GET /`
     // returns the whole embedded page (~200 KB), so a client that stops reading
@@ -610,7 +854,7 @@ fn serve_request(
             .header("upgrade")
             .is_some_and(|u| u.to_ascii_lowercase().contains("websocket"));
     if wants_ws {
-        return match upgrade_ws(stream, req, editor, *cols, *rows, clip, ws_busy, bind_host)? {
+        return match upgrade_ws(stream, req, editor, *cols, *rows, clip, bind_host)? {
             Some(session) => Ok(Served::WsClient(session)),
             None => Ok(Served::Http { mutated: false }),
         };
@@ -636,7 +880,16 @@ fn serve_request(
             }
         }
     }
-    let mutated = handle_http(&mut stream, req, editor, cols, rows, files, clip)?;
+    let mutated = handle_http(
+        &mut stream,
+        req,
+        editor,
+        cols,
+        rows,
+        files,
+        clip,
+        allow_reset,
+    )?;
     Ok(Served::Http { mutated })
 }
 
@@ -654,6 +907,7 @@ fn handle_http(
     rows: &mut u16,
     files: &[PathBuf],
     clip: &mut ClipboardSync,
+    allow_reset: bool,
 ) -> Result<bool> {
     let body_json = || serde_json::from_slice::<Value>(&req.body).unwrap_or_else(|_| json!({}));
     match (req.method.as_str(), req.path.as_str()) {
@@ -699,6 +953,18 @@ fn handle_http(
             let s = scene_json(editor, *cols, *rows).to_string();
             respond(stream, "200 OK", "application/json", s.as_bytes())?;
             Ok(true)
+        }
+        // Refused when the editor isn't ours to throw away: under the session
+        // daemon it carries the recovery session, the restored workspace, and
+        // any attached TUI clients, none of which survive a silent rebuild.
+        ("POST", "/reset") if !allow_reset => {
+            respond(
+                stream,
+                "409 Conflict",
+                "text/plain",
+                b"/reset is unavailable in a shared session",
+            )?;
+            Ok(false)
         }
         ("POST", "/reset") => {
             (*cols, *rows) = DEFAULT_SIZE;
@@ -962,9 +1228,11 @@ fn origin_host_matches(origin: &str, host_header: Option<&str>, bind_host: &str)
     host_is_allowed(target, bind) && host_only(origin).eq_ignore_ascii_case(target)
 }
 
-/// Handle a `/ws` upgrade request: enforce the single-client model (409) and
-/// the Origin policy (403), then handshake (101), switch the socket to
-/// nonblocking, and send the full-scene hello.
+/// Handle a `/ws` upgrade request: enforce the Origin policy (403), then
+/// handshake (101), switch the socket to nonblocking, and send the full-scene
+/// hello. The returned session is added to the mirrored client set by the
+/// CALLER (`run`); the upgrade itself never rejects a well-formed same-origin
+/// request — every client joins (shared-view mirroring, see the module docs).
 #[allow(clippy::too_many_arguments)]
 fn upgrade_ws(
     mut stream: TcpStream,
@@ -973,19 +1241,8 @@ fn upgrade_ws(
     cols: u16,
     rows: u16,
     clip: &mut ClipboardSync,
-    ws_busy: bool,
     bind_host: &str,
 ) -> Result<Option<WsSession>> {
-    if ws_busy {
-        respond(
-            &mut stream,
-            "409 Conflict",
-            "text/plain",
-            b"editor session busy: this bridge hosts ONE single-threaded editor session and one \
-              WebSocket client at a time; close the other client first",
-        )?;
-        return Ok(None);
-    }
     if let Some(origin) = req.header("origin") {
         if !origin_host_matches(origin, req.header("host"), bind_host) {
             respond(
@@ -1137,6 +1394,18 @@ struct WsSession {
     top: HashMap<&'static str, u64>,
     regions: HashMap<String, u64>,
     panes: Vec<u64>,
+    /// Liveness clock: the last time ANY inbound bytes arrived (input, a pong,
+    /// a ping — all count). Refreshed in `drain_messages`; read by `heartbeat`
+    /// to reap a peer that has gone silent past `WS_LIVENESS_TIMEOUT`.
+    last_recv: Instant,
+    /// When we last sent a heartbeat ping — throttles them to `WS_PING_INTERVAL`.
+    last_ping: Instant,
+    /// This client's wanted grid size (cols, rows), from its `resize` messages.
+    /// The bridge fits the editor to the element-wise MIN across all clients so
+    /// the render fits every viewport (`effective_size`); `None` until the
+    /// client first reports (seeded to the current effective size on join so it
+    /// doesn't transiently shrink the grid before its real viewport arrives).
+    want: Option<(u16, u16)>,
 }
 
 /// Fingerprint a JSON value for change detection by streaming its serialization
@@ -1180,7 +1449,56 @@ impl WsSession {
             top: HashMap::new(),
             regions: HashMap::new(),
             panes: Vec::new(),
+            last_recv: Instant::now(),
+            last_ping: Instant::now(),
+            want: None,
         }
+    }
+
+    /// Record this client's wanted grid size from a `resize` message, applying
+    /// the same clamps as the HTTP `/resize` route (`apply_resize`). Returns
+    /// true if the wanted size changed — the caller then recomputes the
+    /// effective (min-across-clients) size and resizes the shared editor.
+    fn note_resize(&mut self, v: &Value) -> bool {
+        let c = v
+            .get("cols")
+            .and_then(|x| x.as_u64())
+            .map(|c| (c as u16).clamp(20, 400));
+        let r = v
+            .get("rows")
+            .and_then(|x| x.as_u64())
+            .map(|r| (r as u16).clamp(8, 200));
+        // Keep whichever dimension the message carried; a resize always sends
+        // both, but tolerate a partial one by falling back to the last value.
+        let cur = self.want.unwrap_or(DEFAULT_SIZE);
+        let next = (c.unwrap_or(cur.0), r.unwrap_or(cur.1));
+        if self.want != Some(next) {
+            self.want = Some(next);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Heartbeat, called once per loop pass. Reap the peer if it has gone
+    /// silent past the liveness deadline (a half-open connection never sends a
+    /// clean close, so this is the only thing that frees its slot), and
+    /// otherwise ping on the interval so a live-but-idle browser keeps
+    /// auto-ponging and stays counted as alive. The ping is enqueued, not
+    /// written — the caller's `flush` sends it, so this never blocks.
+    fn heartbeat(&mut self) -> std::io::Result<()> {
+        let now = Instant::now();
+        if now.duration_since(self.last_recv) > WS_LIVENESS_TIMEOUT {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "ws peer silent past liveness deadline (half-open); reaping",
+            ));
+        }
+        if now.duration_since(self.last_ping) >= WS_PING_INTERVAL {
+            self.last_ping = now;
+            self.enqueue(0x9, b""); // ping (empty payload)
+        }
+        Ok(())
     }
 
     /// `{"type":"hello","seq":0,"scene":<full scene>}` — sent once per
@@ -1301,6 +1619,9 @@ impl WsSession {
             match self.stream.read(&mut tmp) {
                 Ok(0) => return Err(std::io::Error::from(ErrorKind::ConnectionAborted)),
                 Ok(n) => {
+                    // Any inbound bytes — input, a pong, a ping — prove the peer
+                    // is alive; refresh the liveness clock `heartbeat` reads.
+                    self.last_recv = Instant::now();
                     self.inbuf.extend_from_slice(&tmp[..n]);
                     if self.inbuf.len() > WS_PAYLOAD_CAP * 2 {
                         return Err(std::io::Error::from(ErrorKind::InvalidData));
@@ -1398,6 +1719,54 @@ fn rect_json(r: Rect) -> Value {
 }
 
 /// Slice the rendered cells inside `r` into rows of styled runs.
+/// Plugin scrollbar markers for one pane, as `[{row, color}]`.
+///
+/// Reads the projection the render pass just cached for this track height
+/// (see [`ScrollbarMarkerBuckets::latest_for_height`]) rather than
+/// re-projecting, so the web scrollbar shows exactly the rows the terminal
+/// painted. Theme keys are resolved to concrete hex here — the frontend has
+/// no theme-key resolver.
+fn scrollbar_markers_json(
+    editor: &Editor,
+    buffer_id: crate::model::event::BufferId,
+    scrollbar_rect: Rect,
+) -> Value {
+    let Some(state) = editor.active_window().buffer_state(buffer_id) else {
+        return json!([]);
+    };
+    let Some(cells) = state
+        .scrollbar_marker_buckets
+        .latest_for_height(scrollbar_rect.height as usize)
+    else {
+        return json!([]);
+    };
+
+    let theme = editor.theme.read().unwrap();
+    let out: Vec<Value> = cells
+        .iter()
+        .enumerate()
+        .filter_map(|(row, cell)| {
+            let cell = cell.as_ref()?;
+            let color = match &cell.color {
+                fresh_core::api::OverlayColorSpec::Rgb(r, g, b) => (*r, *g, *b),
+                fresh_core::api::OverlayColorSpec::ThemeKey(key) => {
+                    let resolved = crate::view::theme::named_color_from_str(key)
+                        .or_else(|| theme.resolve_theme_key(key))?;
+                    match resolved {
+                        ratatui::style::Color::Rgb(r, g, b) => (r, g, b),
+                        _ => return None,
+                    }
+                }
+            };
+            Some(json!({
+                "row": row,
+                "color": format!("#{:02x}{:02x}{:02x}", color.0, color.1, color.2),
+            }))
+        })
+        .collect();
+    json!(out)
+}
+
 fn cells_json(buf: &Buffer, r: Rect) -> Value {
     let mut rows = Vec::with_capacity(r.height as usize);
     for y in r.y..r.y.saturating_add(r.height) {
@@ -1489,8 +1858,24 @@ fn tick_scene(editor: &mut Editor, cols: u16, rows: u16, clip: &mut ClipboardSyn
     build_scene(editor, cols, rows, clip)
 }
 
+/// Run one render with chrome kept out of the cells.
+///
+/// The browser draws chrome (menu bar, tabs, status bar, scrollbars, explorer)
+/// as native HTML from the semantic model, so the pane cells must carry buffer
+/// interiors only. `build_editor` sets the flag permanently for the standalone
+/// bridge, but the daemon shares its editor with TUI clients that *do* want
+/// chrome drawn into the cells — so scope it to the scene's render and put the
+/// host's value back, instead of leaving a mode flag flipped under them.
+fn with_chrome_suppressed<T>(editor: &mut Editor, f: impl FnOnce(&mut Editor) -> T) -> T {
+    let prev = editor.suppress_chrome_cells;
+    editor.suppress_chrome_cells = true;
+    let out = f(editor);
+    editor.suppress_chrome_cells = prev;
+    out
+}
+
 fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
-    let (buf, cursor) = render_to_buffer(editor, cols, rows);
+    let (buf, cursor) = with_chrome_suppressed(editor, |e| render_to_buffer(e, cols, rows));
     let w = buf.area.width;
     let h = buf.area.height;
 
@@ -1556,6 +1941,12 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
                     "vscroll": rect_json(*scrollbar_rect),
                     "thumbStart": thumb_s,
                     "thumbEnd": thumb_e,
+                    // Plugin scrollbar markers. The web frontend draws its own
+                    // scrollbar from `vscroll`/`thumb*` rather than reading the
+                    // painted cells, so markers must travel as data too.
+                    // Colours are resolved here — the frontend has no theme-key
+                    // resolver.
+                    "vscrollMarkers": scrollbar_markers_json(editor, *bufid, *scrollbar_rect),
                 })
             },
         )
@@ -1595,20 +1986,15 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
             }
         }
     }
-    // The OpenFile / SaveFileAs / SwitchProject browser is painted as a cell
-    // overlay above the prompt row (FileBrowserRenderer). Its band can span
-    // chrome the frontend renders natively — with the file explorer open, the
-    // name column lands in explorer cells that pane slices never carry — so
-    // ship the whole popup band as cells; the frontend draws it as one block
-    // (clicks route through the pixel→cell path into the existing
-    // file-browser hit-test).
-    if let Some(fb) = editor.active_window().file_browser_layout.as_ref() {
-        let r = fb.popup_area;
-        if r.width > 0 && r.height > 0 {
-            if let Some(obj) = palette.as_object_mut() {
-                obj.insert("browserRect".to_string(), rect_json(r));
-                obj.insert("browserCells".to_string(), cells_json(&buf, r));
-            }
+    // Semantic file browser for the OpenFile / SaveFileAs / SwitchProject
+    // prompts (`Editor::file_browser_view`), attached to the palette because
+    // it belongs to the active prompt. It used to ship as a slab of cells —
+    // the one chrome surface that did — which is why it looked like a
+    // terminal screenshot pasted into the page.
+    let file_browser = serde_json::to_value(editor.file_browser_view()).unwrap_or(Value::Null);
+    if !file_browser.is_null() {
+        if let Some(obj) = palette.as_object_mut() {
+            obj.insert("browser".to_string(), file_browser);
         }
     }
     let trust_dialog = serde_json::to_value(editor.trust_dialog_view()).unwrap_or(Value::Null);

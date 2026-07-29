@@ -10,6 +10,7 @@ pub mod basic;
 pub mod binary_file;
 pub mod block_selection;
 pub mod blog_showcases;
+pub mod bracket_highlight_settings;
 pub mod buffer_groups;
 #[cfg(feature = "plugins")]
 pub mod buffer_lifecycle;
@@ -25,8 +26,12 @@ pub mod csi_u_session_input;
 pub mod cursor_style_rendering;
 pub mod dabbrev_completion;
 #[cfg(feature = "plugins")]
+pub mod dock_dropdown_mouse;
+#[cfg(feature = "plugins")]
 pub mod dock_focus_stuck_born_attached;
 pub mod dock_panel_routing;
+#[cfg(feature = "plugins")]
+pub mod dock_switch_wipes_outgoing_window;
 pub mod document_model;
 pub mod emacs_actions;
 pub mod encoding;
@@ -78,6 +83,7 @@ pub mod issue_2031_next_prev_window;
 pub mod issue_2035_preview_renders_buffer_groups;
 pub mod issue_2119_wheel_scroll;
 pub mod issue_2124_quickfix_enter;
+pub mod issue_2283_dock_last_tab_close;
 pub mod issue_2345_language_settings;
 pub mod issue_2357_shebang_interpreter;
 pub mod issue_2362_replace_toolbar_theme;
@@ -85,11 +91,17 @@ pub mod issue_2373_buffer_switcher_virtual;
 pub mod issue_2405_brackets_in_comments;
 pub mod issue_2449_scrollback_wrapped_ansi_color;
 pub mod issue_2566_env_detector_labels;
+pub mod issue_2572_hover_through_panel;
 pub mod issue_2605_format_selection_range;
+pub mod issue_2796_key_release_duplicates;
+#[cfg(feature = "plugins")]
+pub mod issue_2810_session_escape_flush;
+pub mod issue_2843_single_line_viewport;
 pub mod issue_779_after_eof_shade;
 pub mod issue_close_file_in_split_hides_buffer_group;
 pub mod language_dialog_esc_cancels_edit;
 pub mod language_dialog_tab_size;
+pub mod language_textmate_grammar;
 pub mod mouse_session_input;
 pub mod suspend_process;
 
@@ -128,6 +140,7 @@ pub mod lsp_goto_implementation;
 pub mod lsp_indicator_click_bugs;
 pub mod lsp_indicator_click_to_open;
 pub mod lsp_inlay_hints_capability;
+pub mod lsp_inlay_hints_refresh_on_edit;
 pub mod lsp_lifecycle_visibility;
 pub mod lsp_missing_binary_and_dismiss;
 pub mod lsp_multi_semantic_tokens;
@@ -140,13 +153,17 @@ pub mod lsp_server_lifecycle_cleanup;
 pub mod lsp_stop_stale_indicator;
 pub mod lsp_toggle_desync;
 pub mod lsp_unified_code_actions;
+pub mod lsp_unified_hover;
 pub mod lsp_unresponsive_capability_does_not_block;
 pub mod macros;
 pub mod mark_mode_actions;
 pub mod markdown_compose;
 pub mod markdown_compose_diagnostics;
 pub mod markdown_compose_scroll_reach;
+#[cfg(feature = "plugins")]
+pub mod markdown_compose_scrollbar_markers;
 pub mod markdown_compose_table_border;
+pub mod markdown_fenced_code_highlighting;
 pub mod memory_scroll_leak;
 pub mod menu_bar;
 pub mod menu_cursor_bleed;
@@ -161,7 +178,9 @@ pub mod multicursor;
 pub mod occurrence_highlight;
 pub mod on_save_actions;
 pub mod open_folder;
+pub mod orchestrator_dialog_trust_repro;
 pub mod orchestrator_dock;
+pub mod orchestrator_dock_settings;
 pub mod orchestrator_window_lsp;
 pub mod overlay_extend_to_line_end;
 pub mod pane_navigation;
@@ -189,12 +208,18 @@ pub mod remote_indicator_popup;
 pub mod remote_indicator_status;
 pub mod remote_reconnect_terminal;
 pub mod rendering;
+// Spawns its agent terminals through the plugin `createTerminal` command —
+// the path Orchestrator's "Run Agent…" uses — so it needs that API compiled in.
+#[cfg(feature = "plugins")]
+pub mod restart_exited_terminal;
 pub mod restored_agent_terminal;
 pub mod restored_terminal_dock_activation;
 pub mod restored_terminal_focus;
 pub mod save_as_language_detection;
 pub mod save_nonexistent_directory;
 pub mod scroll_clearing;
+#[cfg(feature = "plugins")]
+pub mod scrollbar_markers;
 pub mod scrolling;
 pub mod search;
 pub mod search_center_on_scroll;
@@ -229,6 +254,7 @@ pub mod shift_backspace;
 pub mod slow_filesystem;
 pub mod smart_editing;
 pub mod smart_home;
+pub mod split_close_confirm;
 pub mod split_focus_tab_click;
 pub mod split_tabs;
 pub mod split_view;

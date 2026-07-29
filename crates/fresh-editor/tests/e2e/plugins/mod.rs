@@ -7,6 +7,8 @@ pub mod audit_mode;
 pub mod authority_snapshot;
 pub mod buffer_info_splits;
 pub mod command_keybinding_editor;
+pub mod config_changed_adoption;
+pub mod csharp_restore_trust;
 pub mod dashboard;
 // The three modules below drive the in-tree fake-devcontainer
 // CLI (a bash script under `scripts/fake-devcontainer/bin/`).
@@ -53,12 +55,14 @@ pub mod orchestrator_new_session_renders;
 pub mod orchestrator_open_cross_project;
 pub mod package_manager;
 pub mod plugin;
+pub mod plugin_config_changed_hook;
 pub mod plugin_config_registration;
 pub mod plugin_keybinding_execution;
 pub mod plugins_dir_in_working_dir;
 pub mod review_diff_hunk_parity;
 pub mod review_diff_line_staging;
 pub mod review_diff_ux_bugs;
+pub mod set_split_ratio_leaf;
 pub mod tab_actions;
 pub mod terminal_hooks;
 pub mod theme_editor;

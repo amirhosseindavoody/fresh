@@ -290,6 +290,9 @@ impl Editor {
                     .unwrap_or_else(|| d.root.clone());
                 fresh_core::api::WindowInfo {
                     id: fresh_core::WindowId(d.id),
+                    // A dormant shell carries the persisted id when its
+                    // workspace file had one; legacy files leave it empty.
+                    stable_id: d.stable_id.clone().unwrap_or_default(),
                     label: d.label.clone(),
                     root: normalize_plugin_path(d.root.clone()),
                     project_path: normalize_plugin_path(project_path),
@@ -322,6 +325,7 @@ impl Editor {
                     .unwrap_or(false);
                 fresh_core::api::WindowInfo {
                     id: s.id,
+                    stable_id: s.stable_id.clone(),
                     label: s.label.clone(),
                     root: normalize_plugin_path(s.root.clone()),
                     project_path: normalize_plugin_path(project_path),
@@ -649,6 +653,12 @@ impl Editor {
             } => {
                 self.handle_set_split_buffer(split_id, buffer_id);
             }
+            PluginCommand::MoveBufferToSplit {
+                buffer_id,
+                split_id,
+            } => {
+                self.handle_move_buffer_to_split(buffer_id, split_id);
+            }
             PluginCommand::SetSplitScroll { split_id, top_byte } => {
                 self.handle_set_split_scroll(split_id, top_byte);
             }
@@ -782,6 +792,30 @@ impl Editor {
                 namespace,
             } => {
                 self.handle_clear_line_indicators(buffer_id, namespace);
+            }
+            PluginCommand::SetScrollbarMarkers {
+                buffer_id,
+                namespace,
+                markers,
+            } => {
+                self.handle_set_scrollbar_markers(buffer_id, namespace, markers);
+            }
+            PluginCommand::SetScrollbarMarkersInRange {
+                buffer_id,
+                namespace,
+                start,
+                end,
+                markers,
+            } => {
+                self.handle_set_scrollbar_markers_in_range(
+                    buffer_id, namespace, start, end, markers,
+                );
+            }
+            PluginCommand::ClearScrollbarMarkers {
+                buffer_id,
+                namespace,
+            } => {
+                self.handle_clear_scrollbar_markers(buffer_id, namespace);
             }
             PluginCommand::SetFileExplorerDecorations {
                 namespace,
@@ -922,7 +956,7 @@ impl Editor {
                 title,
                 resume,
                 env,
-                command_allowlist,
+                allow_script,
                 request_id,
             } => {
                 self.handle_create_window_with_terminal(
@@ -933,7 +967,7 @@ impl Editor {
                     title,
                     resume,
                     env,
-                    command_allowlist,
+                    allow_script,
                     request_id,
                 );
             }
@@ -977,6 +1011,18 @@ impl Editor {
             }
             PluginCommand::CloseWindow { id } => {
                 let _ = self.close_window(id);
+            }
+            PluginCommand::DeleteWorkspace { root } => {
+                // Permanently forget this directory's persisted session so
+                // boot-time discovery can't rediscover it. Best-effort, like
+                // discovery's own GC: a failed unlink just leaves the file to
+                // be retried next launch rather than aborting the delete.
+                if let Err(e) = crate::workspace::Workspace::delete(&root) {
+                    tracing::warn!(
+                        "DeleteWorkspace: could not forget workspace for {:?}: {e}",
+                        root
+                    );
+                }
             }
             PluginCommand::PrewarmWindow { id } => {
                 self.prewarm_window(id);
@@ -1330,6 +1376,18 @@ impl Editor {
             PluginCommand::ExecuteAction { action_name } => {
                 self.handle_execute_action(action_name);
             }
+            PluginCommand::CompleteCommand {
+                request_id,
+                ok,
+                output,
+                error,
+            } => {
+                // A command dispatched over the agent channel has settled.
+                // Park the outcome where the host loop (daemon or in-process
+                // control socket) picks it up and answers the caller waiting on
+                // this request id.
+                crate::server::command_access::complete(request_id, ok, output, error);
+            }
             PluginCommand::ExecuteActions { actions } => {
                 self.handle_execute_actions(actions);
             }
@@ -1491,6 +1549,24 @@ impl Editor {
             PluginCommand::FlushLayout => {
                 self.flush_layout();
             }
+            PluginCommand::SetLineTargets { buffer_id, targets } => {
+                self.set_line_targets(buffer_id, targets);
+            }
+            PluginCommand::SplitWindow {
+                options,
+                request_id,
+            } => {
+                self.handle_split_window(options, request_id);
+            }
+            PluginCommand::SyncSnapshot { request_id } => {
+                // Everything queued ahead of this has been applied by now
+                // (the queue is FIFO), so refreshing the snapshot here is
+                // what makes the caller's next read observe its own writes.
+                self.update_plugin_state_snapshot();
+                self.send_plugin_response(fresh_core::api::PluginResponse::SnapshotSynced {
+                    request_id,
+                });
+            }
             PluginCommand::CompositeNextHunk { buffer_id } => {
                 self.handle_composite_next_hunk(buffer_id);
             }
@@ -1565,8 +1641,9 @@ impl Editor {
                 window_id,
                 command,
                 title,
+                resume,
                 env,
-                command_allowlist,
+                allow_script,
                 request_id,
             } => {
                 self.handle_create_terminal(
@@ -1578,8 +1655,9 @@ impl Editor {
                     window_id,
                     command,
                     title,
+                    resume,
                     env,
-                    command_allowlist,
+                    allow_script,
                     request_id,
                 );
             }
@@ -3786,7 +3864,7 @@ impl Editor {
         title: Option<String>,
         resume: Option<Vec<String>>,
         env: Option<std::collections::HashMap<String, String>>,
-        command_allowlist: Option<Vec<String>>,
+        allow_script: bool,
         request_id: u64,
     ) {
         let callback_id = JsCallbackId::from(request_id);
@@ -3820,11 +3898,19 @@ impl Editor {
             new_authority,
             resume,
             env,
-            command_allowlist,
+            allow_script,
         ) {
             Ok((window_id, terminal_id, buffer_id)) => {
                 let api_result = fresh_core::api::SessionWithTerminalResult {
                     window_id: window_id.0,
+                    // The durable id is minted with the window, so a caller
+                    // gets it in the same breath as the create — no lookup,
+                    // and nothing to miss if the window is closed later.
+                    stable_id: self
+                        .windows
+                        .get(&window_id)
+                        .map(|w| w.stable_id.clone())
+                        .unwrap_or_default(),
                     terminal_id: terminal_id.0 as u64,
                     buffer_id: buffer_id.0 as u64,
                 };
@@ -3855,8 +3941,9 @@ impl Editor {
         target_session_id: Option<fresh_core::WindowId>,
         command: Option<Vec<String>>,
         title: Option<String>,
+        resume: Option<Vec<String>>,
         env: Option<std::collections::HashMap<String, String>>,
-        command_allowlist: Option<Vec<String>>,
+        allow_script: bool,
         request_id: u64,
     ) {
         // Resolve target window. Explicit `windowId` wins when the
@@ -3890,29 +3977,38 @@ impl Editor {
         };
 
         // Assemble the extra env injected into the spawned terminal's child:
-        // `FRESH_BIN` plus, when `command_allowlist` is given, a capability
+        // `FRESH_BIN` plus, when `allow_script` is given, a capability
         // token bound to the TARGET window + that allowlist (with
         // `FRESH_SESSION`). This is what lets an agent spawned into an
         // *existing* window drive the editor exactly like one born via
         // `createWindowWithTerminal` — both paths share the same helper.
-        let terminal_env =
-            crate::app::terminal::agent_command_env(target_id, env, command_allowlist);
+        let terminal_env = crate::app::terminal::agent_command_env(target_id, env, allow_script);
 
         let result = {
             let target = self
                 .windows
                 .get_mut(&target_id)
                 .expect("target window present (existence checked above)");
-            target.create_plugin_terminal(crate::app::terminal::PluginTerminalSpec {
+            let spec = crate::app::terminal::PluginTerminalSpec {
                 cwd: cwd_buf,
                 direction: split_direction,
                 ratio,
                 focus: focus.unwrap_or(true),
                 persistent,
-                command,
+                command: command.clone(),
                 title: title.filter(|t| !t.is_empty()),
                 env: terminal_env,
-            })
+            };
+            let spawned = target.create_plugin_terminal(spec);
+            // Record the launch/resume argv exactly as `create_window_with_terminal`
+            // does. Without this, an agent spawned into an *existing* window (the
+            // Run-Agent "current workspace" path) was not a restorable session
+            // terminal at all: it vanished on workspace save, and a restart
+            // respawned a bare shell instead of the agent.
+            if let Ok((terminal_id, _, _)) = &spawned {
+                target.mark_terminal_restorable(*terminal_id, command, resume);
+            }
+            spawned
         };
         match result {
             Ok((terminal_id, buffer_id, created_split_id)) => {
@@ -5900,6 +5996,9 @@ impl Window {
                     .unwrap_or(false)
             });
             let is_preview = self.is_buffer_preview(*buffer_id);
+            // A terminal pane and a plugin scratch pane are both "virtual";
+            // only the window knows which one has a PTY behind it.
+            let is_terminal = self.is_terminal_buffer(*buffer_id);
             // Which splits currently hold this buffer — lets plugins
             // implement "focus existing if visible, else open new"
             // without tracking split ids across editor restarts
@@ -5915,7 +6014,9 @@ impl Window {
                 path: state.buffer.file_path().map(|p| p.to_path_buf()),
                 modified: state.buffer.is_modified(),
                 length: state.buffer.len(),
+                line_count: state.buffer.line_count(),
                 is_virtual,
+                is_terminal,
                 editing_disabled: state.editing_disabled,
                 view_mode: view_mode.to_string(),
                 is_composing_in_any_split,
@@ -5985,9 +6086,12 @@ impl Window {
         // which is what `editor.getCursorPosition()` then sees.
         let active_buf_id = snapshot.active_buffer_id;
         let active_split_id = self.effective_active_pair().0;
+        // Captured before the closure borrows `self`: the panes' rects are
+        // derived from the same area the renderer lays out into, so the
+        // geometry a plugin reads matches the cells actually drawn.
+        let content_area = self.editor_content_area();
         self.buffers
             .with_all_mut(|buffers_mut, mgr, vs_map| {
-                let _ = mgr; // active_split_id was computed above
                 if let Some(active_vs) = vs_map.get(&active_split_id) {
                     // Primary cursor (from SplitViewState)
                     let active_cursors = &active_vs.cursors;
@@ -6067,9 +6171,20 @@ impl Window {
                     snapshot.selected_text = None;
                 }
 
-                // Per-split snapshot
+                // Per-split snapshot.
+                //
+                // Walked through the layout rather than the view-state map so
+                // the list comes out in *visual* order — left to right, top to
+                // bottom — and carries each pane's on-screen rect. A caller
+                // asking "which pane is on the left" can then compare `x`
+                // instead of guessing from an iteration order that used to be
+                // a HashMap's.
                 snapshot.splits.clear();
-                for (leaf_id, vs) in vs_map.iter() {
+                let laid_out = mgr.get_visible_buffers(content_area);
+                for (leaf_id, _buf, rect) in laid_out {
+                    let Some(vs) = vs_map.get(&leaf_id) else {
+                        continue;
+                    };
                     let buf_id = vs.active_buffer;
                     let top_line = buffers_mut.get(&buf_id).and_then(|state| {
                         if state.buffer.line_count().is_some() {
@@ -6081,6 +6196,11 @@ impl Window {
                     snapshot.splits.push(fresh_core::api::SplitSnapshot {
                         split_id: leaf_id.0 .0,
                         buffer_id: buf_id,
+                        label: mgr.get_label(leaf_id.0).map(|l| l.to_string()),
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
                         viewport: ViewportInfo {
                             top_byte: vs.viewport.top_byte,
                             top_line,

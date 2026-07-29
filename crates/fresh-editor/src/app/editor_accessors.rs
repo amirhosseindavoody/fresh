@@ -1259,6 +1259,56 @@ impl Editor {
         }
     }
 
+    /// Current phase of an interactive in-editor self-update (drives the
+    /// status-bar update indicator).
+    pub fn self_update_phase(&self) -> crate::services::release_checker::SelfUpdatePhase {
+        self.self_update_phase
+    }
+
+    /// Mark that an interactive self-update has started in a local terminal
+    /// buffer, remembering the terminal (to match its `TerminalExited`) and the
+    /// (window, buffer) so the indicator can switch back to it.
+    pub fn begin_self_update(
+        &mut self,
+        terminal: fresh_core::TerminalId,
+        window: fresh_core::WindowId,
+        buffer: fresh_core::BufferId,
+    ) {
+        self.self_update_phase = crate::services::release_checker::SelfUpdatePhase::Running;
+        self.self_update_terminal = Some(terminal);
+        self.self_update_output = Some((window, buffer));
+    }
+
+    /// Move the update indicator to its terminal state when the update terminal
+    /// exits.
+    pub fn finish_self_update(&mut self, success: bool) {
+        use crate::services::release_checker::SelfUpdatePhase;
+        self.self_update_phase = if success {
+            SelfUpdatePhase::Succeeded
+        } else {
+            SelfUpdatePhase::Failed
+        };
+    }
+
+    /// Switch to the update terminal buffer so the user can watch progress or
+    /// read the outcome. The update always runs locally, so this is a local
+    /// terminal buffer regardless of any remote authority attached to the
+    /// window. If the buffer has since been closed, report that instead.
+    pub fn show_self_update_output(&mut self) {
+        if let Some((window, buffer)) = self.self_update_output {
+            let exists = self
+                .windows
+                .get(&window)
+                .is_some_and(|w| w.buffers.get(&buffer).is_some());
+            if exists {
+                self.active_window = window;
+                self.active_window_mut().set_active_buffer(buffer);
+                return;
+            }
+        }
+        self.set_status_message(t!("update.log_unavailable").to_string());
+    }
+
     /// Check for and handle any new warnings in the warning log
     ///
     /// Updates the general warning domain for the status bar.
@@ -1363,19 +1413,19 @@ impl Editor {
 
         // Get hover state without borrowing self
         let hover_info = match self.active_window_mut().mouse_state.lsp_hover_state {
-            Some((byte_pos, start_time, screen_x, screen_y)) => {
+            Some((byte_pos, start_time, screen_x, screen_y, buffer_id)) => {
                 if self.active_window_mut().mouse_state.lsp_hover_request_sent {
                     return false; // Already sent request for this position
                 }
                 if start_time.elapsed() < hover_delay {
                     return false; // Timer hasn't expired yet
                 }
-                Some((byte_pos, screen_x, screen_y))
+                Some((byte_pos, screen_x, screen_y, buffer_id))
             }
             None => return false,
         };
 
-        let Some((byte_pos, screen_x, screen_y)) = hover_info else {
+        let Some((byte_pos, screen_x, screen_y, buffer_id)) = hover_info else {
             return false;
         };
 
@@ -1385,7 +1435,7 @@ impl Editor {
             .set_screen_position((screen_x, screen_y));
 
         // Request hover at the byte position — only mark as sent if dispatched
-        match self.request_hover_at_position(byte_pos) {
+        match self.request_hover_at_position(byte_pos, buffer_id) {
             Ok(true) => {
                 self.active_window_mut().mouse_state.lsp_hover_request_sent = true;
                 true

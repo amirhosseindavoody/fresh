@@ -31,6 +31,7 @@ const editor = getEditor();
 const NS_GUTTER = "live-diff";
 const NS_VLINE = "live-diff-vlines";
 const NS_OVERLAY = "live-diff-overlay";
+const NS_SCROLL = "live-diff-scroll";
 
 // Lower priority than git_gutter (10) so live-diff loses if both are active
 // on the same line — but in practice users will run one or the other.
@@ -149,6 +150,22 @@ interface BufferDiffState {
   hunks: Hunk[];
   /** True while a recompute is in flight. */
   updating: boolean;
+  /**
+   * Set when a recompute is requested while one is already in flight for
+   * this buffer. The running pass re-runs once more when it finishes so the
+   * request isn't lost (a dropped post-commit refresh left a stale diff on
+   * screen forever — the #2503 `focus_gained`/reflog path).
+   */
+  rerunRequested: boolean;
+  /**
+   * Request to drop the cached git reference and re-fetch it on the next
+   * recompute pass (a HEAD move: commit, checkout, reset, merge). Consumed
+   * *inside* the recompute mutex so a concurrent pass never observes a
+   * half-cleared reference — mutating `oldText`/`oldLines` directly from an
+   * event handler raced an in-flight recompute and rendered a bogus
+   * "everything added" diff.
+   */
+  reloadRef: boolean;
   /** Token bumped on every scheduleRecompute; mismatched tokens are stale. */
   pendingToken: number;
   /**
@@ -775,6 +792,7 @@ function clearDecorations(bufferId: number): void {
   editor.clearLineIndicators(bufferId, NS_GUTTER);
   editor.clearVirtualTextNamespace(bufferId, NS_VLINE);
   editor.clearNamespace(bufferId, NS_OVERLAY);
+  editor.clearScrollbarMarkers(bufferId, NS_SCROLL);
 }
 
 /**
@@ -852,6 +870,44 @@ function renderHunks(state: BufferDiffState, newLines: string[]): void {
       GUTTER_COLORS.modified[0], GUTTER_COLORS.modified[1], GUTTER_COLORS.modified[2], PRIORITY,
     );
   }
+
+  // Scrollbar marks, one per hunk — so unsaved changes elsewhere in the file
+  // are visible without scrolling to find them.
+  //
+  // Whole-namespace replace (not the range-scoped form) is right here: unlike
+  // a `lines_changed` producer, this pass recomputes the diff for the *entire*
+  // buffer every time, so the hunk list it holds is complete and authoritative.
+  // Sending it in one command also means the marks swap atomically.
+  //
+  // Added/modified hunks span their new-side lines, so they carry an `end` and
+  // paint a proportional streak. A removed hunk has no new-side line of its
+  // own (`newCount === 0`) — its content is gone — so it marks the seam where
+  // the deletion happened, matching where the virtual deletion line renders.
+  // Colours reuse the gutter palette deliberately: a hunk's gutter glyph and
+  // its scrollbar mark are then the same colour.
+  const scrollMarkers = [];
+  for (const h of state.hunks) {
+    if (h.newStart >= lineCount) continue;
+    const color = h.kind === "added"
+      ? GUTTER_COLORS.added
+      : h.kind === "modified"
+        ? GUTTER_COLORS.modified
+        : GUTTER_COLORS.removed;
+    const start = lineStarts[h.newStart];
+    // Byte offsets, not line numbers: exact at any file size, and the editor
+    // anchors them so marks ride subsequent edits until the next recompute.
+    const marker: { position: number; end?: number; color: [number, number, number]; priority: number } = {
+      position: start,
+      color,
+      priority: PRIORITY,
+    };
+    if (h.newCount > 0) {
+      const lastLine = Math.min(h.newStart + h.newCount - 1, lineCount - 1);
+      marker.end = lineEndExclusive(lastLine);
+    }
+    scrollMarkers.push(marker);
+  }
+  editor.setScrollbarMarkers(bid, NS_SCROLL, scrollMarkers);
 
   // Background highlights and virtual lines, all sync now.
   for (const h of state.hunks) {
@@ -974,10 +1030,44 @@ async function recompute(bufferId: number): Promise<void> {
   const state = states.get(bufferId);
   if (!state) return;
   if (!isEnabledForBuffer(state)) return;
-  if (state.updating) return;
+  // Serialize recomputes per buffer. A recompute suspends at its `await`
+  // points (git reference load, buffer-text fetch). A second trigger that
+  // arrives meanwhile must neither start a concurrent pass (it would race on
+  // the shared `oldText`/`oldLines` reference and render a bogus "everything
+  // added" diff) nor be silently dropped (a dropped post-commit refresh left
+  // the stale diff on screen until the external test timeout — #2503's
+  // `focus_gained`/reflog path). Coalesce: mark that another pass is needed
+  // and let the in-flight one run it before it releases the mutex.
+  if (state.updating) {
+    state.rerunRequested = true;
+    return;
+  }
 
   state.updating = true;
   try {
+    do {
+      state.rerunRequested = false;
+      // Consume a reference-reload request *inside* the mutex so no other
+      // pass can observe a half-cleared reference. Event handlers that need
+      // the cached git reference re-fetched (a HEAD move) set `reloadRef`
+      // rather than mutating `oldText`/`oldLines` directly. `lastHunksKey`
+      // is intentionally kept so an unchanged diff still suppresses a no-op
+      // repaint (no flicker on every window focus).
+      if (state.reloadRef) {
+        state.reloadRef = false;
+        state.oldText = null;
+        state.oldLines = [];
+        state.lastBufferText = null;
+      }
+      await onePass();
+    } while (state.rerunRequested);
+  } finally {
+    state.updating = false;
+  }
+
+  // A single diff pass. Early `return`s end this pass only; the wrapper's
+  // `do…while` still honors any `rerunRequested` recorded meanwhile.
+  async function onePass(): Promise<void> {
     if (state.oldText === null) {
       const ref = await loadReference(state);
       if (ref === null) {
@@ -1062,8 +1152,6 @@ async function recompute(bufferId: number): Promise<void> {
     renderHunks(state, newLines);
 
     editor.setViewState(bufferId, "live_diff_hunks", hunks);
-  } finally {
-    state.updating = false;
   }
 }
 
@@ -1098,6 +1186,8 @@ function ensureState(bufferId: number): BufferDiffState | null {
     oldLines: [],
     hunks: [],
     updating: false,
+    rerunRequested: false,
+    reloadRef: false,
     pendingToken: 0,
     override: getStoredOverride(bufferId),
     lastBufferText: null,
@@ -1337,15 +1427,15 @@ function refreshGitReferences(): void {
   for (const state of states.values()) {
     if (state.mode.kind === "disk") continue;
     if (!isEnabledForBuffer(state)) continue;
-    // Re-fetch the reference (HEAD may have moved) but keep `lastHunksKey`:
-    // this path fires on every window focus, so when the diff is in fact
-    // unchanged the recompute's hunk-equality guard suppresses the repaint
-    // and there's no flicker. `lastBufferText` must still be cleared so the
-    // "same buffer text" early-return doesn't skip recomputing against the
-    // new reference.
-    state.oldText = null;
-    state.oldLines = [];
-    state.lastBufferText = null;
+    // Request a reference re-fetch (HEAD may have moved) via the flag the
+    // recompute consumes under its mutex — NOT by mutating `oldText`/
+    // `oldLines` here, which races an in-flight recompute for this buffer
+    // and made it diff the new buffer against an emptied reference (every
+    // line shown as added, and never cleared). `reloadRef` keeps
+    // `lastHunksKey`, so when the diff is in fact unchanged the recompute's
+    // hunk-equality guard still suppresses the repaint and there's no
+    // flicker on every window focus.
+    state.reloadRef = true;
     recompute(state.bufferId).catch((e) => editor.error(`live-diff: ${e}`));
   }
 }

@@ -40,9 +40,10 @@ const browser = await chromium.launch({ ...(EXE ? { executablePath: EXE } : {}),
 // its items (the TUI clips a dropdown to the grid, hiding the tail rows).
 const page = await browser.newPage({ viewport: { width: 1280, height: 960 }, deviceScaleFactor: 2 });
 const errs = []; page.on('pageerror', e => errs.push(String(e)));
-// The single-client test below deliberately opens a second /ws socket that the
-// server rejects (409) — Chromium logs that handshake failure as a console
-// error, so /ws connection noise is filtered out of the page-error assertion.
+// The mirroring test below opens a second /ws socket alongside the page's own
+// and later closes it — normal WebSocket churn that Chromium may log as console
+// noise, so /ws connection messages are filtered out of the page-error
+// assertion.
 page.on('console', m => { if (m.type() === 'error' && !/WebSocket connection to .*\/ws/.test(m.text())) errs.push('console:' + m.text()); });
 await page.goto(URL, { waitUntil: 'networkidle' });
 await page.waitForFunction(() => window.fresh && window.fresh.scene && window.fresh.scene.regions.panes.length > 0);
@@ -73,6 +74,16 @@ check('editor reports the open menu', sm.regions.menuOpen != null);
 check('dropdown rows rendered as native .mitem', (await page.locator('.mitem').count()) >= 4);
 check('dropdown shows accelerators (e.g. Ctrl+N)', (await page.locator('.mitem .accel').count()) >= 1);
 check('NO cells/svg inside the dropdown', (await page.locator('.dropdown svg').count()) === 0);
+// Blanket leakage guard. The per-surface checks above only cover surfaces
+// somebody remembered to add — the file browser shipped its whole popup as a
+// cell slab for months precisely because it was a SIBLING of `.palette`, so
+// `.palette svg` never saw it. Buffer interiors (and the picker's preview
+// pane, which is a real buffer render) are the only legitimate cell users.
+const cellLeaks = () => page.evaluate(() => [...document.querySelectorAll('svg.cells')]
+  .filter(s => !s.closest('.pane-content,.pane-gutter,.ppreview'))
+  .map(s => (s.parentElement || {}).className || '?'));
+check('NO cell SVG anywhere outside pane interiors / the preview pane',
+  (await cellLeaks()).length === 0, JSON.stringify(await cellLeaks()));
 await page.screenshot({ path: `${SHOTS}/22-native-menu.png` });
 await page.keyboard.press('Escape'); await page.waitForTimeout(150);
 
@@ -281,6 +292,90 @@ await page.keyboard.press('End');
 for (let i = 0; i < 3; i++) await page.keyboard.press('Backspace');
 await page.keyboard.press('Escape'); await page.waitForTimeout(200);
 
+console.log('\n[dock chrome polish: no h-scroll, list fills, dropdowns float over content]');
+// Regression cover for the orchestrator-dock visual fixes: the dock never
+// raises a spurious horizontal scrollbar; the session tree fills the panel
+// (the TUI hint-padding rows are dropped in the web); and the toolbar
+// dropdowns float over the content (positioned by `layoutDockOverlays`)
+// instead of reflowing the list, with a full-width option highlight and an
+// outside-click dismiss.
+const dockOverlay = () => page.locator('.widget-surface.w-dock > .w-col > .w-overlay');
+const treeHeight = () => page.evaluate(() => {
+  const t = document.querySelector('.widget-surface.w-dock .w-tree');
+  return t ? Math.round(t.getBoundingClientRect().height) : -1;
+});
+
+// (1) No horizontal scrollbar: over-wide `pre` tree rows ellipsis-clip.
+const dockOverflowX = await page.evaluate(() =>
+  getComputedStyle(document.querySelector('.widget-surface.w-dock')).overflowX);
+check('dock never scrolls horizontally (overflow-x: hidden)', dockOverflowX === 'hidden', dockOverflowX);
+
+// (2) The session list fills the panel (no blank filler stealing the space).
+const fillRatio = await page.evaluate(() => {
+  const dock = document.querySelector('.widget-surface.w-dock');
+  const tree = document.querySelector('.widget-surface.w-dock .w-tree');
+  return tree ? tree.getBoundingClientRect().height / dock.getBoundingClientRect().height : 0;
+});
+check('session list fills the dock (tree ≥ 55% of dock height)', fillRatio >= 0.55, `ratio=${fillRatio.toFixed(2)}`);
+
+// (3) New Task… dropdown floats flush under its button (never on top of it),
+//     and its option highlight fills the row instead of hugging the text.
+await page.locator('.widget-surface.w-dock .w-button.primary', { hasText: 'New Task' }).first().click();
+await page.waitForFunction(() => !!document.querySelector('.widget-surface.w-dock > .w-col > .w-overlay'),
+  { timeout: 8000 }).catch(() => {});
+const newInfo = await page.evaluate(() => {
+  const ov = document.querySelector('.widget-surface.w-dock > .w-col > .w-overlay');
+  const btn = [...document.querySelectorAll('.widget-surface.w-dock .w-button.primary')]
+    .find(b => /New Task/.test(b.textContent));
+  if (!ov || !btn) return null;
+  const o = ov.getBoundingClientRect(), b = btn.getBoundingClientRect();
+  const opt = ov.querySelector('.w-button'), row = opt && opt.closest('.w-row');
+  return {
+    floats: getComputedStyle(ov).position === 'absolute',
+    belowButton: o.top >= b.bottom - 2,
+    optionFillsRow: !!row && opt.getBoundingClientRect().width >= row.getBoundingClientRect().width - 2,
+  };
+});
+check('New Task dropdown floats absolutely, flush below its button', !!newInfo && newInfo.floats && newInfo.belowButton, JSON.stringify(newInfo));
+check('dropdown option highlight fills the row (no half-width spacer)', !!newInfo && newInfo.optionFillsRow, JSON.stringify(newInfo));
+await page.keyboard.press('Escape');
+await page.waitForFunction(() => !document.querySelector('.widget-surface.w-dock > .w-col > .w-overlay'),
+  { timeout: 8000 }).catch(() => {});
+
+// (4) Move to Folder… floats over the tree without reflowing it, and an
+//     outside click dismisses it (the dropdowns carry no scrim of their own).
+await page.locator('.widget-surface.w-dock .w-tree-row').first().click({ button: 'right' });
+await page.waitForFunction(() => (window.fresh.scene.regions.widgets || []).some(w => w.kind === 'floatingModal'),
+  { timeout: 8000 }).catch(() => {});
+const treeBeforeMove = await treeHeight();
+await page.locator('.widget-surface.w-floatingModal .w-button', { hasText: 'Move to Folder' }).first().click();
+await page.waitForFunction(() => !!document.querySelector('.widget-surface.w-dock > .w-col > .w-overlay'),
+  { timeout: 8000 }).catch(() => {});
+const moveInfo = await page.evaluate(() => {
+  const ov = document.querySelector('.widget-surface.w-dock > .w-col > .w-overlay');
+  const tree = document.querySelector('.widget-surface.w-dock .w-tree');
+  const div = document.querySelector('.widget-surface.w-dock .w-divider');
+  if (!ov) return null;
+  const ovTop = Math.round(ov.getBoundingClientRect().top);
+  // The menu is pinned to the divider at the head of the tree (a small
+  // divider gap sits above the first tree row); the pre-fix bug parked it at
+  // the panel top over the toolbar, which this catches.
+  return {
+    floats: getComputedStyle(ov).position === 'absolute',
+    atTreeHead: !!div && Math.abs(ovTop - Math.round(div.getBoundingClientRect().top)) <= 3
+      && (!tree || ovTop >= Math.round(tree.getBoundingClientRect().top) - 16),
+    treeH: tree ? Math.round(tree.getBoundingClientRect().height) : -1,
+  };
+});
+check('Move to Folder floats absolutely at the head of the tree', !!moveInfo && moveInfo.floats && moveInfo.atTreeHead, JSON.stringify(moveInfo));
+check('Move to Folder does not collapse the session list', !!moveInfo && moveInfo.treeH >= treeBeforeMove * 0.7, `tree ${treeBeforeMove} -> ${moveInfo && moveInfo.treeH}`);
+await page.screenshot({ path: `${SHOTS}/30-dock-move-dropdown.png` });
+await page.mouse.click(1000, 700); // click in the editor, outside the dock
+await page.waitForFunction(() => !document.querySelector('.widget-surface.w-dock > .w-col > .w-overlay'),
+  { timeout: 8000 }).catch(() => {});
+check('outside-click dismisses the Move to Folder dropdown', (await dockOverlay().count()) === 0);
+await page.keyboard.press('Escape'); await page.waitForTimeout(150);
+
 console.log('\n[keybinding editor = full native modal incl. edit dialog]');
 // Start clean: dismiss any focused dock/floating panel so keys reach the editor.
 await page.keyboard.press('Escape'); await page.waitForTimeout(120);
@@ -449,19 +544,55 @@ check('typing frame does NOT resend heavyweight unrelated regions',
   !diffKeys.includes('regions.settings') && !diffKeys.includes('regions.keybindingEditor') && !diffKeys.includes('regions.widgets'),
   JSON.stringify(diffKeys));
 
-console.log('\n[single-client model: a second WebSocket is rejected]');
-const second = await page.evaluate(() => new Promise(res => {
+console.log('\n[shared-view mirroring: multiple clients are all live at once]');
+// Opening the editor again (a second tab, another device, or the page you load
+// after a server restart) JOINS the shared session — both clients mirror the
+// SAME editor, neither is rejected. This is what stops a stale/half-open
+// background tab from locking out a new page (the old model bounced the newcomer
+// with 409, so a zombie held the single slot until a server restart).
+const secondJoined = await page.evaluate(() => new Promise(res => {
   const w = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
-  w.onopen = () => { w.close(); res('open'); };
+  window.__mirror = w;
+  window.__mirrorFrames = [];
+  w.onmessage = ev => { try { const m = JSON.parse(ev.data); window.__mirrorFrames.push(m.type);
+    if (m.type === 'hello') res('hello'); } catch (_) {} };
   w.onclose = () => res('closed');
   setTimeout(() => res('timeout'), 3000);
 }));
-check('second WebSocket is rejected before upgrade (409)', second === 'closed', second);
-check('first socket unaffected by the rejected second one', await page.evaluate(() => window.fresh.wsOpen));
-const seqR0 = await page.evaluate(() => window.fresh.seq);
+check('a second WebSocket JOINS and gets its own hello (mirroring, no 409)', secondJoined === 'hello', secondJoined);
+check('the page socket stays open alongside the second (both live)', await page.evaluate(() => window.fresh.wsOpen));
+// Input from the SECOND client mutates the shared editor, and BOTH clients get
+// the resulting pushed frame (the scene is built once and broadcast to all).
+const pFrames0 = await page.evaluate(() => window.fresh.frames);
+const mFrames0 = await page.evaluate(() => window.__mirrorFrames.length);
+await page.evaluate(() => window.__mirror.send(JSON.stringify({ type: 'key', key: 'Z' })));
+check("the page receives a frame from the OTHER client's input (shared editor)",
+  await page.waitForFunction(f0 => window.fresh.frames > f0, pFrames0, { timeout: 5000 }).then(() => true).catch(() => false));
+check('the second client also receives broadcast frames',
+  await page.waitForFunction(f0 => window.__mirrorFrames.length > f0, mFrames0, { timeout: 5000 }).then(() => true).catch(() => false));
+// The page's own input still round-trips too (it remained fully live).
+const pFrames1 = await page.evaluate(() => window.fresh.frames);
 await page.keyboard.type('Q');
-check('first socket still functional (input still round-trips)',
-  await page.waitForFunction(s0 => window.fresh.seq > s0, seqR0, { timeout: 5000 }).then(() => true).catch(() => false));
+check('the page socket is still functional (its own input round-trips)',
+  await page.waitForFunction(f0 => window.fresh.frames > f0, pFrames1, { timeout: 5000 }).then(() => true).catch(() => false));
+// Min-viewport resize policy: the shared grid is fit to the SMALLEST client so
+// it fits every window. Have the mirror report a narrower viewport and the
+// page's rendered width must shrink to match (bigger windows letterbox). Keep
+// the mirror's rows equal to the page's so only width changes — leaving the
+// vertical layout (and the later zoom hit-test) undisturbed.
+const sBig = await scene(page); const wBig = sBig.w;
+await page.evaluate(d => window.__mirror.send(JSON.stringify({ type: 'resize', cols: Math.max(20, d.w - 20), rows: d.h })), { w: wBig, h: sBig.h });
+check('a narrower mirror shrinks the shared grid to fit it (min viewport wins)',
+  await page.waitForFunction(w0 => window.fresh.scene.w < w0, wBig, { timeout: 5000 }).then(() => true).catch(() => false),
+  `w was ${wBig}`);
+// Close the extra client so the rest of the suite runs against the page alone;
+// the grid grows back once the small viewport that constrained it is gone.
+await page.evaluate(() => window.__mirror.close());
+check('closing the small mirror grows the grid back (constraint lifted)',
+  await page.waitForFunction(w0 => window.fresh.scene.w >= w0, wBig, { timeout: 5000 }).then(() => true).catch(() => false),
+  `w should return to ${wBig}`);
+check('closing one mirror leaves the page live (session survives a client leaving)',
+  await page.evaluate(() => window.fresh.wsOpen));
 
 console.log('\n[per-region DOM patching: a typing frame rebuilds only its regions]');
 // Have the file explorer open as the heavyweight *unrelated* region.
@@ -637,27 +768,78 @@ await page.waitForTimeout(800);
 const mf1 = await page.evaluate(() => window.fresh.frames);
 check('idle mousemove over an unchanged buffer pushes (almost) no frames', mf1 - mf0 <= 3, `frames ${mf0}->${mf1}`);
 
-console.log('\n[Open File prompt: input line surfaced at the bottom (cell browser stays in the pane)]');
-// Action::Open starts an OpenFile prompt whose file browser is drawn into the
-// PANE cells; the prompt's input line must still project so the web has a path
-// box to type into (the TUI draws it on the bottom prompt row).
+console.log('\n[Open File: a NATIVE file browser card, not a slab of cells]');
+// Action::Open starts an OpenFile prompt. The whole dialog — path, prompt
+// input, nav shortcuts, toggles, sortable headers and the entry rows — is
+// projected semantically (`Editor::file_browser_view`) and rendered as DOM;
+// every click routes back to the cell span the TUI laid that element out at,
+// so the editor stays the only thing that hit-tests.
 await page.keyboard.press('Escape'); await page.waitForTimeout(120);
 await page.request.post(URL + '/action', { data: { action: 'open' } });
-await page.waitForFunction(() => !!window.fresh.scene.regions.palette, { timeout: 5000 }).catch(() => {});
+await page.waitForFunction(() => !!document.querySelector('.palette.filebrowser'), { timeout: 5000 }).catch(() => {});
+await page.waitForFunction(() => ((window.fresh.scene.regions.palette || {}).browser || {}).loading === false, { timeout: 5000 }).catch(() => {});
+const fb = () => page.evaluate(() => JSON.parse(JSON.stringify((window.fresh.scene.regions.palette || {}).browser || null)));
+const b0 = await fb();
+check('Open File projects a semantic file browser', !!b0 && Array.isArray(b0.rows) && b0.rows.length > 0,
+  JSON.stringify(b0 && { path: b0.path, rows: b0.rows.length }));
+check('every interactive element carries its cell span',
+  !!b0 && [...b0.toggles, ...b0.shortcuts, ...b0.columns].every(e => e.w > 0));
+check('file browser is native DOM rows', (await page.locator('.palette.filebrowser .fbrow').count()) >= 1);
+check('NO cells/svg inside the file browser', (await page.locator('.palette.filebrowser svg').count()) === 0);
+check('the native row window matches the editor viewport',
+  (await page.locator('.palette.filebrowser .fbrow').count()) === b0.rows.length);
+// The status bar yields its row to the prompt in the TUI; the web must not
+// draw a stale one under the dialog.
+check('status bar does not project while the prompt owns the row',
+  !(await scene(page)).regions.statusbar);
 await page.keyboard.type('src/');
 await page.waitForFunction(() => (window.fresh.scene.regions.palette || {}).query === 'src/', { timeout: 5000 }).catch(() => {});
-const op = (await scene(page)).regions.palette;
-check('Open File projects a palette (scene.regions.palette non-null)', !!op && op.promptType === 'openfile', JSON.stringify(op && { q: op.query, t: op.promptType }));
-check('Open File input bar shows the typed path', !!op && op.query === 'src/', op && op.query);
-check('Open File has NO native suggestion list (browser is in the pane cells)', !!op && op.listRect == null && op.outerRect == null, JSON.stringify(op && { l: op.listRect, o: op.outerRect }));
-check('Open File renders a native input-only bar', (await page.locator('.palette.input-only .pinput').count()) >= 1);
-check('Open File does NOT render a suggestion list', (await page.locator('.palette .plist').count()) === 0);
-const opBox = await page.locator('.palette').boundingBox();
-const opGridBottom = await page.evaluate(() => { const m = window.fresh.metrics; return m.ay + window.fresh.scene.h * m.ch; });
-check('Open File input bar hugs the bottom of the cell grid (TUI prompt row)', !!opBox && Math.abs((opBox.y + opBox.height) - opGridBottom) <= 3, `bottom=${opBox && (opBox.y + opBox.height)} grid=${opGridBottom}`);
+check('the prompt input inside the card shows the typed path',
+  (await page.locator('.palette.filebrowser .pinput .q').innerText()).includes('src/'));
+check('no cell SVG leaks while the file browser is open', (await cellLeaks()).length === 0,
+  JSON.stringify(await cellLeaks()));
 await page.screenshot({ path: `${SHOTS}/33-openfile-prompt.png` });
+
+// Clicks travel back through the editor's own hit-tests. Clear the typed
+// filter first: filtering re-scores the list, so DOM row N and the row N
+// captured before typing are not the same entry.
+for (let i = 0; i < 4; i++) { await page.keyboard.press('Backspace'); }
+await page.waitForTimeout(300);
+const b1 = await fb();
+const dirIdx = b1.rows.findIndex(r => r.isDir && r.name !== '..');
+if (dirIdx >= 0) {
+  await page.locator('.palette.filebrowser .fbrow').nth(dirIdx).click();
+  await page.waitForTimeout(250);
+  const afterClick = await fb();
+  check('clicking a row selects it in the editor', afterClick.selected === b1.rows[dirIdx].index,
+    `selected=${afterClick.selected} want=${b1.rows[dirIdx].index}`);
+  await page.locator('.palette.filebrowser .fbrow').nth(dirIdx).dblclick();
+  await page.waitForTimeout(400);
+  const afterNav = await fb();
+  check('double-clicking a directory navigates into it',
+    !!afterNav && afterNav.path.endsWith('/' + b1.rows[dirIdx].name),
+    `path=${afterNav && afterNav.path} want .../${b1.rows[dirIdx].name}`);
+}
+await page.locator('.palette.filebrowser .fbcol-size').click();
+await page.waitForTimeout(250);
+check('clicking a column header re-sorts through the editor',
+  (await fb()).columns.find(c => c.name === 'size').active);
+const hidden0 = (await fb()).toggles.find(t => t.name === 'showHidden').active;
+await page.locator('.palette.filebrowser .fbtoggle').first().click();
+await page.waitForTimeout(300);
+check('clicking a checkbox toggles it through the editor',
+  (await fb()).toggles.find(t => t.name === 'showHidden').active === !hidden0);
 await page.keyboard.press('Escape'); await page.waitForTimeout(150);
 check('Escape closed the Open File prompt', !(await scene(page)).regions.palette);
+check('status bar comes back once the prompt releases the row',
+  !!(await scene(page)).regions.statusbar);
+// Save As and Switch Project are the same dialog.
+for (const act of ['save_as', 'switch_project']) {
+  await page.request.post(URL + '/action', { data: { action: act } });
+  await page.waitForTimeout(400);
+  check(`${act} renders the same native card`, (await page.locator('.palette.filebrowser').count()) === 1);
+  await page.keyboard.press('Escape'); await page.waitForTimeout(200);
+}
 // Regression: the normal command palette (Ctrl+P) still renders its list.
 await page.locator('body').click();
 await page.keyboard.press('Control+p');

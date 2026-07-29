@@ -943,9 +943,11 @@ impl Editor {
             }
         }
 
-        // Check if we're still hovering the same position
-        if let Some((old_pos, _, _, _)) = self.active_window_mut().mouse_state.lsp_hover_state {
-            if old_pos == byte_pos {
+        // Check if we're still hovering the same position in the same buffer
+        if let Some((old_pos, _, _, _, old_buf)) =
+            self.active_window_mut().mouse_state.lsp_hover_state
+        {
+            if old_pos == byte_pos && old_buf == buffer_id {
                 // Same position - keep existing state
                 return;
             }
@@ -956,9 +958,11 @@ impl Editor {
             // mouse passed through whitespace between two words (issue #692).
         }
 
-        // Start tracking new hover position
+        // Start tracking new hover position (remembering which buffer the
+        // pointer is over, so the request targets that buffer — not the
+        // active one — see `lsp_hover_state`).
         self.active_window_mut().mouse_state.lsp_hover_state =
-            Some((byte_pos, std::time::Instant::now(), col, row));
+            Some((byte_pos, std::time::Instant::now(), col, row, buffer_id));
         self.active_window_mut().mouse_state.lsp_hover_request_sent = false;
     }
 
@@ -2056,7 +2060,17 @@ impl Editor {
                             self.should_quit = true;
                         }
                     } else if let Some(i) = layout.radios.iter().position(|r| hit(*r)) {
-                        self.confirm_workspace_trust(i);
+                        // Selecting a radio is NOT consent. A click moves the
+                        // selection and leaves the dialog up; [ OK ] commits
+                        // it — the same two-step the keyboard already used
+                        // (`T`/`K`/`B` select, Enter/`O` confirm). Accepting
+                        // on click made "Trust folder & Allow Tooling" a
+                        // one-click grant of full execution rights on a
+                        // security prompt, with no chance to reconsider and
+                        // no way to read the option before committing to it.
+                        // The web UI forwards its radio clicks to this same
+                        // hit-test, so both frontends inherit the fix.
+                        self.set_workspace_trust_selection(i);
                     }
                     // else: click on the dialog body or dimmed backdrop — absorb.
                 }
@@ -2441,6 +2455,14 @@ impl Editor {
             C::Messages => self.handle_action(Action::ShowStatusLog),
             // Owns its own toggle (second click closes the read-only menu).
             C::ReadOnly => self.handle_action(Action::ShowReadOnlyMenu),
+            C::Update => {
+                self.dismiss_menu_popups_for_prompt();
+                self.handle_action(Action::UpdateFresh)
+            }
+            C::RestartTerminal => {
+                self.dismiss_menu_popups_for_prompt();
+                self.handle_action(Action::RestartTerminal)
+            }
         }
     }
 
@@ -2531,48 +2553,25 @@ impl Editor {
     }
 
     fn handle_click_split_controls(&mut self, col: u16, row: u16) -> Option<AnyhowResult<()>> {
-        let close_split_id = self
+        let close_split_hit = self
             .active_layout()
             .close_split_areas
             .iter()
             .find(|(_, btn_row, start_col, end_col)| {
                 row == *btn_row && col >= *start_col && col < *end_col
             })
-            .map(|(split_id, _, _, _)| *split_id);
-        if let Some(split_id) = close_split_id {
-            if let Err(e) = self
-                .windows
-                .get_mut(&self.active_window)
-                .and_then(|w| w.split_manager_mut())
-                .expect("active window must have a populated split layout")
-                .close_split(split_id)
-            {
-                self.set_status_message(
-                    t!("error.cannot_close_split", error = e.to_string()).to_string(),
-                );
-            } else {
-                // Drop the closed split from every terminal's scrollback set.
-                self.active_window_mut()
-                    .forget_split_terminal_modes(split_id);
-                let new_active = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .active_split();
-                if let Some(buffer_id) = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.splits())
-                    .map(|(mgr, _)| mgr)
-                    .expect("active window must have a populated split layout")
-                    .buffer_for_split(new_active)
-                {
-                    self.set_active_buffer(buffer_id);
-                }
-                self.set_status_message(t!("split.closed").to_string());
-            }
+            .map(|(split_id, btn_row, start_col, _)| (*split_id, *btn_row, *start_col));
+        if let Some((split_id, btn_row, start_col)) = close_split_hit {
+            // Closing a split isn't undoable, so don't act on the raw click —
+            // pop a small confirmation just below the `×` button offering
+            // "Close split" / "Cancel". Dismiss any other native menu first so
+            // only one popup is visible.
+            self.active_window_mut().close_context_menus();
+            self.active_window_mut().close_split_menu = Some(super::types::CloseSplitMenu::new(
+                split_id,
+                start_col,
+                btn_row + 1,
+            ));
             return Some(Ok(()));
         }
 
@@ -2626,6 +2625,12 @@ impl Editor {
                 }
                 Err(e) => self.set_status_message(e),
             }
+            // Maximize/restore changed every pane's geometry: reflow through
+            // the single layout funnel, exactly as the keyboard/command
+            // `toggle_maximize_split` does. Without this the mouse path left
+            // every visible terminal at its pre-toggle PTY size and scroll-back
+            // wrap column.
+            self.relayout();
             return Some(Ok(()));
         }
 
@@ -3282,7 +3287,11 @@ impl Editor {
         // The ratio represents the fraction of space the first split gets
         if total_size > 0 {
             let ratio_delta = delta as f32 / total_size as f32;
-            let new_ratio = (start_ratio + ratio_delta).clamp(0.1, 0.9);
+            // Store the raw fraction; the absolute minimum-pane-size guard is
+            // enforced at layout time, so dragging the separator toward the
+            // edge stops when the sibling would drop below the minimum size
+            // rather than at a fixed 10%/90%.
+            let new_ratio = (start_ratio + ratio_delta).clamp(0.0, 1.0);
 
             // Update the split ratio. The container may live in the main
             // split tree or inside a stashed Grouped subtree (buffer group
@@ -3297,7 +3306,11 @@ impl Editor {
                 .get_ratio(split_id.into())
                 .is_some()
             {
-                self.windows
+                // Guarded by the `get_ratio(..).is_some()` check above, so
+                // this id resolves to a resizable Split; the bool result is
+                // not actionable here (the drag can only target a container).
+                let _resized = self
+                    .windows
                     .get_mut(&self.active_window)
                     .and_then(|w| w.split_manager_mut())
                     .expect("active window must have a populated split layout")
@@ -3315,9 +3328,10 @@ impl Editor {
 
     /// Handle right-click event
     pub(super) fn handle_right_click(&mut self, col: u16, row: u16) -> AnyhowResult<()> {
-        // A right-click anywhere dismisses the "+" new-tab popup (it's a
-        // left-click-only menu).
+        // A right-click anywhere dismisses the left-click-only popups (the "+"
+        // new-tab menu and the close-split confirmation).
         self.active_window_mut().new_tab_menu = None;
+        self.active_window_mut().close_split_menu = None;
 
         // Right-click inside the orchestrator dock column → let the plugin
         // raise a per-session context menu. Mirrors the left-click path:
@@ -3579,8 +3593,78 @@ impl Editor {
                     self.execute_file_explorer_context_menu_action(item);
                 }
             }
+            ContextMenuKind::CloseSplit => {
+                let selected = self
+                    .active_window()
+                    .close_split_menu
+                    .as_ref()
+                    .map(|m| (m.highlighted_item(), m.split_id));
+                self.active_window_mut().close_context_menus();
+                if let Some((item, split_id)) = selected {
+                    self.execute_close_split_menu_action(item, split_id);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Execute a close-split confirmation choice. "Cancel" is a no-op (the menu
+    /// was already dismissed by the caller); "Close split" runs the actual
+    /// close.
+    fn execute_close_split_menu_action(
+        &mut self,
+        item: super::types::CloseSplitMenuItem,
+        split_id: LeafId,
+    ) {
+        use super::types::CloseSplitMenuItem;
+        match item {
+            CloseSplitMenuItem::Cancel => {}
+            CloseSplitMenuItem::CloseSplit => self.close_split_confirmed(split_id),
+        }
+    }
+
+    /// Close a split for real (after the confirmation popup). Mirrors the
+    /// keyboard "Close Split" command: close the pane, forget its terminal
+    /// scrollback modes, and refocus whichever split becomes active.
+    fn close_split_confirmed(&mut self, split_id: LeafId) {
+        if let Err(e) = self
+            .windows
+            .get_mut(&self.active_window)
+            .and_then(|w| w.split_manager_mut())
+            .expect("active window must have a populated split layout")
+            .close_split(split_id)
+        {
+            self.set_status_message(
+                t!("error.cannot_close_split", error = e.to_string()).to_string(),
+            );
+            return;
+        }
+        // Drop the closed split from every terminal's scrollback set.
+        self.active_window_mut()
+            .forget_split_terminal_modes(split_id);
+        let new_active = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(mgr, _)| mgr)
+            .expect("active window must have a populated split layout")
+            .active_split();
+        if let Some(buffer_id) = self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.buffers.splits())
+            .map(|(mgr, _)| mgr)
+            .expect("active window must have a populated split layout")
+            .buffer_for_split(new_active)
+        {
+            self.set_active_buffer(buffer_id);
+        }
+        // Closing a split gives its space back to the surviving panes — the
+        // same reflow `close_active_split` runs. `set_active_buffer` above only
+        // resizes terminals when the *newly focused* buffer is one, so the
+        // other surviving panes need the funnel.
+        self.relayout();
+        self.set_status_message(t!("split.closed").to_string());
     }
 
     fn execute_file_explorer_context_menu_action(
@@ -4137,6 +4221,7 @@ impl Editor {
         // Option row → select that index (fires `change`) and close.
         if let Some(hit) = hits.iter().find(|h| in_rect(col, row, h.rect)) {
             let ha = crate::widgets::HitArea {
+                overlay: false,
                 widget_key: key,
                 widget_kind: "dropdown",
                 buffer_row: 0,
@@ -4186,23 +4271,49 @@ impl Editor {
             .map(|f| f.entries.clone())
             .unwrap_or_default();
         let local_screen_col = (col - inner.x) as usize;
-        let bcol = match entries.get(brow as usize) {
-            Some(entry) => crate::primitives::display_width::grapheme_byte_at_visual_column(
-                &entry.text,
-                local_screen_col,
-            ),
-            None => return,
-        };
+        // A row an `Overlay` covers (the dock's "New Task… ▾" / "Move to
+        // Folder…" dropdowns float over the tree without reflowing it) is
+        // DRAWN from the overlay's text, so the click column has to be
+        // mapped through that text — it is what the user is pointing at,
+        // and what the overlay's hit areas were measured against. Mapping
+        // through the row underneath yields a byte offset in a different
+        // string, which is why the dropdown options were unclickable: the
+        // offset never landed inside an option's range.
+        let overlay_text = self.panel(slot).and_then(|f| {
+            f.overlays
+                .iter()
+                .find(|o| o.buffer_row == brow)
+                .map(|o| o.entry.text.clone())
+        });
+        let on_overlay = overlay_text.is_some();
+        let row_text =
+            match overlay_text.or_else(|| entries.get(brow as usize).map(|e| e.text.clone())) {
+                Some(text) => text,
+                None => return,
+            };
+        let bcol = crate::primitives::display_width::grapheme_byte_at_visual_column(
+            &row_text,
+            local_screen_col,
+        );
         // Row-aware resolution: an exact byte hit wins, but a click past a
         // compact list/tree row's text still lands on the row (its body
         // `select`) instead of being dropped — the same rule the
         // right-click context path uses, kept in one place so the two can't
         // drift (they did once: right-click was row-wide, left-click was
         // byte-exact, so compact dock rows ignored left-clicks past the label).
-        let (mut hit_payload, hit_event, hit_key, hit_kind, hit_byte_start) = match self
-            .widget_registry
-            .hit_test_row_aware(slot.buffer_id(), brow, bcol as u32)
-        {
+        //
+        // Over an overlay that rule is off: the popup is opaque, so only its
+        // own hits are reachable and a click that misses every option (its
+        // border, its padding) is swallowed rather than falling through to
+        // the row it hides.
+        let resolved = if on_overlay {
+            self.widget_registry
+                .overlay_hit_test(slot.buffer_id(), brow, bcol as u32)
+        } else {
+            self.widget_registry
+                .hit_test_row_aware(slot.buffer_id(), brow, bcol as u32)
+        };
+        let (mut hit_payload, hit_event, hit_key, hit_kind, hit_byte_start) = match resolved {
             Some((_, hit)) => (
                 hit.payload.clone(),
                 hit.event_type.to_string(),

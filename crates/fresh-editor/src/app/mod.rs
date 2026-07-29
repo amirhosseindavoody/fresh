@@ -172,6 +172,7 @@ pub fn editor_tick(
         needs_render = true;
     }
     editor.active_window_mut().check_diagnostic_pull_timer();
+    editor.check_inlay_hints_timer();
     if editor.check_warning_log() {
         needs_render = true;
     }
@@ -510,8 +511,16 @@ pub struct Editor {
     /// Backend does not render a hardware cursor — always use software cursor indicators.
     software_cursor_only: bool,
 
-    /// Session name for display in status bar (session mode only)
+    /// Name of the *named* daemon whose persistence scope this editor uses
+    /// (`fresh --cmd daemon new NAME`). `None` in direct mode and for an
+    /// unnamed working-directory daemon, which shares the directory's
+    /// workspaces and recovery with a direct-mode run. Not a display field —
+    /// see `session_display_name`.
     session_name: Option<String>,
+
+    /// Status-bar label for a daemon-backed editor: the daemon's name, or the
+    /// working directory for an unnamed one. Cosmetic only.
+    session_display_name: Option<String>,
 
     /// Pending escape sequences to send to client (session mode only)
     /// These get prepended to the next render output
@@ -880,6 +889,14 @@ pub struct Editor {
     /// `last_register`, and the `playing` guard flag).
     // `macros` moved onto `Window`.
 
+    /// Clickable lines per buffer, from `editor.setLineTargets`.
+    ///
+    /// Editor-owned rather than plugin-owned so a view outlives the script
+    /// that built it: a one-shot agent can leave behind an index whose lines
+    /// still open their targets long after it has exited.
+    #[cfg(feature = "plugins")]
+    line_targets: std::collections::HashMap<fresh_core::BufferId, Vec<fresh_core::api::LineTarget>>,
+
     /// Pending plugin action receivers (for async action execution)
     #[cfg(feature = "plugins")]
     pending_plugin_actions: Vec<(
@@ -890,6 +907,22 @@ pub struct Editor {
     /// Flag set by plugin commands that need a render (e.g., RefreshLines)
     #[cfg(feature = "plugins")]
     plugin_render_requested: bool,
+
+    /// Clone of the buffer as it stood at the end of the previous render
+    /// pass. Ratatui's `swap_buffers` resets the "current" buffer, so at
+    /// the start of the next draw `frame.buffer_mut()` is blank rather
+    /// than the previous frame; animations need what the user actually
+    /// saw. Editor-wide, not per-window: only the active window paints,
+    /// so a per-window copy would go stale the moment focus moved, and
+    /// cross-window transitions read it from the *incoming* window.
+    last_rendered_frame: Option<ratatui::buffer::Buffer>,
+
+    /// Plugin commands the mid-render drain refused to run because they
+    /// may only be handled between frames (see
+    /// `Editor::plugin_command_must_run_between_frames`). Drained at the
+    /// very bottom of the same render, once the paint is finished.
+    #[cfg(feature = "plugins")]
+    deferred_plugin_commands: Vec<fresh_core::api::PluginCommand>,
 
     /// Pending chord sequence for multi-key bindings (e.g., C-x C-s in Emacs)
     /// Stores the keys pressed so far in a chord sequence
@@ -988,6 +1021,20 @@ pub struct Editor {
 
     /// Periodic update checker (checks for new releases every hour)
     update_checker: Option<crate::services::release_checker::PeriodicUpdateChecker>,
+
+    /// Lifecycle of an interactive in-editor self-update, reflected by the
+    /// status-bar update indicator (see `SelfUpdatePhase`).
+    self_update_phase: crate::services::release_checker::SelfUpdatePhase,
+
+    /// The local terminal running an interactive self-update, if one is in
+    /// flight — matched against `TerminalExited` to move the indicator to its
+    /// terminal state. `None` once reaped.
+    self_update_terminal: Option<fresh_core::TerminalId>,
+
+    /// The (window, buffer) of the update terminal, so the indicator can switch
+    /// back to it on click. The update always runs locally, so this is a local
+    /// terminal buffer regardless of the window's authority.
+    self_update_output: Option<(fresh_core::WindowId, fresh_core::BufferId)>,
 
     // Terminal subsystem moved onto `Window` (Step 0d). PTYs and
     // their backing files belong to the window that spawned them, so
@@ -3923,6 +3970,60 @@ mod tests {
             })
             .sum();
         assert!(view_state.tab_scroll_offset <= total_width);
+    }
+
+    /// Regression for sinelaw/fresh#2650 (Part 2).
+    ///
+    /// In a vertical split each pane's tab bar is only as wide as the pane,
+    /// but `ensure_active_tab_visible` used to be fed `effective_tabs_width`
+    /// (the whole editor width), so the scroll math ran against ~2x the real
+    /// width. `split_tabs_width` must report the focused split's real pane
+    /// width (minus the split-control button columns, which the tab bar
+    /// reserves) instead — roughly half the editor after a vertical split.
+    #[test]
+    fn split_tabs_width_reports_per_split_pane_width() {
+        let config = Config::default();
+        let (dir_context, _temp) = test_dir_context();
+        let mut editor = Editor::new(
+            config,
+            80,
+            24,
+            dir_context,
+            crate::view::color_support::ColorCapability::TrueColor,
+            test_filesystem(),
+        )
+        .unwrap();
+
+        let full_width = editor.active_window().effective_tabs_width();
+
+        // Split vertically into two side-by-side panes.
+        editor.split_pane_vertical();
+
+        let panes: Vec<(crate::model::event::LeafId, u16)> = editor
+            .split_manager()
+            .get_visible_buffers(editor.active_window().editor_content_area())
+            .into_iter()
+            .map(|(leaf, _buf, area)| (leaf, area.width))
+            .collect();
+        assert_eq!(panes.len(), 2, "vertical split should yield two panes");
+
+        // Two side-by-side splits show the maximize + close buttons, so the tab
+        // bar reserves those columns; split_tabs_width reflects that.
+        let reserve = crate::view::ui::tabs::split_control_reserve(true, true);
+        for (leaf, pane_width) in &panes {
+            let w = editor.active_window().split_tabs_width(*leaf);
+            assert_eq!(
+                w,
+                pane_width.saturating_sub(reserve),
+                "split_tabs_width must equal the pane's real width minus the control-button reserve"
+            );
+            assert!(
+                w < full_width,
+                "each pane width ({}) must be narrower than the whole editor ({})",
+                w,
+                full_width
+            );
+        }
     }
 
     /// Regression for sinelaw/fresh#2229.

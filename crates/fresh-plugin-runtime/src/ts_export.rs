@@ -23,9 +23,9 @@ use fresh_core::api::{
     GrepMatch, JsDiagnostic, JsPosition, JsRange, JsTextPropertyEntry, KeyEventPayload,
     LanguagePackConfig, LayoutHints, LspServerPackConfig, OverlayColorSpec, OverlayOptions,
     PluginAnimationEdge, PluginAnimationKind, ProcessLimitsPackConfig, RemoteBackendInfo,
-    ReplaceResult, ScreenSize, SearchTakeResult, SpawnResult, SplitSnapshot, TerminalResult,
-    TextPropertiesAtCursor, TokenColor, TsHighlightSpan, ViewTokenStyle, ViewTokenWire,
-    ViewTokenWireKind, ViewportInfo, VirtualBufferResult, WindowInfo,
+    ReplaceResult, ScreenSize, ScrollbarMarker, SearchTakeResult, SpawnResult, SplitSnapshot,
+    TerminalResult, TextPropertiesAtCursor, TokenColor, TsHighlightSpan, ViewTokenStyle,
+    ViewTokenWire, ViewTokenWireKind, ViewportInfo, VirtualBufferResult, WindowInfo,
 };
 use fresh_core::command::Suggestion;
 use fresh_core::file_explorer::{
@@ -57,6 +57,13 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "ScreenSize" => Some(ScreenSize::decl(&cfg)),
         "KeyEventPayload" => Some(KeyEventPayload::decl(&cfg)),
         "SplitSnapshot" => Some(SplitSnapshot::decl(&cfg)),
+        "SplitCreated" => Some(fresh_core::api::SplitCreated::decl(&cfg)),
+        "SplitWindowOptions" => Some(fresh_core::api::SplitWindowOptions::decl(&cfg)),
+        "SplitAxis" => Some(fresh_core::api::SplitAxis::decl(&cfg)),
+        "SplitPlacement" => Some(fresh_core::api::SplitPlacement::decl(&cfg)),
+        "LineTarget" => Some(fresh_core::api::LineTarget::decl(&cfg)),
+        "PaneDescription" => Some(fresh_core::api::PaneDescription::decl(&cfg)),
+        "WorkspaceDescription" => Some(fresh_core::api::WorkspaceDescription::decl(&cfg)),
         "ActionSpec" => Some(ActionSpec::decl(&cfg)),
         "BufferSavedDiff" => Some(BufferSavedDiff::decl(&cfg)),
         "LayoutHints" => Some(LayoutHints::decl(&cfg)),
@@ -149,6 +156,7 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         // Overlay/inline styling types
         "OverlayOptions" => Some(OverlayOptions::decl(&cfg)),
         "OverlayColorSpec" => Some(OverlayColorSpec::decl(&cfg)),
+        "ScrollbarMarker" => Some(ScrollbarMarker::decl(&cfg)),
         "InlineOverlay" => Some(InlineOverlay::decl(&cfg)),
         "OffsetUnit" => Some(fresh_core::text_property::OffsetUnit::decl(&cfg)),
         "StyledSegment" => Some(fresh_core::text_property::StyledSegment::decl(&cfg)),
@@ -332,6 +340,13 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "ScreenSize",                      // Used by editor.getScreenSize()
     "KeyEventPayload",                 // Used by editor.getNextKey()
     "SplitSnapshot",                   // Used by editor.listSplits()
+    "SplitCreated",                    // Resolved by editor.splitWindow()
+    "SplitWindowOptions",              // Options for editor.splitWindow()
+    "SplitAxis",                       // SplitWindowOptions.direction
+    "SplitPlacement",                  // SplitWindowOptions.place
+    "LineTarget",                      // Used by editor.setLineTargets()
+    "PaneDescription",                 // Part of WorkspaceDescription
+    "WorkspaceDescription",            // Returned by editor.describeWorkspace()
     "LayoutHints",                     // Used by plugins for view transforms
     "ViewTokenWire",                   // Used by plugins for view transforms
     "ViewTokenWireKind",               // Used by ViewTokenWire
@@ -539,6 +554,19 @@ interface HookEventMap {
   focus_gained: Record<string, never>;
   authority_changed: { label: string };
   trust_changed: { level: "trusted" | "restricted" | "blocked" };
+  /**
+   * The effective config changed — the user saved from the Settings UI,
+   * or the config was reloaded from disk. Payload-free by design:
+   * re-read what you care about with `editor.getPluginConfig()` /
+   * `editor.getConfig()`, both of which already reflect the new values
+   * when the handler runs.
+   *
+   * Any plugin that caches a `defineConfigX` value (rather than reading
+   * it at point of use) should subscribe, or its setting will appear to
+   * do nothing until the editor restarts. Does not fire for the
+   * plugin's own `editor.setSetting(...)` writes.
+   */
+  config_changed: Record<string, never>;
 
   // ── buffer lifecycle ─────────────────────────────────────────────────────
   buffer_activated: { buffer_id: number };
@@ -630,6 +658,14 @@ interface HookEventMap {
   // ── commands ─────────────────────────────────────────────────────────────
   pre_command: { action: string | Record<string, unknown> };
   post_command: { action: string | Record<string, unknown> };
+  /**
+   * NOT EMITTED. Declared here historically, but nothing in the editor ever
+   * fires it: `editor.on("idle", ...)` registers successfully and the handler
+   * is never called. Listed so that its absence is documented rather than
+   * discovered — do not build on it. For "run something later", drive it from
+   * an event that does fire (`cursor_moved`, `buffer_changed`) or from your
+   * own `spawnProcess` timer.
+   */
   idle: { milliseconds: number };
   resize: { width: number; height: number };
 

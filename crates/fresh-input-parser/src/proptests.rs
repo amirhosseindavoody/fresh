@@ -72,9 +72,13 @@ proptest! {
 
     /// A well-formed **SGR mouse** report parses to exactly one mouse event with
     /// the right 0-indexed coordinates, at every split point, with no leak.
+    ///
+    /// `Cb` stops at 127: bit 7 selects xterm's buttons 8-15, which have no
+    /// `MouseEventKind` counterpart and are deliberately dropped. That range is
+    /// covered by `high_button_reports_are_dropped_without_leaking`.
     #[test]
     fn wellformed_sgr_mouse_parses_at_any_split(
-        cb in 0u16..=255, cx in 1u16..=4000, cy in 1u16..=4000,
+        cb in 0u16..=127, cx in 1u16..=4000, cy in 1u16..=4000,
         press in any::<bool>(), cut in 0usize..64,
     ) {
         let final_byte = if press { 'M' } else { 'm' };
@@ -94,9 +98,12 @@ proptest! {
     /// A well-formed **X10 mouse** report (three coordinate bytes, each a valid
     /// `value + 32` byte `>= 0x20`) parses to exactly one mouse event at every
     /// split point, with no structural leak.
+    ///
+    /// The button byte stops at 0x9f for the same reason `Cb` stops at 127 in
+    /// the SGR property above: `0xa0` is where bit 7 — buttons 8-15 — starts.
     #[test]
     fn wellformed_x10_mouse_parses_at_any_split(
-        b0 in 0x20u8..=0xff, b1 in 0x20u8..=0xff, b2 in 0x20u8..=0xff,
+        b0 in 0x20u8..=0x9f, b1 in 0x20u8..=0xff, b2 in 0x20u8..=0xff,
         cut in 0usize..8,
     ) {
         let seq = [0x1b, b'[', b'M', b0, b1, b2];
@@ -107,6 +114,31 @@ proptest! {
 
         prop_assert_eq!(structural_char_leaks(&ev), 0, "leak: {:?}", ev);
         prop_assert_eq!(mouse_events(&ev).len(), 1, "expected 1 mouse event, got {:?}", ev);
+    }
+
+    /// **Unrepresentable buttons are dropped, never leaked.** Bit 7 of `Cb`
+    /// selects xterm's buttons 8-15, which `MouseEventKind` cannot express, so
+    /// both encodings must swallow the report whole rather than alias it onto
+    /// Left/Middle/Right (or, with bit 6 also set, onto the wheel). Emitting no
+    /// event must not weaken the #2745 invariant, which holds for *every* `Cb`:
+    /// the report's bytes are still consumed, at every split point.
+    #[test]
+    fn high_button_reports_are_dropped_without_leaking(
+        cb in 128u16..=255, cx in 1u16..=4000, cy in 1u16..=4000,
+        b0 in 0xa0u8..=0xff, b1 in 0x20u8..=0xff, b2 in 0x20u8..=0xff,
+        cut in 0usize..64,
+    ) {
+        let sgr = format!("\x1b[<{cb};{cx};{cy}M").into_bytes();
+        let x10 = vec![0x1b, b'[', b'M', b0, b1, b2];
+        for seq in [sgr, x10] {
+            let cut = cut % (seq.len() + 1);
+            let mut p = InputParser::new();
+            let mut ev = p.parse(&seq[..cut]);
+            ev.extend(p.parse(&seq[cut..]));
+
+            prop_assert_eq!(structural_char_leaks(&ev), 0, "leak: {:?} (seq {:02x?})", ev, seq);
+            prop_assert_eq!(mouse_events(&ev).len(), 0, "expected no mouse event, got {:?}", ev);
+        }
     }
 
     /// Ground-state **printable ASCII text** (no `ESC`) passes through 1:1 — one
@@ -133,7 +165,7 @@ proptest! {
     #[test]
     fn truncated_x10_then_sgr_resyncs(
         prefix_coords in proptest::collection::vec(0x20u8..=0xff, 0..3),
-        cb in 0u16..=255, cx in 1u16..=4000, cy in 1u16..=4000, cut in 0usize..64,
+        cb in 0u16..=127, cx in 1u16..=4000, cy in 1u16..=4000, cut in 0usize..64,
     ) {
         let mut seq = vec![0x1b, b'[', b'M'];
         seq.extend_from_slice(&prefix_coords); // 0..=2 coord bytes: truncated
@@ -164,7 +196,7 @@ proptest! {
     fn sgr_mouse_amid_esc_free_noise(
         pre in proptest::collection::vec(0x20u8..=0x7e, 0..64),
         post in proptest::collection::vec(0x20u8..=0x7e, 0..64),
-        cb in 0u16..=255, cx in 1u16..=4000, cy in 1u16..=4000,
+        cb in 0u16..=127, cx in 1u16..=4000, cy in 1u16..=4000,
     ) {
         let mut seq = pre.clone();
         seq.extend_from_slice(format!("\x1b[<{cb};{cx};{cy}M").as_bytes());
@@ -184,6 +216,52 @@ proptest! {
         }
         for (e, &b) in ev[pre.len() + 1..].iter().zip(post.iter()) {
             prop_assert_eq!(e, &Event::Key(KeyEvent::new(KeyCode::Char(b as char), KeyModifiers::empty())));
+        }
+    }
+
+    /// **String-type sequences never leak.** A DCS/OSC/APC/PM/SOS string with an
+    /// arbitrary ESC-free body, terminated by `ST` or `BEL`, must be consumed
+    /// whole — producing no key events — at every split point. This is the §5.1
+    /// invariant for the string states.
+    #[test]
+    fn string_sequences_are_swallowed_at_any_split(
+        introducer in prop::sample::select(vec![b'P', b']', b'_', b'^', b'X']),
+        body in proptest::collection::vec(0x20u8..=0x7e, 0..64),
+        bel in any::<bool>(),
+        cut in 0usize..80,
+    ) {
+        let mut seq = vec![0x1b, introducer];
+        seq.extend_from_slice(&body);
+        if bel {
+            seq.push(0x07); // BEL terminator
+        } else {
+            seq.extend_from_slice(b"\x1b\\"); // ST terminator
+        }
+        let cut = cut % (seq.len() + 1);
+        let mut p = InputParser::new();
+        let mut ev = p.parse(&seq[..cut]);
+        ev.extend(p.parse(&seq[cut..]));
+        let key_events = ev.iter().filter(|e| matches!(e, Event::Key(_))).count();
+        prop_assert_eq!(key_events, 0, "string leaked keys: {:?} (seq {:02x?})", ev, seq);
+    }
+
+    /// **No Private Use Area codepoint ever becomes a `Char` key.** For any
+    /// CSI-u codepoint in the PUA range (U+E000–U+F8FF), the result is either a
+    /// non-`Char` functional key or nothing — never an invisible PUA glyph
+    /// inserted into the buffer. This is the §5.1 invariant for kitty keys.
+    #[test]
+    fn pua_codepoints_never_become_char_keys(cp in 0xe000u32..=0xf8ff) {
+        let seq = format!("\x1b[{cp}u").into_bytes();
+        let ev = InputParser::new().parse(&seq);
+        for e in &ev {
+            if let Event::Key(ke) = e {
+                if let KeyCode::Char(c) = ke.code {
+                    prop_assert!(
+                        !('\u{e000}'..='\u{f8ff}').contains(&c),
+                        "cp {} produced PUA char {:?}", cp, c
+                    );
+                }
+            }
         }
     }
 }

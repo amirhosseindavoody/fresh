@@ -79,6 +79,74 @@ pub struct TerminalLinkHover {
     pub cols: std::ops::Range<usize>,
 }
 
+/// A terminal whose process quit while its buffer stayed open as read-only
+/// scrollback, keyed by `BufferId` in [`Window::exited_terminals`].
+///
+/// The exit path drops the buffer↔terminal binding and closes the PTY handle,
+/// so every input a respawn needs — geometry, cwd, backing/log files, launch
+/// and agent-resume argv — is snapshotted here *before* that teardown. That
+/// makes [`Window::restart_terminal_buffer`] a pure function of this record,
+/// exactly like a workspace restore is a pure function of the persisted
+/// terminal entry.
+#[derive(Debug, Clone)]
+pub struct ExitedTerminal {
+    /// The PTY session that died. Kept for the status message and so a
+    /// second exit for the same id can be recognised as stale.
+    pub terminal_id: crate::services::terminal::TerminalId,
+    /// Wait-status exit code, when the platform reported one.
+    pub exit_code: Option<i32>,
+    /// Geometry of the dead PTY, so the reborn one matches its split.
+    pub cols: u16,
+    pub rows: u16,
+    /// Working directory the dead PTY ran in.
+    pub cwd: Option<PathBuf>,
+    /// Scrollback/log files to keep appending to, so a restart continues the
+    /// transcript rather than starting blank.
+    pub backing_path: Option<PathBuf>,
+    pub log_path: Option<PathBuf>,
+    /// Launch argv (`Window::terminal_commands`), absent for a plain shell.
+    pub command: Option<Vec<String>>,
+    /// Agent-resume argv (`Window::terminal_resume_commands`) — the argv that
+    /// rejoins the agent's conversation (`claude --resume <id>`) instead of
+    /// starting a fresh one. Absent for non-agent terminals.
+    pub resume: Option<Vec<String>>,
+    /// Whether the dead terminal was ephemeral (plugin/Orchestrator-created).
+    pub ephemeral: bool,
+    /// The tab title as it read *before* the exit marker was appended, so a
+    /// restart can put it back. `None` for an auto-named tab, which re-derives
+    /// its name from the reborn process.
+    pub title: Option<String>,
+}
+
+impl ExitedTerminal {
+    /// Short name of the process that died — the basename of the resume or
+    /// launch argv's program (`claude`, `codex`, …), or `None` for a terminal
+    /// that was just the user's shell.
+    pub fn program_name(&self) -> Option<&str> {
+        // An *empty* resume vector is the plain-shell restore marker, not a
+        // rejoinable agent — fall through to the launch command rather than
+        // reporting no program at all.
+        self.resume
+            .as_ref()
+            .filter(|argv| !argv.is_empty())
+            .or(self.command.as_ref())
+            .and_then(|argv| argv.first())
+            .map(|program| {
+                program
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(program.as_str())
+            })
+    }
+
+    /// Whether restarting this terminal rejoins an agent conversation (as
+    /// opposed to re-running the launch command or opening a plain shell).
+    pub fn resumes_agent(&self) -> bool {
+        self.resume.as_ref().is_some_and(|argv| !argv.is_empty())
+    }
+}
+
 /// Per-terminal-buffer editor state, keyed by `BufferId` in
 /// [`Window::terminal_buffers`]. PTY I/O lives in the `TerminalManager`; the
 /// byte-stream backing files stay keyed by `TerminalId`.
@@ -260,6 +328,13 @@ pub struct Window {
     /// because undo history is buffer-scoped — closing a window
     /// drops the buffer and its log together.
     pub event_logs: HashMap<BufferId, crate::model::event::EventLog>,
+
+    /// File buffers restored as **empty placeholders** because this window's
+    /// authority is remote: reading their content synchronously during restore
+    /// would freeze the single-threaded editor loop over a slow link. The editor
+    /// drains this each tick, reads each file off-loop, and fills the buffer via
+    /// `AsyncMessage::RemoteBufferContentLoaded`. Always empty for local windows.
+    pub(crate) pending_content_load: Vec<(BufferId, PathBuf)>,
 
     /// Status message (shown in this window's status bar). Per-window
     /// because each window has its own context — a save in window A
@@ -821,6 +896,15 @@ pub struct Window {
     pub terminal_resume_commands:
         std::collections::HashMap<crate::services::terminal::TerminalId, Vec<String>>,
 
+    /// Terminals whose process has quit while their buffer stayed open,
+    /// keyed by that buffer. Everything needed to respawn the same process
+    /// in place lives in the record, so a restart doesn't depend on the
+    /// terminal-id-keyed maps surviving the teardown. Populated by
+    /// `handle_terminal_exited`, consumed by
+    /// [`Window::restart_terminal_buffer`], and dropped when the buffer
+    /// closes or comes back live.
+    pub exited_terminals: HashMap<BufferId, ExitedTerminal>,
+
     /// Plugin-development workspace per buffer (temp dir + LSP
     /// configuration for plugin buffers). Buffer-keyed and buffers
     /// are per-window, so the workspace map follows.
@@ -884,6 +968,10 @@ pub struct Window {
 
     /// File-explorer context menu state (right-click in the explorer).
     pub file_explorer_context_menu: Option<crate::app::types::FileExplorerContextMenu>,
+
+    /// Close-split confirmation popup state (left-click on a split tab bar's
+    /// `×` button). Offers "Close split" / "Cancel".
+    pub close_split_menu: Option<crate::app::types::CloseSplitMenu>,
 
     /// Theme inspector popup (Ctrl+Right-Click) anchored in this window.
     pub theme_info_popup: Option<crate::app::types::ThemeInfoPopup>,
@@ -1089,6 +1177,9 @@ impl Window {
         if let Some(m) = &self.tab_context_menu {
             return Some((ContextMenuKind::Tab, &m.menu));
         }
+        if let Some(m) = &self.close_split_menu {
+            return Some((ContextMenuKind::CloseSplit, &m.menu));
+        }
         None
     }
 
@@ -1108,6 +1199,9 @@ impl Window {
             return Some(&mut m.menu);
         }
         if let Some(m) = self.tab_context_menu.as_mut() {
+            return Some(&mut m.menu);
+        }
+        if let Some(m) = self.close_split_menu.as_mut() {
             return Some(&mut m.menu);
         }
         None
@@ -1141,6 +1235,13 @@ impl Window {
                 .iter()
                 .map(|i| i.label())
                 .collect(),
+            ContextMenuKind::CloseSplit => self
+                .close_split_menu
+                .as_ref()?
+                .items()
+                .iter()
+                .map(|i| i.label())
+                .collect(),
         })
     }
 
@@ -1150,6 +1251,7 @@ impl Window {
         self.tab_context_menu = None;
         self.new_tab_menu = None;
         self.file_explorer_context_menu = None;
+        self.close_split_menu = None;
     }
 
     /// Apply LSP folding ranges to the named buffer's `folding_ranges`
@@ -1724,14 +1826,21 @@ impl Window {
     }
 
     /// Configure `leaf_id`'s viewport for a terminal-buffer
-    /// scrollback view: disable line wrap, clear any pending
-    /// skip-ensure-visible flag, then scroll so the buffer's primary
-    /// cursor (positioned at end-of-buffer when entering scrollback)
-    /// is visible. No-op if the buffer or split is missing.
+    /// scrollback view: enable grid wrap (exact-column rows at the PTY
+    /// width, fresh#2649), clear any pending skip-ensure-visible flag,
+    /// then scroll so the buffer's primary cursor (positioned at
+    /// end-of-buffer when entering scrollback) is visible. No-op if the
+    /// buffer or split is missing.
     pub fn enter_terminal_scrollback_view(&mut self, buffer_id: BufferId, leaf_id: LeafId) {
+        let grid_cols = self.terminal_grid_cols(buffer_id);
         self.buffers
             .with_buffer_and_split(buffer_id, leaf_id, |state, view_state| {
-                view_state.viewport.line_wrap_enabled = false;
+                view_state.viewport.line_wrap_enabled = true;
+                view_state.viewport.grid_wrap = true;
+                view_state.viewport.wrap_indent = false;
+                if let Some(cols) = grid_cols {
+                    view_state.viewport.wrap_column = Some(cols);
+                }
                 view_state.viewport.clear_skip_ensure_visible();
                 view_state.ensure_cursor_visible(&mut state.buffer, &state.marker_list);
             });
@@ -1767,7 +1876,13 @@ impl Window {
                         let buf_state = vs.ensure_buffer_state(buffer_id);
                         buf_state.show_line_numbers = false;
                         buf_state.highlight_current_line = false;
-                        buf_state.viewport.line_wrap_enabled = false;
+                        // Grid wrap (fresh#2649): restored scroll-back lays
+                        // out at the grid width like the live view. The
+                        // width is filled in by `enforce_terminal_grid_wrap`
+                        // once the respawned PTY reports its size.
+                        buf_state.viewport.line_wrap_enabled = true;
+                        buf_state.viewport.grid_wrap = true;
+                        buf_state.viewport.wrap_indent = false;
                     }
                 }
                 state.buffer.set_modified(false);
@@ -1989,6 +2104,7 @@ impl Window {
             panel_ids: HashMap::new(),
             buffers: WindowBuffers::new(),
             buffer_metadata: HashMap::new(),
+            pending_content_load: Vec::new(),
             terminal_manager: crate::services::terminal::TerminalManager::new(id),
             terminal_buffers: HashMap::new(),
             terminal_backing_files: HashMap::new(),
@@ -2104,6 +2220,7 @@ impl Window {
             ephemeral_terminals: std::collections::HashSet::new(),
             terminal_commands: std::collections::HashMap::new(),
             terminal_resume_commands: std::collections::HashMap::new(),
+            exited_terminals: HashMap::new(),
             plugin_dev_workspaces: HashMap::new(),
             status_bar_values: HashMap::new(),
             mouse_state: crate::app::types::MouseState::default(),
@@ -2125,6 +2242,7 @@ impl Window {
             tab_context_menu: None,
             new_tab_menu: None,
             file_explorer_context_menu: None,
+            close_split_menu: None,
             theme_info_popup: None,
             event_debug: None,
             file_open_state: None,
@@ -2292,6 +2410,42 @@ impl Window {
         }
     }
 
+    /// Width of the tab bar for a *specific* split.
+    ///
+    /// [`effective_tabs_width`](Self::effective_tabs_width) returns the whole
+    /// editor-content width; but in a vertical split each pane's tab strip is
+    /// only as wide as that pane (`tabs_rect.width == split_area.width`).
+    /// Feeding the full width to the tab-scroll math makes a half-width split
+    /// scroll against ~2x its real width, so it under-scrolls and the ">"
+    /// overflow indicator disagrees with what's visible. This returns the
+    /// focused split's real pane width, falling back to
+    /// [`effective_tabs_width`](Self::effective_tabs_width) when the split
+    /// isn't in the current visible layout (e.g. hidden behind a maximized
+    /// sibling).
+    pub fn split_tabs_width(&self, split_id: LeafId) -> u16 {
+        match self.buffers.splits() {
+            Some((mgr, _)) => {
+                let visible = mgr.get_visible_buffers(self.editor_content_area());
+                let Some((_, _, area)) = visible.iter().find(|(id, _, _)| *id == split_id) else {
+                    return self.effective_tabs_width();
+                };
+                // The split-control (maximize / close) buttons are painted over
+                // the right edge of the tab row; reserve their columns here so
+                // the scroll math measures against the same width the tab bar
+                // actually lays tabs into (fresh#2768). Mirror the show-flags in
+                // `render_split_tab_bar`.
+                let has_multiple_splits = visible.len() > 1;
+                let is_maximized = mgr.is_maximized();
+                let show_maximize = has_multiple_splits || is_maximized;
+                let show_close = has_multiple_splits && !is_maximized;
+                let reserve =
+                    crate::view::ui::tabs::split_control_reserve(show_maximize, show_close);
+                area.width.saturating_sub(reserve)
+            }
+            None => self.effective_tabs_width(),
+        }
+    }
+
     /// The split id whose `SplitViewState` owns the currently-focused
     /// cursors/viewport for this window.
     #[inline]
@@ -2449,24 +2603,46 @@ impl Window {
         self.terminal_buffer(buffer_id).is_some()
     }
 
-    /// Terminal buffers never line-wrap (see `resolve_line_wrap_for_buffer`):
-    /// their content is column-formatted, and wrapping a large scrollback turns
-    /// the scrollbar's visual-row index into an O(all-lines) scan every frame,
-    /// freezing the UI (fresh#2608). Heal any per-buffer viewport a global
-    /// line-wrap toggle (or restored state) left enabled — cheap enough to run
-    /// each frame, and a no-op when the window has no terminals.
-    pub(crate) fn enforce_terminal_no_wrap(&mut self) {
-        let terminals = &self.terminal_buffers;
-        if terminals.is_empty() {
+    /// Terminal buffers always line-wrap in *grid* mode (see
+    /// `resolve_line_wrap_for_buffer`): exact-column rows at the PTY grid
+    /// width so scroll-back lays out identically to the live grid
+    /// (fresh#2649). Heal any per-buffer viewport a global line-wrap
+    /// toggle (or restored state) left in another mode — cheap enough to
+    /// run each frame, and a no-op when the window has no terminals.
+    ///
+    /// `wrap_column` (the grid width) is only *filled in* when missing —
+    /// scroll-back entry (`sync_terminal_to_buffer`) sets the capture-time
+    /// width, which must win over the instantaneous PTY width (a split
+    /// that entered scroll-back reserves a scrollbar column, so the PTY
+    /// may be resized one column narrower afterwards while the captured
+    /// content still lays out at the width it was captured at).
+    /// When the *pane* changes width the authority is
+    /// `resize_visible_terminals`, which re-pins it to the new pane width
+    /// on the same funnel that pushes the PTY size.
+    pub(crate) fn enforce_terminal_grid_wrap(&mut self) {
+        if self.terminal_buffers.is_empty() {
             return;
         }
+        // Snapshot grid widths first — `terminal_grid_cols` borrows self
+        // immutably while the healing loop needs the view states mutably.
+        let cols_by_buffer: std::collections::HashMap<BufferId, Option<usize>> = self
+            .terminal_buffers
+            .keys()
+            .map(|&b| (b, self.terminal_grid_cols(b)))
+            .collect();
         let Some(vs_map) = self.buffers.split_view_states_mut() else {
             return;
         };
         for vs in vs_map.values_mut() {
             for (buffer_id, buffer_state) in vs.keyed_states.iter_mut() {
-                if terminals.contains_key(buffer_id) {
-                    buffer_state.viewport.line_wrap_enabled = false;
+                if let Some(cols) = cols_by_buffer.get(buffer_id) {
+                    let vp = &mut buffer_state.viewport;
+                    vp.line_wrap_enabled = true;
+                    vp.grid_wrap = true;
+                    vp.wrap_indent = false;
+                    if vp.wrap_column.is_none() {
+                        vp.wrap_column = *cols;
+                    }
                 }
             }
         }
@@ -2494,6 +2670,45 @@ impl Window {
         buffer_id: BufferId,
     ) -> Option<crate::services::terminal::TerminalId> {
         self.terminal_buffer(buffer_id).map(|tb| tb.terminal_id)
+    }
+
+    /// The current tab title of the terminal with `terminal_id` in this
+    /// window — the same combined foreground-process + OSC-title string that
+    /// [`Self::sync_terminal_titles`] paints on the tab. `None` when no
+    /// terminal buffer in this window owns that id.
+    ///
+    /// Computed live from the foreground-name cache + the terminal's current
+    /// OSC title (via the shared [`combine_terminal_title`]), rather than the
+    /// buffer's `display_name`, because `display_name` is only refreshed
+    /// during render — so at `terminal_output` time it can lag a frame behind
+    /// a title the program just set. An explicitly-titled tab (plugin/command
+    /// named) keeps that stored name.
+    ///
+    /// This is the readback the `terminal_output` hook ships to plugins so
+    /// they can name a workspace after whatever the terminal is running
+    /// (Orchestrator's terminal-tracking workspace names).
+    pub(crate) fn terminal_tab_title(
+        &self,
+        terminal_id: crate::services::terminal::TerminalId,
+    ) -> Option<String> {
+        let buffer_id = self
+            .terminal_buffers
+            .iter()
+            .find(|(_, tb)| tb.terminal_id == terminal_id)
+            .map(|(bid, _)| *bid)?;
+        if self.terminal_explicit_titles.contains(&buffer_id) {
+            return self
+                .buffer_metadata
+                .get(&buffer_id)
+                .map(|meta| meta.display_name.clone());
+        }
+        let pty = self.terminal_fg_cache.get(&buffer_id).cloned();
+        let osc = self.terminal_manager.get(terminal_id).and_then(|handle| {
+            let raw = handle.state.lock().ok()?.title().to_string();
+            let sanitized = crate::services::terminal_title::sanitize_title(&raw);
+            (!sanitized.is_empty()).then_some(sanitized)
+        });
+        crate::app::terminal::combine_terminal_title(pty.as_deref(), osc.as_deref())
     }
 
     /// Whether `split` is viewing terminal `buffer_id` in read-only scrollback.
@@ -3094,7 +3309,7 @@ impl Window {
 
         // Load from canonical path (for I/O and dedup), detect language from
         // display path (for glob pattern matching against user-visible names).
-        let buffer = crate::model::buffer::Buffer::load_from_file(
+        let buffer = crate::model::buffer::Buffer::load_from_file_for_editing(
             &canonical_path,
             self.config().editor.large_file_threshold_bytes as usize,
             std::sync::Arc::clone(&self.resources.local_filesystem),
@@ -3967,3 +4182,64 @@ impl Window {
 // assertion isn't worth the maintenance, and the same behaviour is
 // already exercised by every `EditorTestHarness::create` path that
 // names a window.
+
+#[cfg(test)]
+mod exited_terminal_tests {
+    use super::ExitedTerminal;
+    use crate::services::terminal::TerminalId;
+
+    fn record(command: Option<&[&str]>, resume: Option<&[&str]>) -> ExitedTerminal {
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        ExitedTerminal {
+            terminal_id: TerminalId(0),
+            exit_code: Some(0),
+            cols: 80,
+            rows: 24,
+            cwd: None,
+            backing_path: None,
+            log_path: None,
+            command: command.map(argv),
+            resume: resume.map(argv),
+            ephemeral: true,
+            title: None,
+        }
+    }
+
+    /// The status-bar indicator names the program that died. The resume argv
+    /// wins over the launch command — that's the process a restart will
+    /// actually run, so it's the one the user is being offered.
+    #[test]
+    fn program_name_prefers_the_resume_argv() {
+        let e = record(
+            Some(&["/opt/bin/claude", "--session-id", "x"]),
+            Some(&["/opt/bin/claude", "--resume", "x"]),
+        );
+        assert_eq!(e.program_name(), Some("claude"));
+        assert!(e.resumes_agent());
+    }
+
+    /// With no resume spec the launch command names the indicator, and the
+    /// wording drops to "restart" rather than "resume".
+    #[test]
+    fn program_name_falls_back_to_the_launch_command() {
+        let e = record(Some(&["npm", "run", "dev"]), None);
+        assert_eq!(e.program_name(), Some("npm"));
+        assert!(!e.resumes_agent());
+    }
+
+    /// A plain shell has no program to name — the indicator says "terminal".
+    #[test]
+    fn a_plain_shell_has_no_program_name() {
+        assert_eq!(record(None, None).program_name(), None);
+    }
+
+    /// An empty resume vector is the "plain shell" restore marker, not a
+    /// rejoinable agent — treating it as one would render "Resume" for a
+    /// terminal that has nothing to resume.
+    #[test]
+    fn an_empty_resume_argv_is_not_an_agent() {
+        let e = record(Some(&["bash"]), Some(&[]));
+        assert!(!e.resumes_agent());
+        assert_eq!(e.program_name(), Some("bash"));
+    }
+}

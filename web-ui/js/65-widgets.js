@@ -810,6 +810,73 @@ function contextMenuEl(cm){
   return el;
 }
 
+// Float the dock's toolbar dropdowns (New Task… / project filter / Move to
+// folder…) over the panel content instead of letting them reflow the session
+// list. Each `overlay()` widget is a flex child of the dock column; flexbox
+// would place an absolutely-positioned flex child at the column's TOP (its
+// static position is the flex start, not its in-flow spot), so we can't lean
+// on `top:auto`. Instead we pin each overlay to the top of the row that took
+// its place in flow — its next in-flow sibling's `offsetTop` — which is
+// exactly where the dropdown belongs: New-Task under its toolbar row, the
+// project menu under its button, Move-to-folder at the head of the tree.
+function layoutDockOverlays(surface){
+  const col=surface.querySelector(":scope > .w-col");
+  if(!col) return;
+  const overlays=[...col.querySelectorAll(":scope > .w-overlay")];
+  if(!overlays.length) return;
+  // Take every overlay OUT of flow first, so the rows below it collapse up to
+  // their true positions. Measuring `next.offsetTop` while the overlay is
+  // still in flow would read the row shoved down by the overlay's own height,
+  // dropping the menu far below where it belongs.
+  overlays.forEach(ov=>{
+    ov.style.position="absolute";
+    ov.style.left="0"; ov.style.right="0";
+    ov.style.margin="0"; ov.style.top="0";
+  });
+  // Now pin each to where it belongs. The New-Task create menu hangs off its
+  // button: its toolbar row also holds the search field (which wraps below
+  // the button on a narrow dock), so anchoring to the next sibling would drop
+  // a gap — the search field — between the button and its dropdown. Anchor it
+  // to the button's bottom instead. The project and Move-to-folder menus have
+  // no such split, so they pin to the top of the row that took their place in
+  // flow (project under its button, Move at the head of the session tree).
+  overlays.forEach(ov=>{
+    const prev=ov.previousElementSibling, next=ov.nextElementSibling;
+    let top;
+    if(prev && prev.classList.contains("w-row") && prev.classList.contains("wrap")){
+      const btn=prev.querySelector(".w-button");
+      top=btn ? btn.offsetTop+btn.offsetHeight : (next ? next.offsetTop : 0);
+    } else {
+      top=next ? next.offsetTop : 0;
+    }
+    ov.style.top=top+"px";
+  });
+}
+
+// Outside-click dismiss for the dock dropdowns. They carry no scrim (a dock
+// is not a modal), so without this a click outside the open menu leaves it
+// stranded. A press outside an open dock overlay sends Escape, which the host
+// translates to `dock_menu_cancel` while the menu owns the keyboard (same
+// dismissal the anchored context-menu scrim uses). Attached once.
+//
+// Clicks on a dock *button* (the "New Task… ▾" trigger, the project pill, …)
+// are LET THROUGH untouched: the plugin's own handler toggles/closes the menu
+// (clicking the open trigger must close it, not be swallowed here). Only
+// clicks on inert space — the tree, the editor, empty chrome — dismiss.
+let dockOverlayDismissWired=false;
+function wireDockOverlayDismiss(){
+  if(dockOverlayDismissWired) return;
+  dockOverlayDismissWired=true;
+  document.addEventListener("mousedown",e=>{
+    const open=document.querySelector(".widget-surface.w-dock > .w-col > .w-overlay");
+    if(!open) return;
+    if(open.contains(e.target)) return;                       // option click → runs normally
+    if(e.target.closest(".widget-surface.w-dock .w-button")) return; // trigger button → plugin toggles it
+    e.preventDefault(); e.stopPropagation();
+    sendKey({key:"Escape"});
+  },true);
+}
+
 // A floating / dock plugin widget panel, rendered natively at its cell rect.
 // Returns [scrim?, panel]: a `floatingModal` is a blocking dialog, so it gets a
 // dimming `.modal-scrim` behind it (same pattern as the trust / settings /
@@ -885,7 +952,24 @@ function widgetSurfaceEls(s){
   el.appendChild(widgetEl(s.spec, ctx));
   // A left dock's rightmost column is an editor resize border (dock_resizing);
   // give it an explicit grip since the .widget-surface is in onChrome.
-  if(s.kind==="dock") el.appendChild(borderDragHandle(s.rect.x + s.rect.w - 1, s.rect.y, s.rect.h));
+  if(s.kind==="dock"){
+    const grip=borderDragHandle(s.rect.x + s.rect.w - 1, s.rect.y, s.rect.h);
+    // A shell-inset dock's visual card is NARROWER than its logical cell rect
+    // (the bezel gap on the right). The grip is placed at the logical edge, so
+    // it would jut past the card and give the panel a phantom horizontal
+    // scroll region (an "empty" strip you can scroll to). Pin it to the card's
+    // own right edge instead; the drag still forwards the logical resize col.
+    if(!isMobile() && s.rect.x===0 && shellTheme()){
+      grip.style.left=(Math.max(140, px(s.rect.w,CW)-SHELL.side-SHELL.gap)-px(1,CW))+"px";
+    }
+    el.appendChild(grip);
+    // Position the dock dropdowns after layout (offsetTop needs the panel in
+    // the document) and arm outside-click dismissal.
+    if(!isMobile()){
+      wireDockOverlayDismiss();
+      requestAnimationFrame(()=>layoutDockOverlays(el));
+    }
+  }
   out.push(el);
   return out;
 }

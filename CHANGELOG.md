@@ -1,16 +1,69 @@
 # Release Notes
 
-## Unreleased
+## 0.4.5
+
+For live updates on Fresh, [follow me on X](https://x.com/TheNoamLewis).
+
+> Most options below can be changed in the **Settings UI** - run **Open Settings** from the command palette (`Ctrl+P`).
+
+### Terminal input parsing was rewritten
+
+Keyboard and mouse input is now parsed by our own `fresh-input-parser` crate instead of crossterm, to work around crossterm limitations that caused real bugs: dropped modified F1-F4 keys (`Shift+F3` did nothing, #699), unchecked mouse-coordinate math (a crash, #2732), and desyncing on input split across reads (mouse sequences leaking into terminals, #2745). This touches core input handling broadly, so if anything feels off with keyboard or mouse input, please report it.
 
 ### Features
 
-* **`Run Agent…` command — start a coding agent from anywhere** - a new command-palette command opens a compact picker to launch any of the starting processes the New-Workspace dialogue offers (a bare terminal or an agent: `claude`, `codex`, `opencode`, `aider`) without the full dialogue. Choose whether it runs in your **current workspace** (a terminal in the window you're already in, alongside your open buffers — no new worktree) or a **new workspace** (a fresh worktree + window), toggle auto mode, and optionally hand it a first prompt; the picker remembers your last choice. Either way the launch reuses the dialogue's exact logic — session-id pinning, auto-mode flags, Fresh-CLI system-prompt injection, the `FRESH_CMD_TOKEN` capability, and environment — so an agent started this way is indistinguishable from a dialogue-launched one.
+* **Option for in-editor self-update** - update Fresh from the status-bar indicator, or via `fresh --cmd update`. Detects your install method and runs the appropriate, platform specific, update command.
+* **Syntax highlighting inside embedded code blocks** - a fenced code block in a Markdown file (e.g. ```` ```rust ```` ) now highlights with that language's own grammar instead of one flat color; the same mechanism also fixes Vue's `<script>`/`<style>` blocks (#2689, requested by @asukaminato0721).
+* **Better Bazel/Starlark highlighting** - functions, operators, punctuation, and built-ins are now highlighted, and `.bazel`/`MODULE.bazel` files are recognized (contributed by @asukaminato0721).
+* **More graphics, documentation, and build-file highlighting** - GLSL `.glslf`/`.glslv` shaders, Wavefront `.obj` meshes, Doxygen `.dox`/`.doxy` docs and `Doxyfile.in` templates, Windows resource `.rc` scripts, pkg-config `.pc`/`.pc.in` metadata, `.cmake.in` templates, and `CMakeCache.txt` files are now recognized and highlighted.
+* **Broader LaTeX ecosystem highlighting** - LaTeX templates, TeX packages/classes and documented sources, generated `.aux`/`.toc` files, BibLaTeX and ConTeXt files, BibTeX databases and `.bst` styles, plus `latexmkrc` files now use their appropriate grammars.
+* **Orchestrator: agents & workspaces**
+  * **`Run Agent…` command** launches a terminal or a coding agent (`claude`, `codex`, `opencode`, `aider`) in your current workspace or a new one, without the full New Workspace dialog.
+  * **Non-blocking workspace creation** - creating a workspace no longer freezes the editor; choose **Create & Visit** or **Create in Background** and keep working while it comes up.
+  * **The dock's start-up state is now configurable** - Settings → **Plugin: orchestrator** has four new options: open the dock automatically on startup (off by default, and it opens unfocused so typing still goes to the editor), the layout it opens with (**card** or **compact**), and the starting state of the **all worktrees** and **show empty** checkboxes. They're defaults, not locks: the dock's own view button and checkboxes still win for the rest of the session, and an edit applies the next time you open the dock — no restart.
+* **Restart an exited terminal in place** - when a terminal's process quits, the status bar offers a clickable `⟳ Restart terminal` (or `⟳ Resume claude`, named after whatever was running, with the exit code when it's non-zero). Click it, run **Restart Terminal Process** from the command palette, or use **View → Terminal → Restart Terminal Process**, and the process comes back in the *same* buffer below the existing scrollback — no new terminal, no lost place. A coding agent with a resume spec rejoins its conversation rather than starting over, exactly as it does when you reopen the editor. Works for plain shells and commands too; a *running* terminal is never restarted. The offer survives quitting the editor — the pane comes back with its transcript and the indicator, deliberately still stopped rather than silently re-running.
+  * A terminal's exit is **no longer written into the output** as a `[Terminal process exited]` line, which cost a row and scrolled the top of the final screen out of view — often the first, most important line of an agent's last answer. The tab reads `claude (exited)` instead, and the dead terminal is left exactly on its last frame.
+  * **Terminal tab names now survive an editor restart** — a restored agent tab stays named `claude` instead of falling back to `bash` / `*Terminal 1*`.
+  * **Run Agent… and New Workspace are now one dialog.** A "Launch in" switch at the top chooses the current workspace or a new one; picking a new one reveals the backend tabs, Project Path, Workspace Name and the Advanced fold, and picking the current one hides them, leaving just the agent controls. Both palette commands open the same form — they only differ in where the switch starts.
+  * Fixes the **`custom…` agent when running in the current workspace**, which had nowhere to type a command: the Agent Command box lives under the workspace-shaped Advanced fold, which that shape doesn't have, so picking `custom…` left the form claiming an agent you couldn't name — and dropped focus back to the top, where the next arrow key silently switched **Launch in** to *New workspace*. The box is now inline whenever there's no fold to hold it.
+  * Fixes **Run Agent… → current workspace**, which recorded neither the launch nor the resume argv: that agent used to vanish from the saved workspace entirely, and restarting it produced a bare shell instead of the agent. It now behaves exactly like an agent started in its own new workspace.
+* **Classic Mac (CR) line endings** are now fully supported (#2736, requested by @720720).
+* **`.editorconfig` support** - `indent_style`/`indent_size`/`tab_width` are picked up automatically (#959, requested by @nyurik).
+* **Save All** - save every modified buffer at once from the File menu (#2289, requested by @alspaughb).
 * **Pixi install from source** - add a root `pixi.toml` workspace and a `crates/fresh-editor` package that uses `pixi-build-rust`, so you can `pixi install` / `pixi run fresh` from a checkout.
 
 ### Bug Fixes
 
-* **Codex "Auto mode" now actually engages** - the checkbox previously passed `--full-auto`, which recent Codex CLI rejects outright (the flag was removed from the root command). Auto mode now launches Codex with `--sandbox workspace-write --ask-for-approval never` — its self-approving posture inside the workspace-write sandbox — on both launch and resume.
-* **Full redraw on terminal resize / focus** - dragging a terminal window between monitors (notably Windows Terminal over SSH, where a DPI change can wipe the alt-screen without changing cell count) no longer leaves a solid purple/blue fill. Resize and FocusGained request a clear+repaint (with short deferred retries for late host wipes), focus events are enabled in direct mode, and missed SIGWINCH is detected by polling host size (#2723).
+* **Orchestrator & dock**
+  * Codex "Auto mode" works again (it was passing a flag recent Codex CLI rejects).
+  * Dock rows are fully clickable in compact (list) view, ordered by recency, and auto-name themselves from their terminal.
+  * Fixed a crash when navigating to an unreachable remote workspace.
+  * Searching the dock and then opening one of the matches no longer wipes the search — the filtered list is still there when you come back for the next one. Leaving the dock (`Esc`, clicking the editor) still clears it.
+  * **Settings opens over the dock**, not beside it - the Settings dialog (and the keybinding editor) now centres on the whole screen and dims the dock along with everything else, instead of being squeezed into the columns right of the dock and leaving it bright, as if it were still live.
+  * **Tidier workspace cards** - a card is now two rows instead of three: name with its git summary flush right, then the branch with the PR badge flush right. The branch starts at the card's left edge rather than floating mid-row, the empty third row is gone, and a branch that just repeats the workspace name gives its place to the project.
+* **Terminal**
+  * Scrollback no longer loses output or gets stuck mid-scroll (#2649, reported by @dmknght).
+  * **Full redraw on terminal resize / focus** - dragging a terminal window between monitors (notably Windows Terminal over SSH, where a DPI change can wipe the alt-screen without changing cell count) no longer leaves a solid purple/blue fill. Resize and FocusGained request a clear+repaint (with short deferred retries for late host wipes), focus events are enabled in direct mode, and missed SIGWINCH is detected by polling host size (#2723).
+* **Tabs & splits**
+  * A long filename no longer hides other tabs, and per-split scrolling is fixed (#2650, reported by @dmknght).
+  * Closing a split now asks for confirmation first.
+  * Closing the last editor tab no longer swallows the Utility Dock into the main tab bar (#2283, reported by @lizdeika).
+  * Plugin split APIs (`setSplitRatio`, `openFileInSplit`) no longer crash or silently no-op on an invalid split (#2769, #2770, #2783, reported by @RetributionByRevenue).
+* **LSP**
+  * Hover now merges results from every configured server instead of only the first (#2635, reported by @hkngoc).
+  * Fixed hover occasionally showing another buffer's content (#2572, reported by @asukaminato0721).
+  * Inlay hints now refresh after an edit instead of freezing (#2744, reported by @P1C4550).
+* **Misc**
+  * On-save actions no longer desync from disk on rapid saves (#2711, #2706, reported by @720720).
+  * Settings' Theme dropdown lists every installed theme (#2738, reported by @720720).
+  * Fixed a spurious devcontainer parse error on startup (#2709, reported by @720720).
+  * The ruler now draws past the last written line (#2631, reported by @akarinotomoshibi).
+  * Edit menu's "Replace..." is now correctly labeled "Query Replace..." (#2135).
+
+### Internals
+
+* Split the monolithic plugin-dispatch and update/release-checking code into focused modules, alongside a round of flaky-e2e-test stabilization.
+
 
 ## 0.4.4
 
@@ -30,7 +83,6 @@ For live updates on Fresh, [follow me on X](https://x.com/TheNoamLewis).
 * **More languages highlighted** - new grammars for gettext PO, m4, Xcode pbxproj, Metal, CUDA, HIP, Fortran, LLVM IR, and MLIR (#2593), plus fixed GLSL/HLSL/WGSL highlighting (#2553); both by @asukaminato0721.
 * **`NextPane` / `PrevPane`** - cycle through every split+tab pane as one flat list, distinct from `NextSplit`/`PrevSplit` and `NextWindow`/`PrevWindow`; landing on a terminal now also switches it into terminal mode (#2562, by @masmu).
 * **Orchestrator dock: organize workspaces into custom folders** - create/rename/delete folders and move workspaces between them ("Move to Folder…" via the context menu, `F2`, right-click, or the palette); the layout survives a crash. The toolbar is condensed to a "New Task…" dropdown and a search field, with other filters in a collapsible section (#2703).
-* **Non-blocking workspace creation** - creating a workspace from **Orchestrator: New Workspace** no longer freezes the editor behind a modal "Creating…/Connecting…" dialog. The form now offers two submit buttons — **Create & Visit** (focus follows into the new workspace once it is ready) and **Create in Background** (stay put on your current workspace) — and in both cases the new workspace appears immediately in the dock with its own scoped status (`Creating…` for a local worktree, `Connecting…` for a remote SSH/Kubernetes host that may not be reachable yet), and you can keep working or switch to other workspaces while it comes up. A failed create becomes an error row you can retry or dismiss from the row's context menu, and a workspace still being created when the editor quits is restored (paused, one keystroke to resume) on the next launch. A remote host that requires an interactive password (or key passphrase) now fails cleanly into that error row instead of silently wedging the UI — previously the underlying `ssh` grabbed the editor's terminal to prompt where no answer could reach it, painting over the screen and scrambling keystrokes.
 * **Search in Project: file filter** - a new **Files** field limits project search & replace to comma-separated globs like `*.rs` or `src/**` (#2699, by @asukaminato0721).
 
 ### Bug Fixes
@@ -54,7 +106,6 @@ For live updates on Fresh, [follow me on X](https://x.com/TheNoamLewis).
 * **File Explorer fixes**: the context menu now grabs the keyboard while open, so keys no longer leak into the tree underneath (#2587); and git decorations now cover nested sub-repos even when the workspace root is itself a git repo (#2592).
 * **Git Grep no-match is reported as "No matches"**, not an error (#2591).
 * **Orchestrator remembers workspaces after a crash** and shows "Cancel" instead of "Quit" on the trust prompt (#2658).
-* **Orchestrator dock: the whole row is clickable in compact (list) view** - left-clicking a session row past the end of its (short) label now selects and dives into it, instead of doing nothing; the empty space to the right of the text is part of the row, matching card view and the right-click menu. Every click path now shares one row-aware hit resolver so left- and right-click can't drift apart.
 * **Command palette names no longer truncate at the start** - the name column sizes to the longest visible name; only an overlong name is trimmed, at its tail (#2703).
 * **Compose mode: cursor movement no longer lags in large files** - arrow keys used to re-run wrapping and concealment over the whole buffer on every keypress.
 * **Per-language settings now apply everywhere** - language-dependent buffer settings (tab size, auto-close, whitespace indicators, word characters, etc.) were applied inconsistently depending on how a buffer was created, and didn't refresh when a buffer's language changed. They now resolve uniformly and re-apply on any language change.

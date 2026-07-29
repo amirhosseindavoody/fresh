@@ -13,9 +13,11 @@ the core; each frontend only renders it.
 - **Chrome is native DOM/CSS**, rendered from the editor's **semantic
   projections** in `crates/fresh-editor/src/view/scene.rs` (`Editor::menu_view()`,
   `tab_bar_view()`, `status_view()`, `palette_view()`, `popups_view()`,
-  `file_explorer_view()`, `trust_dialog_view()`, `widgets_view()`,
-  `context_menu_view()`, `keybinding_editor_view()`, `settings_view()`): menu bar
-  + dropdowns, tabs, status bar, command palette, popups, file explorer, trust
+  `file_explorer_view()`, `file_browser_view()`, `trust_dialog_view()`,
+  `widgets_view()`, `context_menu_view()`, `keybinding_editor_view()`,
+  `settings_view()`): menu bar
+  + dropdowns, tabs, status bar, command palette, popups, file explorer, the
+  Open File / Save As / Switch Project browser, trust
   dialog, context menus, plugin widgets/dock, the keybinding editor and the full
   Settings modal.
 - **Buffer interior is SVG** — the pipeline's real, syntax-highlighted cells. The
@@ -108,7 +110,7 @@ Pick a numeric prefix that places a new file where its concern belongs; gaps
 | `20-cells.js` | icon set, cell-grid SVG renderer, TUI theme → CSS variables |
 | `30-render.js` | per-region DOM patching, motion (FX), `render()` |
 | `40-menu.js` / `45-tabs.js` / `55-status.js` | native chrome builders |
-| `50-palette.js` | palette / picker / prompts + file-browser band |
+| `50-palette.js` | palette / picker / prompts + the native file browser |
 | `60-popups.js` | native popups |
 | `65-widgets.js` | plugin widget tree + Settings / keybinding editor / aux modals |
 | `70-panels.js` | trust dialog, file explorer, border drag handles |
@@ -190,8 +192,19 @@ a client) and pushes a `frame` of **region diffs** only when the scene
 changed — typing resends only the changed pane, an idle editor sends nothing,
 and the frontend rebuilds only the DOM region containers whose paths changed
 (per-region patching, docs §3.4).
-One client at a time (a second `/ws` gets `409`; foreign `Origin` gets `403`);
-on disconnect the page retries with backoff and resyncs from the next hello.
+**Many clients, one editor (shared-view mirroring).** Every `/ws` upgrade joins
+the session — a second tab, another device, or the page you load after a server
+restart all connect and stay live (a stale/half-open tab can no longer lock out
+a new page, the old first-come-`409` failure mode). The scene is built once per
+tick and pushed to each client as its own region diff; input is accepted from
+all of them and applied to the one editor. Because the clients have different
+window sizes but there is one grid, the render is fit to the **smallest**
+client's viewport (`effective_size`) so it fits every window — bigger windows
+letterbox. A liveness heartbeat (ping every 15 s, reap after 45 s of silence;
+browsers auto-pong) reaps a half-open peer so it can't linger or pin the grid to
+a dead small window's size. A foreign `Origin` still gets `403`; on disconnect
+the page retries with backoff and resyncs from the next hello. Independent
+per-client cursors/viewports are the deeper §3.7 work, still PLANNED.
 The frontend's input rides the WebSocket, but every HTTP route still answers as
 before (full scene): `GET /` (page), `GET /state` (used by the frontend's manual
 `refresh()` resync, `run.sh`'s readiness poll, and curl), and the `POST` input
@@ -215,6 +228,22 @@ cargo run --release --features web -p fresh-editor -- \
 # then open http://127.0.0.1:8137  and type — edits go through the real editor.
 ```
 
+`--web` runs the ordinary **session daemon** with the bridge inside it, so the
+browser is not the only way in — in the same directory:
+
+```sh
+fresh -a          # attach a terminal to the session the browser is looking at
+```
+
+is one editor with two transports: type in the terminal and the browser shows
+it, type in the browser and the terminal shows it. Closing the tab or detaching
+the terminal (`Ctrl-b d`-style detach) leaves the session running for the other.
+The rendered grid fits the smallest connected viewport, so a large window
+letterboxes rather than showing a grid the small one can't display. Sessions are
+keyed by working directory unless you name one with `--session-name NAME`; if a
+session is already live where you run `--web`, it says so instead of shadowing
+it.
+
 For interactive use serve a **release** build — the debug scene render dominates
 the key→frame round-trip (see docs/internal/web-ui.md §3.1 for the measured
 debug vs release numbers). A debug build works for development iteration too
@@ -237,8 +266,11 @@ buffer interior is the pipeline's real syntax-highlighted cells while all chrome
 is native HTML (no cell-drawn chrome), that key / mouse / menu / palette /
 settings / widget interactions run through the real `Editor` (over the
 WebSocket input path), and that the push transport behaves: server-pushed
-frames without page input, region diffs on typing, idle silence, and the
-single-client 409 — plus per-region DOM patching (a typing frame rebuilds
+frames without page input, region diffs on typing, idle silence, and
+shared-view mirroring (a second WebSocket joins and gets its own hello, both
+clients receive broadcast frames from either one's input, and the shared grid
+shrinks to the smallest client's viewport then grows back when it leaves) —
+plus per-region DOM patching (a typing frame rebuilds
 only its pane), measured metrics + app zoom (Ctrl+= / Ctrl+0, hit-testing
 while zoomed), touch pan/tap in a `hasTouch` mobile context, and the
 selection model: a drag on a live terminal grid becomes a real editor
@@ -248,7 +280,7 @@ native browser selection over the SVG grid. It also drives the **web-theme
 switch** (Cosmos ↔ macOS Light ↔ macOS Dark ↔ Compact): the body class, the bezel/title-bar swap,
 the buffer staying monospace under a proportional chrome font, the denser
 Compact grid, `localStorage` persistence, and the switcher menu.
-**149 assertions** across the chrome surfaces, plus screenshots.
+**171 assertions** across the chrome surfaces, plus screenshots.
 
 One command runs the whole thing — build the bridge, install the Playwright
 deps (`test/package.json`) on first use, start the server, run the suite,

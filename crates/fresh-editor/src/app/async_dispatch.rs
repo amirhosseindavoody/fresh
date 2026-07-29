@@ -97,6 +97,12 @@ impl Editor {
         // reconnect notification and posts `RemoteReconnected`.
         self.ensure_remote_reconnect_forwarders();
 
+        // Kick off off-loop content loads for any freshly-restored remote
+        // placeholder buffers (idempotent; drains each window's queue). This is
+        // what makes a dived-into remote session's files fill in without ever
+        // reading them on the editor loop.
+        self.drive_pending_content_loads();
+
         let Some(bridge) = &self.async_bridge else {
             return false;
         };
@@ -382,6 +388,12 @@ impl Editor {
                     terminal,
                     exit_code,
                 } => {
+                    // If this is the interactive self-update terminal, move the
+                    // status-bar indicator to its terminal state (success = exit 0).
+                    if self.self_update_terminal == Some(terminal.terminal) {
+                        self.finish_self_update(exit_code == Some(0));
+                        self.self_update_terminal = None;
+                    }
                     self.handle_terminal_exited(terminal, exit_code);
                 }
 
@@ -405,6 +417,13 @@ impl Editor {
                 }
                 AsyncMessage::RemoteReconnected { connection_id } => {
                     self.handle_remote_reconnected(connection_id);
+                }
+                AsyncMessage::RemoteBufferContentLoaded {
+                    window_id,
+                    buffer_id,
+                    content,
+                } => {
+                    self.handle_remote_buffer_content_loaded(window_id, buffer_id, content);
                 }
                 AsyncMessage::RemoteAttachFailed {
                     error,
@@ -802,12 +821,32 @@ impl Editor {
             .and_then(|w| w.terminal_manager.get(terminal_id))
             .and_then(|handle| handle.state.lock().ok().map(|s| s.last_visible_line()))
             .unwrap_or_default();
+        // The terminal's current tab title, so a plugin can name a workspace
+        // after whatever it's running. The auto-numbered default
+        // (`*Terminal N*`) carries no signal, so pass it through as empty and
+        // let the plugin fall back to its own naming.
+        let terminal_title = self
+            .windows
+            .get(&owner)
+            .and_then(|w| w.terminal_tab_title(terminal_id))
+            .filter(|t| !(t.starts_with("*Terminal ") && t.ends_with('*')))
+            .unwrap_or_default();
+        // The program's explicit activity marker (OSC 133 / OSC 9;4), if it
+        // emits one — lets a plugin drive the working/idle dot off a real
+        // signal instead of output timing.
+        let osc_activity = self
+            .windows
+            .get(&owner)
+            .and_then(|w| w.terminal_manager.get(terminal_id))
+            .and_then(|handle| handle.state.lock().ok().and_then(|s| s.osc_activity()));
         self.plugin_manager.read().unwrap().run_hook(
             "terminal_output",
             crate::services::plugins::hooks::HookArgs::TerminalOutput {
                 terminal_id: terminal_id.0 as u64,
                 window_id: owner.0,
                 last_line,
+                terminal_title,
+                osc_activity,
             },
         );
     }
@@ -894,6 +933,97 @@ impl Editor {
     /// channel id and a fresh forwarder; the old forwarder parks forever on a
     /// notify that can no longer fire (its channel is dropped) — a single idle
     /// task per rebuild, which is rare. Cleaning those up is a future refinement.
+    /// Start off-loop content reads for any window's freshly-restored remote
+    /// placeholder buffers, delivering each via `RemoteBufferContentLoaded`.
+    /// Idempotent: it drains each window's `pending_content_load`, so a buffer
+    /// is scheduled exactly once. Runs the blocking `read_file` on a plain
+    /// thread (never a runtime worker — the remote read uses `block_on`), so a
+    /// slow link never touches the editor loop.
+    fn drive_pending_content_loads(&mut self) {
+        if self.async_bridge.is_none() {
+            return;
+        }
+        type Job = (
+            fresh_core::WindowId,
+            fresh_core::BufferId,
+            std::path::PathBuf,
+            std::sync::Arc<dyn crate::model::filesystem::FileSystem + Send + Sync>,
+        );
+        let mut jobs: Vec<Job> = Vec::new();
+        for (wid, window) in self.windows.iter_mut() {
+            if window.pending_content_load.is_empty() {
+                continue;
+            }
+            let fs = std::sync::Arc::clone(&window.authority().filesystem);
+            for (bid, path) in window.pending_content_load.drain(..) {
+                jobs.push((*wid, bid, path, std::sync::Arc::clone(&fs)));
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        let sender = self.async_bridge.as_ref().unwrap().sender();
+        for (window_id, buffer_id, path, fs) in jobs {
+            let sender = sender.clone();
+            std::thread::Builder::new()
+                .name("remote-buffer-load".to_string())
+                .spawn(move || {
+                    let content = fs.read_file(&path).map_err(|e| e.to_string());
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = sender.send(AsyncMessage::RemoteBufferContentLoaded {
+                        window_id,
+                        buffer_id,
+                        content,
+                    });
+                })
+                .ok();
+        }
+    }
+
+    /// Install content read off-loop into a remote session's placeholder buffer
+    /// (see `drive_pending_content_loads`). Skips a buffer that has since closed
+    /// or that the user already edited, so a late load never clobbers input.
+    fn handle_remote_buffer_content_loaded(
+        &mut self,
+        window_id: fresh_core::WindowId,
+        buffer_id: fresh_core::BufferId,
+        content: Result<Vec<u8>, String>,
+    ) {
+        let content = match content {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("remote buffer {buffer_id:?} content load failed: {e}");
+                return;
+            }
+        };
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        let (modified, path) = {
+            let Some(state) = window.buffers.get(&buffer_id) else {
+                return;
+            };
+            (
+                state.buffer.is_modified(),
+                state.buffer.file_path().map(|p| p.to_path_buf()),
+            )
+        };
+        if modified {
+            return;
+        }
+        let Some(path) = path else {
+            return;
+        };
+        // Build the buffer from the off-loop content, then run the *same*
+        // finalize the synchronous open path runs — so an async-filled remote
+        // buffer is identical to a normally-opened one (LSP didOpen, read-only,
+        // editorconfig, metadata). The only difference is the content arrived
+        // from a background read. For a remote session the path is already the
+        // canonical remote path, so it doubles as display / canonical here.
+        let state = window.build_workspace_file_state(&path, Some(content));
+        window.finalize_file_buffer(buffer_id, state, &path, &path, &path, true);
+    }
+
     fn ensure_remote_reconnect_forwarders(&mut self) {
         let (Some(runtime), Some(bridge)) =
             (self.tokio_runtime.as_ref(), self.async_bridge.as_ref())
@@ -985,6 +1115,43 @@ impl Editor {
         self.reattach_window(window_id);
     }
 
+    /// Snapshot a just-exited terminal into the record `restart_terminal_buffer`
+    /// replays from. Reads the live handle for geometry/cwd (valid only until
+    /// `terminal_manager.close`) and the terminal-id-keyed maps for the
+    /// scrollback files and launch/resume argv.
+    fn exited_terminal_record(
+        &self,
+        terminal_id: crate::services::terminal::TerminalId,
+        exit_code: Option<i32>,
+    ) -> crate::app::window::ExitedTerminal {
+        let window = self.active_window();
+        let handle = window.terminal_manager.get(terminal_id);
+        let (cols, rows) = handle
+            .map(|h| h.size())
+            .unwrap_or_else(|| window.get_terminal_dimensions());
+        crate::app::window::ExitedTerminal {
+            terminal_id,
+            exit_code,
+            cols,
+            rows,
+            cwd: handle.and_then(|h| h.cwd()),
+            backing_path: window.terminal_backing_files.get(&terminal_id).cloned(),
+            log_path: window.terminal_log_files.get(&terminal_id).cloned(),
+            command: window
+                .terminal_commands
+                .get(&terminal_id)
+                .filter(|argv| !argv.is_empty())
+                .cloned(),
+            resume: window
+                .terminal_resume_commands
+                .get(&terminal_id)
+                .filter(|argv| !argv.is_empty())
+                .cloned(),
+            ephemeral: window.ephemeral_terminals.contains(&terminal_id),
+            title: None,
+        }
+    }
+
     fn handle_terminal_exited(
         &mut self,
         terminal: fresh_core::WindowTerminalId,
@@ -1056,63 +1223,18 @@ impl Editor {
                     crate::input::keybindings::KeyContext::Normal;
             }
 
-            // Sync terminal content to buffer (final screen state)
+            // Sync terminal content to buffer (final screen state). This pins
+            // the viewport to the start of the visible screen, so the dead
+            // terminal is pixel-identical to its last live frame.
+            //
+            // Nothing is appended after it, deliberately. This used to write a
+            // "[Terminal process exited]" line into the backing file and then
+            // scroll past the pin to reveal it — which pushed the top of the
+            // screen out of view, and the first line of an agent's last answer
+            // is often the part you wanted. The exit is reported on the tab
+            // title and by the status-bar restart indicator instead, neither of
+            // which costs a row of output.
             self.active_window_mut().sync_terminal_to_buffer(buffer_id);
-
-            // Append exit message to the backing file and reload
-            let exit_msg = "\n[Terminal process exited]\n";
-
-            if let Some(backing_path) = self
-                .active_window()
-                .terminal_backing_files
-                .get(&terminal_id)
-                .cloned()
-            {
-                if let Ok(mut file) =
-                    crate::app::terminal::terminal_backing_fs().open_file_for_append(&backing_path)
-                {
-                    use std::io::Write;
-                    if let Err(e) = file.write_all(exit_msg.as_bytes()) {
-                        tracing::warn!("Failed to write terminal exit message: {}", e);
-                    }
-                }
-
-                // Force reload buffer from file to pick up the exit message
-                if let Err(e) = self.revert_buffer_by_id(buffer_id, &backing_path) {
-                    tracing::warn!("Failed to revert terminal buffer: {}", e);
-                }
-
-                // After revert, scroll the viewport so the just-
-                // appended exit message is visible. sync_terminal_to_buffer
-                // pinned the viewport to the start of the visible screen
-                // (so exit is pixel-identical to the last live frame); the
-                // exit message is appended *after* that pinned region,
-                // so we have to deliberately scroll past the pin to bring
-                // it on-screen. Move the cursor to the new end-of-buffer
-                // and clear the skip_ensure_visible flag the sync path
-                // armed; the next render's ensure_visible will then scroll
-                // the cursor (and the exit-message line above it) into
-                // view.
-                let new_total = self
-                    .windows
-                    .get(&self.active_window)
-                    .and_then(|w| w.buffers.get(&buffer_id))
-                    .map(|s| s.buffer.total_bytes())
-                    .unwrap_or(0);
-                if let Some((mgr, view_states)) = self
-                    .windows
-                    .get_mut(&self.active_window)
-                    .map(|w| &mut w.buffers)
-                    .expect("active window present")
-                    .splits_mut()
-                {
-                    let active_split = mgr.active_split();
-                    if let Some(view_state) = view_states.get_mut(&active_split) {
-                        view_state.cursors.primary_mut().position = new_total;
-                        view_state.viewport.clear_skip_ensure_visible();
-                    }
-                }
-            }
 
             // Ensure buffer remains read-only with no line numbers
             if let Some(state) = self
@@ -1132,6 +1254,31 @@ impl Editor {
             // reconnect to respawn in place (see above).
             if !preserve_for_reconnect {
                 self.active_window_mut().terminal_buffers.remove(&buffer_id);
+                // Snapshot everything a restart needs *before* the handle is
+                // closed below, so the buffer can be brought back live in
+                // place (palette command / status-bar indicator) with the
+                // same argv precedence a workspace restore would use. The
+                // reconnect path doesn't need this: it keeps the binding and
+                // respawns from the still-intact terminal-id-keyed maps.
+                let mut record = self.exited_terminal_record(terminal_id, exit_code);
+                // Report the exit on the tab instead of in the output. An
+                // explicitly-titled tab (an agent, a named plugin terminal)
+                // keeps its name with a marker appended; an auto-named one has
+                // no live process left to read a name from, so it gets the
+                // marker on its current name and stops being auto-updated
+                // (`sync_terminal_titles` only walks live `terminal_buffers`).
+                let window = self.active_window_mut();
+                record.title = window
+                    .terminal_explicit_titles
+                    .contains(&buffer_id)
+                    .then(|| window.buffer_metadata.get(&buffer_id))
+                    .flatten()
+                    .map(|meta| meta.display_name.clone());
+                if let Some(meta) = window.buffer_metadata.get_mut(&buffer_id) {
+                    meta.display_name =
+                        t!("terminal.tab_exited", name = meta.display_name).to_string();
+                }
+                window.exited_terminals.insert(buffer_id, record);
             }
 
             self.set_status_message(t!("terminal.exited", id = terminal_id.0).to_string());
@@ -1352,9 +1499,10 @@ impl Editor {
         // channel, so we're the sole owner here. Assert rather
         // than silently drop config.
         let mut registry = registry;
-        std::sync::Arc::get_mut(&mut registry)
-            .expect("freshly-received grammar registry Arc must be uniquely owned")
-            .apply_language_config(&self.config.languages);
+        crate::primitives::grammar::GrammarRegistry::apply_languages(
+            &mut registry,
+            &self.config.languages,
+        );
         crate::config::reload_indent_overrides(&self.config.languages);
         self.grammar_registry = registry;
         // Propagate the new grammar registry to every window's
