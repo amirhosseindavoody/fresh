@@ -638,6 +638,16 @@ async function prescanHeadingMarkers(bufferId: number): Promise<void> {
   }
   // The await gave the user time to toggle compose off (or close the buffer);
   // publishing now would strand marks the disable path has already cleared.
+  //
+  // `setViewMode("compose")` was queued ahead of `getBufferText`, but the
+  // host refreshes the plugin snapshot only after that command batch
+  // returns. On a loaded runner this continuation can resume in the gap and
+  // read a snapshot that still says "not composing", skip the publish, and
+  // never retry — the track keeps only the viewport's marks and
+  // `heading_marks_survive_exploring_the_document` waits out the 180s cap.
+  // `flush` blocks until the queued view-mode change is visible. A real
+  // toggle-off is queued ahead of the flush and still reads as off.
+  await editor.flush();
   if (!isComposingInAnySplit(bufferId)) return;
 
   editor.setScrollbarMarkers(bufferId, HEADING_MARKER_NS, scanHeadings(text));

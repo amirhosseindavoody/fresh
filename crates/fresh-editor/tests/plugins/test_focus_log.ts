@@ -17,7 +17,11 @@ const editor = getEditor();
  */
 
 const lines: string[] = [];
-const LOG = `${editor.getCwd()}/focus_log.txt`;
+// `pathJoin`, not `${getCwd()}/focus_log.txt`. On Windows `getCwd()` is the
+// `\\?\`-prefixed path `canonicalize` returns, and a verbatim path does not
+// treat `/` as a separator. Concatenation wrote a file this test never
+// reads, so `wait_until` sat until nextest's 180s cap (`test windows-latest`).
+const LOG = editor.pathJoin(editor.getCwd(), "focus_log.txt");
 
 function record(line: string): void {
   lines.push(line);
