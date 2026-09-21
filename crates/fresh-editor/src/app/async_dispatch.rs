@@ -6,12 +6,50 @@
 //! `match` is a thin dispatch table: every arm forwards to a `handle_*`
 //! method on `Editor` that owns the actual logic for that variant.
 
-use rust_i18n::t;
+use fresh_i18n::t;
 
 use crate::services::async_bridge::AsyncMessage;
 use crate::view::prompt::PromptType;
 
 use super::Editor;
+
+/// How long the editor thread may spend dispatching async messages in one
+/// tick. A pathology guard rather than a frame pacer (see
+/// `PLUGIN_COMMAND_FRAME_BUDGET`): normal bursts drain in a pass or two;
+/// only a flood is deferred.
+const ASYNC_MESSAGE_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Whether an LSP request was made by the editor rather than asked for by
+/// the user.
+///
+/// Background traffic is debounced and re-issued on every edit, so a stuck
+/// server produces a steady stream of expiries from it; user-invoked
+/// requests are one per keypress and are exactly what the user is waiting
+/// on. Only the latter are worth the status bar (issue #2197).
+fn is_background_lsp_request(method: &str) -> bool {
+    method.starts_with("textDocument/semanticTokens")
+        || matches!(
+            method,
+            "textDocument/inlayHint"
+                | "textDocument/diagnostic"
+                | "textDocument/foldingRange"
+                | "textDocument/documentSymbol"
+                | "textDocument/codeLens"
+                | "textDocument/documentHighlight"
+                | "workspace/diagnostic"
+                // Completion and signature help read as user-invoked but are
+                // issued by the editor: `maybe_trigger_completion` fires on
+                // every trigger character and on a timer for every word
+                // character, and signature help fires on `(` and `,`. Against
+                // a wedged server, typing a line queues one per keystroke and
+                // 30s later each one would claim the status bar — the very
+                // flood this carve-out exists to prevent. An explicitly
+                // invoked completion that expires still shows up in the
+                // indicator.
+                | "textDocument/completion"
+                | "textDocument/signatureHelp"
+        )
+}
 
 impl Editor {
     /// Resolve the `attachRemoteAgent` promise behind `request_id` — the
@@ -79,14 +117,42 @@ impl Editor {
         self.remote_attach_cancelled.remove(&request_id)
     }
 
-    /// Process pending async messages from the async bridge
+    /// Drain pending async messages and plugin commands to completion.
     ///
-    /// This should be called each frame in the main loop to handle:
+    /// This is the historical contract of this method and what direct
+    /// callers (tests, the test API, one-shot tools) rely on: after it
+    /// returns, everything that was pending at call time — including work
+    /// the per-pass frame budget deferred — has been dispatched. The
+    /// interactive loops must NOT use this; they call
+    /// [`Self::process_async_messages_budgeted`] so one burst is spread
+    /// across frames instead of stalling one.
+    pub fn process_async_messages(&mut self) -> bool {
+        let mut needs_render = false;
+        // The cap is a backstop against a plugin that emits continuously —
+        // each pass drains everything that had arrived when it started, so
+        // legitimate cascades settle in a handful of passes.
+        for _ in 0..64 {
+            needs_render |= self.process_async_messages_budgeted();
+            if self.async_message_backlog.is_empty() && !self.plugin_backlog_pending() {
+                break;
+            }
+        }
+        needs_render
+    }
+
+    /// Process pending async messages from the async bridge, against a
+    /// frame budget.
+    ///
+    /// This is what the interactive loops call each frame:
     /// - LSP diagnostics
     /// - LSP initialization/errors
     /// - File system changes (future)
     /// - Git status updates
-    pub fn process_async_messages(&mut self) -> bool {
+    ///
+    /// A burst larger than the budget is deferred in arrival order and the
+    /// return value stays `true` until the backlog drains, keeping the loop
+    /// on its frame cadence.
+    pub fn process_async_messages_budgeted(&mut self) -> bool {
         // Check plugin thread health - will panic if thread died due to error
         // This ensures plugin errors surface quickly instead of causing silent hangs
         self.plugin_manager.write().unwrap().check_thread_health();
@@ -113,10 +179,12 @@ impl Editor {
         // Order matters only for cosmetic message ordering on a
         // very-busy frame; semantically the dispatcher is the same
         // for every source.
-        let mut messages = {
+        let mut messages: Vec<AsyncMessage> =
+            std::mem::take(&mut self.async_message_backlog).into();
+        {
             let _s = tracing::info_span!("try_recv_all").entered();
-            bridge.try_recv_all()
-        };
+            messages.extend(bridge.try_recv_all());
+        }
         for window in self.windows.values() {
             messages.extend(window.bridge.try_recv_all());
         }
@@ -140,7 +208,14 @@ impl Editor {
             "received async messages"
         );
 
-        for message in messages {
+        // Frame budget, same contract as the plugin command drain: dispatch
+        // against a deadline, then defer the tail in arrival order. A burst
+        // (spawn storm, LSP flood) is spread over frames instead of being
+        // fully absorbed before the next one.
+        let deadline = std::time::Instant::now() + ASYNC_MESSAGE_FRAME_BUDGET;
+        let mut handled = 0usize;
+        let mut messages = messages.into_iter();
+        for message in messages.by_ref() {
             match message {
                 AsyncMessage::LspDiagnostics {
                     uri,
@@ -155,6 +230,21 @@ impl Editor {
                     capabilities,
                 } => {
                     self.handle_lsp_initialized(language, server_name, capabilities);
+                }
+                AsyncMessage::LspRequestTimeout {
+                    language,
+                    server_name,
+                    method,
+                    timeout,
+                    consecutive,
+                } => {
+                    self.handle_lsp_request_timeout(
+                        language,
+                        server_name,
+                        method,
+                        timeout,
+                        consecutive,
+                    );
                 }
                 AsyncMessage::LspError {
                     language,
@@ -226,12 +316,9 @@ impl Editor {
                 } => {
                     self.handle_lsp_code_action_resolved(action);
                 }
-                AsyncMessage::LspCompletionResolved {
-                    request_id: _,
-                    item,
-                } => {
+                AsyncMessage::LspCompletionResolved { request_id, item } => {
                     if let Ok(resolved) = item {
-                        self.handle_completion_resolved(resolved);
+                        self.handle_completion_resolved(request_id, resolved);
                     }
                 }
                 AsyncMessage::LspFormatting {
@@ -389,9 +476,10 @@ impl Editor {
                     exit_code,
                 } => {
                     // If this is the interactive self-update terminal, move the
-                    // status-bar indicator to its terminal state (success = exit 0).
+                    // status-bar indicator to its terminal state. The exit code
+                    // distinguishes all three: installed, action-required, failed.
                     if self.self_update_terminal == Some(terminal.terminal) {
-                        self.finish_self_update(exit_code == Some(0));
+                        self.finish_self_update(exit_code);
                         self.self_update_terminal = None;
                     }
                     self.handle_terminal_exited(terminal, exit_code);
@@ -480,6 +568,19 @@ impl Editor {
                     self.handle_plugin_init_script_loaded(outcome);
                 }
             }
+            handled += 1;
+            // Same floor as the plugin-command drain: a message whose handler
+            // overruns the budget must not throttle the queue to 1/frame.
+            if handled >= super::DRAIN_MIN_PER_PASS && std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        self.async_message_backlog = messages.collect();
+        if !self.async_message_backlog.is_empty() {
+            tracing::debug!(
+                deferred = self.async_message_backlog.len(),
+                "async message frame budget exhausted — deferring tail"
+            );
         }
 
         // Update plugin state snapshot BEFORE processing commands
@@ -548,7 +649,32 @@ impl Editor {
         };
 
         // Trigger render if any async messages, plugin commands were processed, or plugin requested render
-        needs_render || processed_any_commands || plugin_render || file_changes || tree_changes
+        //
+        // A non-empty backlog also counts: the frame budget deferred work, and
+        // returning `true` keeps the main loop on its frame cadence so the tail
+        // drains at ~60Hz instead of at the 50ms idle poll.
+        let backlogged = !self.async_message_backlog.is_empty() || self.plugin_backlog_pending();
+        // A frame the last reconcile owes (`Editor::frame_requested`).
+        let frame_requested = std::mem::take(&mut self.frame_requested);
+        needs_render
+            || processed_any_commands
+            || plugin_render
+            || frame_requested
+            || file_changes
+            || tree_changes
+            || backlogged
+    }
+
+    /// Whether the plugin command frame budget left work for the next tick.
+    fn plugin_backlog_pending(&self) -> bool {
+        #[cfg(feature = "plugins")]
+        {
+            !self.plugin_command_backlog.is_empty()
+        }
+        #[cfg(not(feature = "plugins"))]
+        {
+            false
+        }
     }
 
     /// Handle a server's `initialize` response: record capabilities and kick off
@@ -583,6 +709,76 @@ impl Editor {
         // didn't advertise the capability are skipped.
         self.request_inlay_hints_for_language(&language);
         self.pull_diagnostics_for_language(&language);
+    }
+
+    /// Handle a request that expired without an answer.
+    ///
+    /// Requests time out after 30s and are cancelled; before this, that
+    /// happened entirely silently — hover and go-to-definition just did
+    /// nothing while the status bar kept reading "ready" (issue #2197).
+    /// Every timeout now says so on the status bar, and the server's
+    /// `Unresponsive` status (sent alongside once they start repeating)
+    /// takes the indicator off "on".
+    fn handle_lsp_request_timeout(
+        &mut self,
+        language: String,
+        server_name: String,
+        method: String,
+        timeout: std::time::Duration,
+        consecutive: u32,
+    ) {
+        tracing::warn!(
+            "LSP request '{}' on '{}' ({}) timed out after {:?} ({} in a row)",
+            method,
+            server_name.as_str(),
+            language,
+            timeout,
+            consecutive,
+        );
+
+        // The status bar is for requests the *user* made. The editor also
+        // asks for inlay hints, diagnostics, semantic tokens and folds on
+        // its own, several per edit; announcing those would overwrite
+        // whatever the user was reading every 30s for as long as a stuck
+        // server stayed stuck. They still count towards the streak, so the
+        // indicator carries the news instead (issue #2197).
+        if !is_background_lsp_request(&method) {
+            let message = if consecutive > 1 {
+                format!(
+                    "LSP ({}): '{}' timed out after {}s — {} requests unanswered; server not responding",
+                    language,
+                    method,
+                    timeout.as_secs(),
+                    consecutive,
+                )
+            } else {
+                format!(
+                    "LSP ({}): '{}' timed out after {}s",
+                    language,
+                    method,
+                    timeout.as_secs(),
+                )
+            };
+            self.active_window_mut().status_message = Some(message);
+        }
+
+        // Remember it so a feature whose request expired can explain the
+        // empty result it is about to report instead of claiming there was
+        // nothing to find.
+        self.active_window_mut().lsp_request_timeouts.insert(
+            (language, method),
+            crate::app::window::LspRequestTimeoutRecord {
+                server_name,
+                at: std::time::Instant::now(),
+                timeout,
+                consecutive,
+            },
+        );
+
+        // No popup refresh here: this message is delivered *before* the
+        // `Unresponsive` status update that accompanies it, so refreshing
+        // now would re-render the popup from the old status. The status
+        // handler owns that refresh.
     }
 
     /// Handle an LSP server crash/spawn failure: surface it, fire the
@@ -656,10 +852,17 @@ impl Editor {
     fn handle_lsp_apply_edit(&mut self, edit: lsp_types::WorkspaceEdit, label: Option<String>) {
         tracing::info!("Applying workspace edit from server (label: {:?})", label);
         match self.apply_workspace_edit(edit) {
-            Ok(n) => {
+            // A refused operation has already named the file it was about.
+            Ok(applied) if applied.refused > 0 => {}
+            Ok(applied) => {
                 if let Some(label) = label {
                     self.set_status_message(
-                        t!("lsp.code_action_applied", title = &label, count = n).to_string(),
+                        t!(
+                            "lsp.code_action_applied",
+                            title = &label,
+                            count = applied.changes
+                        )
+                        .to_string(),
                     );
                 }
             }
@@ -742,6 +945,16 @@ impl Editor {
             }
             PluginAsyncMessage::PluginResponse(response) => {
                 self.handle_plugin_response(response);
+            }
+            PluginAsyncMessage::OffLoopSettled {
+                callback_id,
+                result,
+            } => {
+                let pm = self.plugin_manager.read().unwrap();
+                match result {
+                    Ok(json) => pm.resolve_callback(JsCallbackId::from(callback_id), json),
+                    Err(e) => pm.reject_callback(JsCallbackId::from(callback_id), e),
+                }
             }
         }
     }
@@ -895,14 +1108,14 @@ impl Editor {
     /// Either way the embedded terminal PTYs died with the old carrier (a
     /// separate `ssh -t` / `kubectl exec` from the agent channel), so we respawn
     /// them in place through the now-live authority, reusing each backing file
-    /// so scrollback continues. `respawn_terminals_through_authority` skips
-    /// still-live terminals, so this is idempotent under duplicate signals.
+    /// so scrollback continues. Still-live terminals are skipped, so this is
+    /// idempotent; an authority change uses `move_window_terminals_to_its_authority`.
     pub(crate) fn reattach_window(&mut self, window_id: fresh_core::WindowId) {
         let Some(window) = self.windows.get_mut(&window_id) else {
             return;
         };
         window.remote_reconnect_error = None;
-        let revived = window.respawn_terminals_through_authority();
+        let revived = window.respawn_terminals_through_authority(false);
         if revived > 0 {
             let label = window.label.clone();
             self.set_status_message(format!("Reconnected: {label}"));
@@ -915,6 +1128,28 @@ impl Editor {
             // brings it back live in place. Only the active window owns the
             // `terminal_mode` / `key_context` input state; a background window
             // re-syncs when the user next focuses it.
+            if window_id == self.active_window {
+                self.sync_terminal_mode_to_active_buffer();
+            }
+        }
+    }
+
+    /// Move a window's terminals onto the machine its authority now names.
+    /// Unlike a reconnect, live terminals are respawned too: after an authority
+    /// change they still run on the machine the window has left.
+    pub(crate) fn move_window_terminals_to_its_authority(
+        &mut self,
+        window_id: fresh_core::WindowId,
+    ) {
+        let Some(window) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        window.remote_reconnect_error = None;
+        let moved = window.respawn_terminals_through_authority(true);
+        if moved > 0 {
+            let label = window.label.clone();
+            tracing::info!("moved {moved} terminal(s) in window {window_id} ({label})");
+            // A background window re-syncs terminal mode when next focused.
             if window_id == self.active_window {
                 self.sync_terminal_mode_to_active_buffer();
             }
@@ -1148,6 +1383,7 @@ impl Editor {
                 .filter(|argv| !argv.is_empty())
                 .cloned(),
             ephemeral: window.ephemeral_terminals.contains(&terminal_id),
+            script_access: window.terminal_has_script_access(terminal_id),
             title: None,
         }
     }
@@ -1347,17 +1583,18 @@ impl Editor {
                     authority.display_label,
                     root.display()
                 );
-                // Resolve before the restart tears the plugin
-                // runtime down, so the awaiting caller observes
-                // success rather than a vanished promise.
                 self.resolve_remote_attach(request_id);
-                // Record the reconnect spec on the (re-rooted)
-                // active session before the restart so it persists
-                // and the rebuilt editor restores this backend.
-                self.active_window_mut().authority_spec = spec;
-                self.install_authority_with_keepalive(authority, keepalive, root);
+                let landed = self.install_authority_with_keepalive(authority, keepalive, root);
+                // Stamp the window the backend landed on; the attach may have opened a new one.
+                if let Some(w) = self.windows.get_mut(&landed) {
+                    w.authority_spec = spec;
+                }
             }
-            crate::services::async_bridge::RemoteAttachMode::Window { label, command } => {
+            crate::services::async_bridge::RemoteAttachMode::Window {
+                label,
+                command,
+                adopt,
+            } => {
                 tracing::info!(
                     "Remote attach connected ({}); opening born-attached window at {}",
                     authority.display_label,
@@ -1367,12 +1604,47 @@ impl Editor {
                 // exists. Resolve on success; on a window-creation
                 // failure reject so the plugin keeps its dialog
                 // open with the reason and no half-built window.
+                let connection = std::sync::Arc::new(crate::services::authority::Connection {
+                    authority,
+                    keepalive: std::sync::Mutex::new(Some(keepalive)),
+                });
+                // Only adopt a window that is still there and still a
+                // placeholder: the user may have closed it while the connect
+                // ran, and growing a *live* window into this session would
+                // take somebody's workspace away from them.
+                let adopt = adopt.filter(|id| self.preparing_windows.contains_key(id));
                 match self
-                    .create_remote_session_window(authority, keepalive, root, label, command, spec)
+                    .create_remote_session_window(connection, root, label, command, spec, adopt)
                 {
                     Ok(_) => self.resolve_remote_attach(request_id),
                     Err(e) => self.reject_remote_attach(request_id, e),
                 }
+            }
+            #[cfg(feature = "plugins")]
+            crate::services::async_bridge::RemoteAttachMode::Machine => {
+                // A plugin's machine handle: a registered connection with no
+                // window, torn down when the last reference to it goes.
+                tracing::info!(
+                    "Machine opened ({}); registered as a connection with no window",
+                    authority.display_label
+                );
+                let id = self.next_machine_id;
+                self.next_machine_id += 1;
+                let info = Self::machine_info(&authority, id);
+                let connection = self.open_connection(crate::services::authority::Connection {
+                    authority,
+                    keepalive: std::sync::Mutex::new(Some(keepalive)),
+                });
+                self.open_machines.insert(
+                    id,
+                    crate::app::OpenMachine::new(crate::app::OpenMachineKind::Owned(connection)),
+                );
+                // A response, not a bare resolve, so the runtime closes the
+                // handle on unload.
+                self.send_plugin_response(fresh_core::api::PluginResponse::MachineOpened {
+                    request_id,
+                    info,
+                });
             }
             crate::services::async_bridge::RemoteAttachMode::Reconnect { window_id } => {
                 // The common case: a dormant remote session the user
@@ -1387,7 +1659,13 @@ impl Editor {
                         "Promoting dormant remote session {window_id} ({})",
                         authority.display_label
                     );
-                    self.promote_dormant_remote(window_id, authority, keepalive);
+                    self.promote_dormant_remote(
+                        window_id,
+                        std::sync::Arc::new(crate::services::authority::Connection {
+                            authority,
+                            keepalive: std::sync::Mutex::new(Some(keepalive)),
+                        }),
+                    );
                 } else if self.windows.contains_key(&window_id) {
                     tracing::info!(
                         "Reconnected dormant session {window_id} ({})",
@@ -1400,8 +1678,13 @@ impl Editor {
                     // authority. The silent hot-swap path keeps the existing
                     // authority and reaches the same `reattach_window` via
                     // `AsyncMessage::RemoteReconnected`.
-                    self.set_session_authority(window_id, authority);
-                    self.session_keepalives.insert(window_id, keepalive);
+                    self.set_session_connection(
+                        window_id,
+                        std::sync::Arc::new(crate::services::authority::Connection {
+                            authority,
+                            keepalive: std::sync::Mutex::new(Some(keepalive)),
+                        }),
+                    );
                     self.reattach_window(window_id);
                 } else {
                     // The window was closed while the connect was in
@@ -1583,7 +1866,7 @@ impl Editor {
         // Refresh the Quick Open suggestions if the prompt is open
         if let Some(prompt) = &self.active_window_mut().prompt {
             if prompt.prompt_type == PromptType::QuickOpen {
-                let input = prompt.input.clone();
+                let input = prompt.input_str().to_string();
                 self.update_quick_open_suggestions(&input);
             }
         }
@@ -1616,6 +1899,7 @@ mod tests {
             Arc::new(crate::model::filesystem::StdFileSystem),
             None,
             None,
+            false,
             false,
             false,
         )

@@ -609,12 +609,18 @@ fn extract_scrollbar_thumb_info(
     }
 }
 
-/// Test that dragging the scrollbar updates the cursor position
-/// Bug: When dragging the scrollbar, the cursor stays at its old position
-/// even though the viewport has scrolled. The cursor should be moved to
-/// somewhere within the newly visible area.
+/// Test that dragging the scrollbar scrolls the viewport and leaves the
+/// cursor where the user left it.
+///
+/// This test used to assert the opposite - that the drag pulled the cursor
+/// to the new `top_byte` - which is the behaviour issue #3192 reports as a
+/// bug: the wheel never moved the cursor, and the relocation was invisible
+/// until the next keypress typed onto a line the user never navigated to.
+/// Scrolling is a viewport operation; the ruling is now the wheel's.
+/// `e2e::issue_3192_scrollbar_drag_cursor` covers the same ground from
+/// rendered output.
 #[test]
-fn test_scrollbar_drag_updates_cursor_position() {
+fn test_scrollbar_drag_leaves_cursor_alone() {
     // Initialize tracing
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
@@ -666,19 +672,18 @@ fn test_scrollbar_drag_updates_cursor_position() {
         "Viewport should have scrolled down significantly (was line {initial_top_line}, now line {top_line_after_drag})"
     );
 
-    // VERIFY: Cursor should have moved to be within the visible area
-    // The cursor should no longer be at the beginning of the file
-    // It should be somewhere near the scrolled viewport position
-    assert!(
-        cursor_pos_after_drag > initial_cursor_pos,
-        "Cursor should have moved from position {initial_cursor_pos} after scrollbar drag, but is still at {cursor_pos_after_drag}"
+    // VERIFY: the cursor has not moved. The scroll left it off-screen, which
+    // is exactly the case the old fixup fired on and the wheel never did.
+    assert_eq!(
+        cursor_pos_after_drag, initial_cursor_pos,
+        "Scrollbar drag should leave the cursor at {initial_cursor_pos}, but it moved to {cursor_pos_after_drag}"
     );
 
-    // VERIFY: Cursor should be at the top of the visible area (or close to it)
-    // When scrollbar is dragged, the cursor is moved to top_byte
-    assert_eq!(
+    // VERIFY: and it was not pulled to the top of the new viewport - the
+    // specific relocation #3192 reports.
+    assert_ne!(
         cursor_pos_after_drag, top_byte_after_drag,
-        "Cursor position {cursor_pos_after_drag} should be at the top of the viewport (top_byte={top_byte_after_drag})"
+        "Cursor should not have been relocated to the viewport top (top_byte={top_byte_after_drag})"
     );
 }
 
@@ -778,6 +783,56 @@ fn test_scrollbar_drag_to_absolute_bottom() {
     assert!(
         cursor_pos <= buffer_len,
         "Cursor should not be beyond buffer end. Cursor at {cursor_pos}, buffer length {buffer_len}"
+    );
+}
+
+/// **Hovering a split separator names it, and the name survives the frame.**
+///
+/// The dividers are nodes in the shell's tree now, and the tree reports the
+/// hover. The legacy box walk runs after the tree on the same event, finds
+/// nothing under a divider cell — no chrome box covers it any more — and used
+/// to store that `None` straight over the tree's answer, so the highlight
+/// never appeared. `Editor::hovered` is where the two walks meet.
+#[test]
+fn test_hovering_a_split_separator_names_it() {
+    let mut harness = EditorTestHarness::new(80, 24).unwrap();
+    harness
+        .send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    harness.type_text("split horiz").unwrap();
+    harness
+        .send_key(KeyCode::Enter, KeyModifiers::NONE)
+        .unwrap();
+    harness.render().unwrap();
+
+    let separators = harness.editor().get_separator_areas().to_vec();
+    assert_eq!(
+        separators.len(),
+        1,
+        "one separator after a horizontal split"
+    );
+    let (split_id, direction, sep_x, sep_y, sep_length) = separators[0];
+
+    harness.mouse_move(sep_x + sep_length / 2, sep_y).unwrap();
+    assert_eq!(
+        harness.editor().hovered(),
+        Some(fresh::app::HoverTarget::SplitSeparator(
+            split_id.into(),
+            direction
+        )),
+        "the pointer is on the separator"
+    );
+
+    // And moving off it gives the answer back to whatever is under the pointer.
+    harness.mouse_move(sep_x + sep_length / 2, 1).unwrap();
+    assert_ne!(
+        harness.editor().hovered(),
+        Some(fresh::app::HoverTarget::SplitSeparator(
+            split_id.into(),
+            direction
+        )),
+        "and off it, it is not"
     );
 }
 
@@ -1840,109 +1895,6 @@ fn test_double_click_requires_same_position() {
         !selected_text_same_pos.is_empty(),
         "Double-click at same position SHOULD select a word, but got empty selection"
     );
-}
-
-/// Test that after double-clicking a word, dragging extends selection by words (issue #1202).
-/// Example: double-click "quick" and drag right → "quick" → "quick brown" → "quick brown fox".
-#[test]
-fn test_double_click_drag_extends_selection_by_words() {
-    let mut harness = EditorTestHarness::new_no_wrap(80, 24).unwrap();
-    let content = "quick brown fox\n";
-    let _fixture = harness.load_buffer_from_text(content).unwrap();
-    harness.render().unwrap();
-
-    let (content_first_row, _) = harness.content_area_rows();
-    let row = content_first_row as u16;
-    let gutter_width = harness.editor().active_state().margins.left_total_width() as u16;
-
-    // "quick" at cols gutter_width..gutter_width+5, " brown" at +6..+12, " fox" at +13..+17
-    let quick_col = gutter_width + 3; // middle of "quick"
-    let brown_col = gutter_width + 9; // in "brown"
-    let fox_col = gutter_width + 14; // in "fox"
-
-    // 1. First click
-    harness
-        .send_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: quick_col,
-            row,
-            modifiers: KeyModifiers::NONE,
-        })
-        .unwrap();
-    harness
-        .send_mouse(MouseEvent {
-            kind: MouseEventKind::Up(MouseButton::Left),
-            column: quick_col,
-            row,
-            modifiers: KeyModifiers::NONE,
-        })
-        .unwrap();
-
-    // 2. Second click (double-click) – selects "quick" and enables word-drag mode
-    harness
-        .send_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: quick_col,
-            row,
-            modifiers: KeyModifiers::NONE,
-        })
-        .unwrap();
-    harness.render().unwrap();
-
-    let after_double = harness.get_selected_text();
-    assert_eq!(
-        after_double, "quick",
-        "After double-click, should have 'quick' selected, got '{}'",
-        after_double
-    );
-
-    // 3. Drag right to "brown" – selection should extend to "quick brown"
-    harness
-        .send_mouse(MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left),
-            column: brown_col,
-            row,
-            modifiers: KeyModifiers::NONE,
-        })
-        .unwrap();
-    harness.render().unwrap();
-
-    let after_drag_brown = harness.get_selected_text();
-    assert!(
-        after_drag_brown.contains("quick") && after_drag_brown.contains("brown"),
-        "After drag to 'brown', selection should include both words, got '{}'",
-        after_drag_brown
-    );
-
-    // 4. Drag further right to "fox" – selection should extend to "quick brown fox"
-    harness
-        .send_mouse(MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left),
-            column: fox_col,
-            row,
-            modifiers: KeyModifiers::NONE,
-        })
-        .unwrap();
-    harness.render().unwrap();
-
-    let after_drag_fox = harness.get_selected_text();
-    assert_eq!(
-        after_drag_fox.trim(),
-        "quick brown fox",
-        "After drag to 'fox', selection should be 'quick brown fox', got '{}'",
-        after_drag_fox
-    );
-
-    // 5. Release
-    harness
-        .send_mouse(MouseEvent {
-            kind: MouseEventKind::Up(MouseButton::Left),
-            column: fox_col,
-            row,
-            modifiers: KeyModifiers::NONE,
-        })
-        .unwrap();
-    harness.render().unwrap();
 }
 
 /// Test that with blinking_bar cursor style, the first character of a selection

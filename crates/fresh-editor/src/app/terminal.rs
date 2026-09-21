@@ -30,7 +30,7 @@ use crate::services::authority::TerminalWrapper;
 use crate::services::terminal::TerminalId;
 use crate::state::EditorState;
 use crate::view::split::SplitViewState;
-use rust_i18n::t;
+use fresh_i18n::t;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +56,13 @@ use std::sync::Arc;
 pub(crate) fn terminal_backing_fs() -> Arc<dyn crate::model::filesystem::FileSystem + Send + Sync> {
     Arc::new(crate::model::filesystem::StdFileSystem)
 }
+
+/// Bracketed-paste start marker, sent to a child that asked for DECSET 2004
+/// before the pasted text. See [`Window::send_terminal_paste`].
+const PASTE_START: &str = "\x1b[200~";
+
+/// Bracketed-paste end marker, sent after the pasted text.
+const PASTE_END: &str = "\x1b[201~";
 
 /// How often [`Window::sync_terminal_titles`] polls each terminal's
 /// foreground process group for tmux-style tab auto-naming. Frequent enough
@@ -160,6 +167,77 @@ pub(crate) fn agent_command_env(
         env.insert("FRESH_CMD_TOKEN".to_string(), token);
     }
     env
+}
+
+impl Window {
+    /// Remember which capability token `terminal_id`'s freshly-spawned child
+    /// was handed, reading it out of the env [`agent_command_env`] built.
+    ///
+    /// A no-op for a terminal spawned without `allowScript` (no token in the
+    /// map), so every spawn site can call it unconditionally. The membership
+    /// this records is what workspace capture persists and what a later
+    /// restore/respawn re-mints from.
+    pub(crate) fn record_terminal_script_token(
+        &mut self,
+        terminal_id: TerminalId,
+        env: &HashMap<String, String>,
+    ) {
+        if let Some(token) = env.get("FRESH_CMD_TOKEN") {
+            self.terminal_script_tokens
+                .insert(terminal_id, token.clone());
+        }
+    }
+
+    /// Re-arm the script capability for a terminal being spawned from a
+    /// *remembered* grant — workspace restore, an exited agent's restart, a
+    /// remote reconnect — and return the env to inject into the new PTY child.
+    ///
+    /// The grant is re-minted rather than carried: the token table is
+    /// in-memory and process-global, so the token a previous editor run
+    /// handed this terminal resolves to nothing here, and within one run the
+    /// respawned child never inherits the dead one's environment anyway.
+    /// Without this a restored agent comes back able to *reach* the editor
+    /// (`FRESH_SESSION` is injected for every local terminal) but not to drive
+    /// it — every `fresh --cmd script run` fails with "no capability token:
+    /// script evaluation is not authorized" until the workspace is recreated
+    /// from scratch (fresh#2903).
+    ///
+    /// The new token is bound to *this* window, which is the right target: a
+    /// restored workspace is a new `WindowId`, and the terminal is coming back
+    /// inside it. Any token the terminal's previous incarnation held is
+    /// revoked on the way past so repeated restarts don't pile up live grants.
+    ///
+    /// `key` is the terminal id the token is filed under — the predicted id at
+    /// restore, the dying terminal's id at respawn. Callers re-key it onto the
+    /// real id afterwards, exactly as they do for the backing/log paths.
+    pub(crate) fn remint_terminal_script_env(
+        &mut self,
+        key: TerminalId,
+    ) -> HashMap<String, String> {
+        if let Some(stale) = self.terminal_script_tokens.remove(&key) {
+            crate::server::command_access::revoke(&stale);
+        }
+        let env = agent_command_env(self.id, None, true);
+        self.record_terminal_script_token(key, &env);
+        env
+    }
+
+    /// Move a terminal's script-token entry onto the id the manager actually
+    /// handed out, for the spawn paths that have to guess the id up front.
+    pub(crate) fn rekey_terminal_script_token(&mut self, from: TerminalId, to: TerminalId) {
+        if from == to {
+            return;
+        }
+        if let Some(token) = self.terminal_script_tokens.remove(&from) {
+            self.terminal_script_tokens.insert(to, token);
+        }
+    }
+
+    /// Whether `terminal_id`'s child holds a script capability token — the
+    /// grant workspace capture persists and a respawn re-mints.
+    pub(crate) fn terminal_has_script_access(&self, terminal_id: TerminalId) -> bool {
+        self.terminal_script_tokens.contains_key(&terminal_id)
+    }
 }
 
 /// Build a [`TerminalWrapper`] that runs `argv` directly as a local PTY child,
@@ -1044,17 +1122,15 @@ impl Window {
     /// through `Authority::terminal_command`, so the new PTY runs on the remote
     /// backend by construction — never the local host.
     ///
-    /// Only terminals whose handle is missing or no longer alive are respawned;
-    /// a still-live terminal is left untouched (respawning it would orphan its
-    /// PTY). Terminal ids change on respawn — the manager allocates fresh ones —
+    /// `include_live` is `false` on a reconnect, where the PTYs died with the
+    /// carrier, and `true` on an authority change, where they are alive on the
+    /// machine the window just left. Terminal ids change on respawn,
     /// so every terminal-id-keyed entry (buffer→terminal binding, backing/log
     /// files, launch/resume commands, ephemeral marker) is remapped to the new
     /// id and the dead handle is torn down.
     ///
-    /// Returns the number of terminals actually revived (dead handles that were
-    /// respawned), so callers can tailor a status message and skip it when the
-    /// window had no terminals to restore.
-    pub fn respawn_terminals_through_authority(&mut self) -> usize {
+    /// Returns how many terminals were respawned.
+    pub fn respawn_terminals_through_authority(&mut self, include_live: bool) -> usize {
         // Snapshot the (buffer, old terminal id) pairs up front — the loop
         // mutates `terminal_buffers` as it remaps ids.
         let bindings: Vec<(BufferId, TerminalId)> = self
@@ -1065,9 +1141,8 @@ impl Window {
 
         let mut revived = 0usize;
         for (buffer_id, old_id) in bindings {
-            // Leave a still-live terminal alone; only revive the dead ones.
             let handle = self.terminal_manager.get(old_id);
-            if handle.is_some_and(|h| h.is_alive()) {
+            if !include_live && handle.is_some_and(|h| h.is_alive()) {
                 continue;
             }
 
@@ -1097,6 +1172,7 @@ impl Window {
                 .filter(|argv| !argv.is_empty())
                 .cloned();
             let ephemeral = self.ephemeral_terminals.contains(&old_id);
+            let script_access = self.terminal_has_script_access(old_id);
 
             let spawn = RespawnSpec {
                 old_id,
@@ -1108,6 +1184,7 @@ impl Window {
                 resume_argv,
                 launch_argv,
                 ephemeral,
+                script_access,
             };
             match self.respawn_terminal_pty(buffer_id, spawn) {
                 Some(_) => revived += 1,
@@ -1151,6 +1228,15 @@ impl Window {
         let wrapper = self.apply_remote_terminal_env(wrapper);
         let env_delta = self.terminal_env_delta(&wrapper);
 
+        // An agent that was granted editor control keeps it across the
+        // respawn: the reborn child gets a freshly-minted token bound to this
+        // window, since the one its predecessor carried died with that PTY.
+        let extra_env = if spec.script_access {
+            self.remint_terminal_script_env(spec.old_id)
+        } else {
+            HashMap::new()
+        };
+
         let new_id = match self.terminal_manager.spawn(
             spec.cols,
             spec.rows,
@@ -1162,7 +1248,7 @@ impl Window {
             crate::services::terminal::BackingMode::Continue,
             wrapper,
             env_delta,
-            HashMap::new(),
+            extra_env,
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -1183,6 +1269,7 @@ impl Window {
         // Re-key every terminal-id-keyed entry onto the reborn terminal. The
         // values come from the caller's spec rather than the maps, so this is
         // correct even when the exit path already dropped the old entries.
+        self.rekey_terminal_script_token(spec.old_id, new_id);
         if new_id != spec.old_id {
             self.terminal_backing_files.remove(&spec.old_id);
             self.terminal_log_files.remove(&spec.old_id);
@@ -1304,6 +1391,7 @@ impl Window {
             resume_argv,
             launch_argv,
             ephemeral: exited.ephemeral,
+            script_access: exited.script_access,
         };
         let Some(new_id) = self.respawn_terminal_pty(buffer_id, spec) else {
             // Put the record back so the user can retry the restart.
@@ -1352,6 +1440,11 @@ struct RespawnSpec {
     resume_argv: Option<Vec<String>>,
     launch_argv: Option<Vec<String>>,
     ephemeral: bool,
+    /// Whether the terminal being reborn held a script capability token. The
+    /// reborn child is minted a new one (see
+    /// [`Window::remint_terminal_script_env`]) rather than inheriting the dead
+    /// one's, which it could not see anyway.
+    script_access: bool,
 }
 
 impl Editor {
@@ -1378,47 +1471,96 @@ impl Editor {
     /// this router adds only the cross-cutting effects that require
     /// editor-level state (the plugin hook + status message).
     /// Launch an interactive self-update in a **local** terminal buffer and
-    /// point the status-bar indicator at it. The terminal runs
-    /// `fresh --cmd update --yes` as a local PTY child — never through the
-    /// window's authority — so package-manager / sudo prompts work interactively
-    /// and the binary that gets swapped is the one actually running. Completion
-    /// is reported via `TerminalExited` (see `handle`/`finish_self_update`),
-    /// which moves the indicator to its `Succeeded`/`Failed` state.
+    /// point the status-bar indicator at it. See [`start_self_update_with`].
+    ///
+    /// [`start_self_update_with`]: Self::start_self_update_with
     pub fn start_self_update(&mut self) {
+        self.start_self_update_with(None);
+    }
+
+    /// Run the update in "download only" mode: fetch and verify the release
+    /// package, then stop and print the install command against the file on
+    /// disk. The middle rung — the network half is done, the root half is the
+    /// user's.
+    pub fn start_self_update_download_only(&mut self) {
+        self.start_self_update_with(Some("--download-only"));
+    }
+
+    /// Run the update in "show me the command" mode: nothing is fetched and
+    /// nothing is written: it names the commands and stops, for a user who
+    /// wants to read before anything happens.
+    pub fn start_self_update_print_command(&mut self) {
+        self.start_self_update_with(Some("--print-command"));
+    }
+
+    /// Launch `fresh --cmd update --yes` (plus `--print-command` when
+    /// `print_command`) as a local PTY child — never through the window's
+    /// authority — so the binary that gets updated is the one actually running.
+    ///
+    /// The PTY is what makes a one-step update possible: `sudo` can prompt for a
+    /// password right in this buffer, so a `.deb`/`.rpm` install finishes here
+    /// rather than being handed back to the user as a chore. Completion is
+    /// reported via `TerminalExited` (see `handle`/`finish_self_update`), which
+    /// moves the indicator to its `Succeeded`/`ActionRequired`/`Failed` state.
+    pub fn start_self_update_with(&mut self, mode_flag: Option<&str>) {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("cannot find current exe for self-update: {e}");
-                self.finish_self_update(false);
+                self.finish_self_update(None);
                 return;
             }
         };
-        let argv = vec![
+        let mut argv = vec![
             exe.to_string_lossy().into_owned(),
             "--cmd".to_string(),
             "update".to_string(),
             "--yes".to_string(),
         ];
+        if let Some(flag) = mode_flag {
+            argv.push(flag.to_string());
+        }
         let title = t!("update.terminal_title").to_string();
         let window = self.active_window;
         let Some((terminal_id, buffer_id)) = self
             .active_window_mut()
             .open_local_command_terminal(argv, title)
         else {
-            self.finish_self_update(false);
+            self.finish_self_update(None);
             return;
         };
         self.begin_self_update(terminal_id, window, buffer_id);
 
-        // Editor-wide: refresh the plugin-state snapshot and fire
-        // `buffer_activated`, matching `open_terminal`.
-        #[cfg(feature = "plugins")]
-        self.update_plugin_state_snapshot();
-        #[cfg(feature = "plugins")]
-        self.plugin_manager.read().unwrap().run_hook(
-            "buffer_activated",
-            crate::services::plugins::hooks::HookArgs::BufferActivated { buffer_id },
-        );
+        // Editor-wide: announce the focus change, matching `open_terminal`.
+        self.announce_focus();
+    }
+
+    /// Size the active window's visible terminal PTYs to their panes — as
+    /// the grid is *now*, laid out before the window reads it.
+    ///
+    /// The editor-side counterpart of `Window::resize_visible_terminals`,
+    /// for the callers that have just changed the grid (a dock split
+    /// created, a terminal split opened, a window dived into) and cannot
+    /// wait for the frame that would place the new pane: the window's
+    /// retained rects are refreshed with one `layout_only` of the frame
+    /// first (`refresh_pane_rects`), then read.
+    pub(crate) fn resize_visible_terminals(&mut self) {
+        self.resize_window_terminals(self.active_window);
+    }
+
+    /// [`Self::resize_visible_terminals`] for `window`, active or not: the
+    /// active window's panes are placed off the frame, another window's off
+    /// one offscreen layout of its own grid — the same two ways the layout
+    /// funnel places them — and then its visible PTYs are sized to them.
+    pub(crate) fn resize_window_terminals(&mut self, window: fresh_core::WindowId) {
+        if window == self.active_window {
+            self.refresh_pane_rects();
+        } else if let Some(w) = self.windows.get_mut(&window) {
+            w.layout_panes_offscreen();
+        }
+        if let Some(w) = self.windows.get_mut(&window) {
+            w.resize_visible_terminals();
+        }
     }
 
     pub fn open_terminal(&mut self) {
@@ -1427,15 +1569,8 @@ impl Editor {
             return;
         };
 
-        // Editor-wide: refresh the plugin-state snapshot so plugin
-        // hooks see the new active buffer, then fire `buffer_activated`.
-        #[cfg(feature = "plugins")]
-        self.update_plugin_state_snapshot();
-        #[cfg(feature = "plugins")]
-        self.plugin_manager.read().unwrap().run_hook(
-            "buffer_activated",
-            crate::services::plugins::hooks::HookArgs::BufferActivated { buffer_id },
-        );
+        // Editor-wide: announce the focus change to plugins.
+        self.announce_focus();
 
         // Status bar with the terminal-mode exit key. Looked up here
         // (not in Window) because the keybinding resolver is shared
@@ -1536,21 +1671,14 @@ impl Editor {
         // is live in this new split; other splits keep their own per-split
         // mode, so closing this split later restores them correctly (#2485).
         self.active_window_mut().key_context = crate::input::keybindings::KeyContext::Terminal;
-        self.active_window_mut().resize_visible_terminals();
+        self.resize_visible_terminals();
 
         // A new split changes every sibling pane's size. Reflow through the
         // single layout funnel so existing terminals fit their new panes.
         self.relayout();
 
-        // Editor-wide: refresh the plugin-state snapshot so plugin hooks see
-        // the new active buffer, then fire `buffer_activated`.
-        #[cfg(feature = "plugins")]
-        self.update_plugin_state_snapshot();
-        #[cfg(feature = "plugins")]
-        self.plugin_manager.read().unwrap().run_hook(
-            "buffer_activated",
-            crate::services::plugins::hooks::HookArgs::BufferActivated { buffer_id },
-        );
+        // Editor-wide: announce the focus change to plugins.
+        self.announce_focus();
 
         let exit_key = self
             .keybindings
@@ -1894,14 +2022,25 @@ impl Editor {
                     .get(&terminal_id)
                 {
                     if let Some(handle) = self.active_window().terminal_manager.get(terminal_id) {
-                        if let Ok(state) = handle.state.lock() {
-                            let truncate_pos = state.backing_file_history_end();
-                            // Always truncate to remove appended visible screen
-                            // (even if truncate_pos is 0, meaning no scrollback yet)
-                            if let Err(e) =
-                                terminal_backing_fs().set_file_length(backing_path, truncate_pos)
-                            {
-                                tracing::warn!("Failed to truncate terminal backing file: {}", e);
+                        if let Ok(mut state) = handle.state.lock() {
+                            // Truncate only when a visible-screen tail is
+                            // actually there. Truncating unconditionally used
+                            // to be harmless because the tail was assumed to
+                            // be the only thing past the history end — but the
+                            // PTY read loop appends there too, and cutting at
+                            // a history end that predates its writes deleted
+                            // live scrollback for good (fresh#3151).
+                            if state.backing_file_has_tail() {
+                                let truncate_pos = state.backing_file_history_end();
+                                match terminal_backing_fs()
+                                    .set_file_length(backing_path, truncate_pos)
+                                {
+                                    Ok(()) => state.set_backing_file_has_tail(false),
+                                    Err(e) => tracing::warn!(
+                                        "Failed to truncate terminal backing file: {}",
+                                        e
+                                    ),
+                                }
                             }
                         }
                     }
@@ -1916,7 +2055,7 @@ impl Editor {
             }
 
             // Ensure terminal PTY is sized correctly for current split dimensions
-            self.active_window_mut().resize_visible_terminals();
+            self.resize_visible_terminals();
 
             self.set_status_message(t!("status.terminal_mode_enabled").to_string());
         }
@@ -1978,6 +2117,42 @@ impl Window {
                 handle.write(data);
             }
         }
+    }
+
+    /// Send `text` to this window's active terminal as a **paste**, rather
+    /// than as the keystrokes the same bytes would be.
+    ///
+    /// Which of those the child sees is its own decision, announced by
+    /// DECSET 2004: a line editor (readline in bash/zsh/fish, an agent CLI's
+    /// input box) turns bracketed paste on precisely so it can tell one from
+    /// the other, and then reads a bare `\n` as the Enter key. Handing such a
+    /// child the raw clipboard bytes therefore submits every line but the
+    /// last — the paste "only pastes the tail", because everything before it
+    /// already ran. Wrapping the text in `ESC [ 200 ~` … `ESC [ 201 ~` is what
+    /// makes it arrive as one inert block.
+    ///
+    /// `ESC` is stripped from the wrapped payload: it is what a premature
+    /// `ESC [ 201 ~` inside the clipboard would need to break out of the
+    /// brackets and have the rest of the text executed, and pasted text has
+    /// no business carrying control sequences either way.
+    ///
+    /// With the mode off the child cannot distinguish paste from typing at
+    /// all, so the honest thing is to send what the keyboard would: line
+    /// breaks become `\r`, the byte the Enter key produces.
+    pub fn send_terminal_paste(&mut self, text: &str) {
+        let bracketed = self
+            .get_active_terminal_state()
+            .is_some_and(|state| state.is_bracketed_paste());
+        let payload = if bracketed {
+            let mut out = String::with_capacity(text.len() + PASTE_START.len() + PASTE_END.len());
+            out.push_str(PASTE_START);
+            out.extend(text.chars().filter(|c| *c != '\x1b'));
+            out.push_str(PASTE_END);
+            out
+        } else {
+            text.replace("\r\n", "\r").replace('\n', "\r")
+        };
+        self.send_terminal_input(payload.as_bytes());
     }
 
     /// Send a key event to this window's active terminal. Picks
@@ -2110,7 +2285,34 @@ impl Window {
     /// Computing the file-explorer width against the post-dock chrome
     /// width (not the full screen) matches the renderer exactly, so split
     /// geometry derived from this lines up with the cells actually drawn.
+    ///
+    /// The vertical bands come from the same toggles the renderer lays out
+    /// against — through [`frame::fixed_rows`], which is *the* copy of that
+    /// sum. Adding them up here instead is a mistake this function has now
+    /// made twice: hard-coding "menu bar + status bar" over-reported the
+    /// height by a row whenever the prompt line was shown, so a panel that
+    /// sizes itself to the pane it is told it has (the code tour's dock panel)
+    /// emitted one row too many and its hint bar fell off the bottom of the
+    /// dock; and the fix for that missed the **search-options row**, which is
+    /// one cell tall whenever a search prompt is up, so every pane was a row
+    /// too tall again with the search bar showing.
+    ///
+    /// It cannot be a read of the frame's body rectangle (`Editor::body_area`):
+    /// `apply_layout` calls this *after* setting a new size and *before* the
+    /// frame that would record it, and getting the previous frame's answer
+    /// there is the bug this whole migration is about. So it stays a function
+    /// of state — of the same state, through the same rule. The field's name
+    /// says which of the two it is.
     pub(crate) fn editor_content_area(&self) -> ratatui::layout::Rect {
+        let vertical_rows = crate::view::shell::frame::fixed_rows(
+            self.menu_bar_visible,
+            self.status_bar_visible,
+            self.prompt
+                .as_ref()
+                .is_some_and(|p| p.prompt_type.has_search_options()),
+            self.prompt_line_visible,
+        );
+        let menu_rows = u16::from(self.menu_bar_visible);
         let chrome_width = self.terminal_width.saturating_sub(self.dock_cols);
         let file_explorer_width = if self.file_explorer_visible {
             self.file_explorer_width.to_cols(chrome_width)
@@ -2126,23 +2328,23 @@ impl Window {
         let editor_width = chrome_width.saturating_sub(file_explorer_width);
         ratatui::layout::Rect::new(
             editor_x,
-            1, // menu bar
+            menu_rows,
             editor_width,
-            self.terminal_height.saturating_sub(2), // menu bar + status bar
+            self.terminal_height.saturating_sub(vertical_rows),
         )
     }
 
     /// Resize all this window's visible terminal PTYs to match their
     /// current split dimensions, and re-pin the scroll-back view's grid
-    /// wrap column to the same pane width. Reads the window's cached
-    /// `terminal_width` / `terminal_height` for the screen size.
+    /// wrap column to the same pane width. Reads the panes as the last
+    /// layout placed them ([`Self::visible_panes`]); an editor-side caller
+    /// that has just changed the grid goes through
+    /// `Editor::resize_visible_terminals`, which lays it out first.
     pub fn resize_visible_terminals(&mut self) {
-        let editor_area = self.editor_content_area();
-
-        let Some((mgr, _)) = self.buffers.splits() else {
+        if self.buffers.splits().is_none() {
             return;
-        };
-        let visible_buffers = mgr.get_visible_buffers(editor_area);
+        }
+        let visible_buffers = self.visible_panes();
 
         // (split, terminal buffer, pty cols, pty rows, grid cols). Collected
         // first because applying it needs `&mut self` for both the terminal
@@ -2243,10 +2445,28 @@ impl Window {
         let mut grid_cols: Option<usize> = None;
         if let Some(handle) = self.terminal_manager.get(terminal_id) {
             if let Ok(mut state) = handle.state.lock() {
-                use std::io::BufWriter;
+                use std::io::{BufWriter, Write};
 
                 let (cols, _) = state.size();
                 grid_cols = Some(cols as usize);
+
+                // An earlier visit (or a session checkpoint) may have left its
+                // visible-screen tail in the file. It is rewritten below, so
+                // remove it first: leaving it in place would bake a stale
+                // screen into the scrollback prefix, and — since the tail is
+                // what the truncation on the way back to live mode cuts at —
+                // would also leave real scrollback stranded past that point
+                // (fresh#3151).
+                if state.backing_file_has_tail() {
+                    let history_end = state.backing_file_history_end();
+                    match terminal_backing_fs().set_file_length(&backing_file, history_end) {
+                        Ok(()) => state.set_backing_file_has_tail(false),
+                        Err(e) => tracing::error!(
+                            "Failed to drop stale terminal visible-screen tail: {}",
+                            e
+                        ),
+                    }
+                }
 
                 // Flush any scrollback that has scrolled off but isn't in the
                 // file yet — in particular the lines a resize spilled from the
@@ -2270,8 +2490,18 @@ impl Window {
                 // Open backing file in append mode to add visible screen
                 if let Ok(mut file) = terminal_backing_fs().open_file_for_append(&backing_file) {
                     let mut writer = BufWriter::new(&mut *file);
-                    match state.append_visible_screen(&mut writer) {
-                        Ok(head) => prepended = head,
+                    // Claim the tail *before* writing it. `BufWriter` spills
+                    // to the file as soon as its buffer fills, so a failure
+                    // part-way through still leaves bytes past the history
+                    // end; the flag is what tells a later path to cut them
+                    // back off, so it has to err towards "something may be
+                    // there" rather than "the write succeeded".
+                    state.set_backing_file_has_tail(true);
+                    let appended = state.append_visible_screen(&mut writer);
+                    match appended.and_then(|head| writer.flush().map(|()| head)) {
+                        Ok(head) => {
+                            prepended = head;
+                        }
                         Err(e) => {
                             tracing::error!(
                                 "Failed to append visible screen to backing file: {}",
@@ -2327,8 +2557,8 @@ impl Window {
                     // line start), not on the line start hidden above.
                     let cursor_byte = anchor_byte.saturating_add(prepended.bytes).min(total_bytes);
                     view_state.cursors.primary_mut().position = cursor_byte;
-                    view_state.viewport.top_byte = anchor_byte;
-                    view_state.viewport.top_view_line_offset = prepended.rows;
+                    view_state.viewport.set_top_byte(anchor_byte);
+                    view_state.viewport.set_top_view_line_offset(prepended.rows);
                     view_state.viewport.left_column = 0;
                 }
             }
@@ -2411,90 +2641,62 @@ impl Window {
         }
     }
 
-    /// Render terminal content for terminal buffers in this window's
-    /// split areas. Overlays the live PTY grid (colors, attributes,
-    /// optional cursor) on top of the buffer's regular text content
-    /// inside `content_rect`.
+    /// Paint a live terminal pane's PTY grid into `content_rect` — the
+    /// pane's own paint, run by the frame's host painter after the text pass
+    /// drew the mirror (`shell_host::BodyPainter::pane`).
     ///
-    /// `cursor_visible_if_active` controls whether the cursor is
-    /// painted at all. The active-window render passes `true` so a
-    /// focused terminal in `terminal_mode` blinks normally; the
-    /// preview path passes `false` so the picker preview stays
-    /// read-only.
+    /// `cursor_visible_if_active` controls whether the block cursor is
+    /// painted at all: the frame passes `true` so a focused terminal in
+    /// terminal mode blinks normally; an embed passes `false`, since it is
+    /// not the input target. The cursor belongs to the focused split's live
+    /// terminal only — other live splits mirror the same PTY.
     ///
-    /// Window-local in every respect — reads `terminal_buffers`,
-    /// `terminal_manager`, `terminal_mode`, `active_buffer()`, and
-    /// `resources.theme` from `self`. The caller picks the window
-    /// (active vs previewed); this method never reaches back to an
-    /// `Editor` or to any other window.
-    pub fn render_terminal_splits(
+    /// Window-local in every respect — reads `terminal_manager`,
+    /// `terminal_link_hover` and `resources.theme` from `self`; the caller
+    /// picks the window and has decided the pane is not in scroll-back.
+    pub fn paint_terminal_grid(
         &self,
-        frame: &mut ratatui::Frame,
-        split_areas: &[(
-            crate::model::event::LeafId,
-            BufferId,
-            ratatui::layout::Rect,
-            ratatui::layout::Rect,
-            usize,
-            usize,
-        )],
+        buf: &mut ratatui::buffer::Buffer,
+        split_id: crate::model::event::LeafId,
+        buffer_id: BufferId,
+        content_rect: ratatui::layout::Rect,
         cursor_visible_if_active: bool,
     ) {
-        let focused_split = self.effective_active_split();
-        for (split_id, buffer_id, content_rect, _scrollbar_rect, _thumb_start, _thumb_end) in
-            split_areas
-        {
-            let Some(terminal_id) = self.get_terminal_id(*buffer_id) else {
-                continue;
-            };
-            // The live PTY grid overlays every split showing a terminal EXCEPT
-            // one that is in read-only scrollback — there we defer to normal
-            // text rendering so the user can scroll. Keying this on the split
-            // (not the buffer, not the single window flag) is what lets the
-            // same terminal be scrolled back in one split while another keeps
-            // streaming the live grid, independently, even off-focus
-            // (fresh#2595).
-            if self.split_terminal_scrollback(*split_id, *buffer_id) {
-                continue;
-            }
-            let Some(handle) = self.terminal_manager.get(terminal_id) else {
-                continue;
-            };
-            let Ok(state) = handle.state.lock() else {
-                continue;
-            };
-            let cursor_pos = state.cursor_position();
-            // The block cursor belongs to the focused split's live terminal
-            // only — other live splits mirror the same PTY but aren't the
-            // input target.
-            let cursor_visible = state.cursor_visible()
-                && *split_id == focused_split
-                && self.focused_terminal_live()
-                && cursor_visible_if_active;
-            let (_, rows) = state.size();
-            let mut content = Vec::with_capacity(rows as usize);
-            for row in 0..rows {
-                content.push(state.get_line(row));
-            }
-            // Ctrl+hover underline: highlight the link span when it's in this
-            // terminal buffer.
-            let link_highlight = self
-                .terminal_link_hover
-                .as_ref()
-                .and_then(|h| (h.buffer_id == *buffer_id).then(|| (h.row, h.cols.clone())));
-            frame.render_widget(ratatui::widgets::Clear, *content_rect);
-            let theme = self.resources.theme.read().unwrap();
-            render::render_terminal_content(
-                &content,
-                cursor_pos,
-                cursor_visible,
-                *content_rect,
-                frame.buffer_mut(),
-                theme.terminal_fg,
-                theme.terminal_bg,
-                link_highlight,
-            );
+        let Some(terminal_id) = self.get_terminal_id(buffer_id) else {
+            return;
+        };
+        let Some(handle) = self.terminal_manager.get(terminal_id) else {
+            return;
+        };
+        let Ok(state) = handle.state.lock() else {
+            return;
+        };
+        let cursor_pos = state.cursor_position();
+        let cursor_visible = state.cursor_visible()
+            && split_id == self.effective_active_split()
+            && self.focused_terminal_live()
+            && cursor_visible_if_active;
+        let (_, rows) = state.size();
+        let mut content = Vec::with_capacity(rows as usize);
+        for row in 0..rows {
+            content.push(state.get_line(row));
         }
+        let link_highlight = self
+            .terminal_link_hover
+            .as_ref()
+            .and_then(|h| (h.buffer_id == buffer_id).then(|| (h.row, h.cols.clone())));
+        ratatui::widgets::Widget::render(ratatui::widgets::Clear, content_rect, buf);
+        let theme = self.resources.theme.read().unwrap();
+        render::render_terminal_content(
+            &content,
+            cursor_pos,
+            cursor_visible,
+            content_rect,
+            buf,
+            theme.terminal_fg,
+            theme.terminal_bg,
+            link_highlight,
+        );
     }
 }
 
@@ -2644,6 +2846,9 @@ pub mod render {
                 // Apply modifiers
                 if cell.bold {
                     style = style.add_modifier(Modifier::BOLD);
+                }
+                if cell.dim {
+                    style = style.add_modifier(Modifier::DIM);
                 }
                 if cell.italic {
                     style = style.add_modifier(Modifier::ITALIC);

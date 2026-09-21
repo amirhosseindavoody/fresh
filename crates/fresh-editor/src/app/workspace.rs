@@ -22,7 +22,7 @@
 //!
 //! Performance: O(1) ≈ 10ms (lazy load) vs O(n) ≈ 1000ms (log replay)
 
-use rust_i18n::t;
+use fresh_i18n::t;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -55,43 +55,61 @@ use super::Editor;
 ///   local external edit.
 /// - If still not found, return `None` so the caller drops the fold rather
 ///   than re-attaching it to unrelated content.
+///
+/// Whatever the route, a candidate that is blank is rejected (issue #3031).
+/// No fold-creation path puts a header on a blank line: indent folding
+/// refuses a blank header outright, and an LSP range starts on the
+/// construct it folds. A saved fold that resolves onto one is therefore
+/// stale — and restoring it is worse than dropping it, because the first
+/// hidden line is then the *real* block opener while the blank header row
+/// shows nothing but the placeholder, with no text and no line number to
+/// say a fold is there at all.
 fn resolve_fold_header_line(
     buffer: &crate::model::buffer::Buffer,
     saved_line: usize,
     header_text: Option<&str>,
 ) -> Option<usize> {
-    let Some(expected) = header_text else {
+    let line_text = |line: usize| -> Option<String> {
+        buffer.get_line(line).map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .trim()
+                .to_string()
+        })
+    };
+    let candidate = match header_text {
         // Backward compatibility: no recorded text, trust the line number.
-        return Some(saved_line);
-    };
-    let expected_trimmed = expected.trim();
-    let line_matches = |line: usize| -> bool {
-        buffer
-            .get_line(line)
-            .map(|bytes| {
-                let text = String::from_utf8_lossy(&bytes);
-                text.trim_end_matches('\n').trim_end_matches('\r').trim() == expected_trimmed
-            })
-            .unwrap_or(false)
-    };
-    if line_matches(saved_line) {
-        return Some(saved_line);
-    }
-    // Search nearby (expanding outward) for the displaced header.
-    const SEARCH_WINDOW: usize = 32;
-    for delta in 1..=SEARCH_WINDOW {
-        let above = saved_line.checked_sub(delta);
-        if let Some(l) = above {
-            if line_matches(l) {
-                return Some(l);
+        None => Some(saved_line),
+        Some(expected) => {
+            let expected_trimmed = expected.trim();
+            let line_matches =
+                |line: usize| -> bool { line_text(line).as_deref() == Some(expected_trimmed) };
+            if line_matches(saved_line) {
+                Some(saved_line)
+            } else {
+                // Search nearby (expanding outward) for the displaced header.
+                const SEARCH_WINDOW: usize = 32;
+                let mut found = None;
+                for delta in 1..=SEARCH_WINDOW {
+                    let above = saved_line.checked_sub(delta);
+                    if let Some(l) = above {
+                        if line_matches(l) {
+                            found = Some(l);
+                            break;
+                        }
+                    }
+                    let below = saved_line.saturating_add(delta);
+                    if line_matches(below) {
+                        found = Some(below);
+                        break;
+                    }
+                }
+                found
             }
         }
-        let below = saved_line.saturating_add(delta);
-        if line_matches(below) {
-            return Some(below);
-        }
-    }
-    None
+    };
+    candidate.filter(|line| line_text(*line).is_some_and(|text| !text.is_empty()))
 }
 
 /// Workspace persistence state tracker
@@ -175,6 +193,13 @@ impl Editor {
     /// active-window wrapper over [`Editor::save_workspace_for`].
     pub fn save_workspace(&mut self) -> Result<(), WorkspaceError> {
         self.save_workspace_for(self.active_window)
+    }
+
+    /// Set to `false` for a `--no-restore` run: the flag means "this session
+    /// neither reads nor writes workspace state", so quit-time saves and
+    /// mid-session checkpoints are suppressed alike (#2735).
+    pub fn set_workspace_persistence(&mut self, enabled: bool) {
+        self.workspace_persistence_enabled = enabled;
     }
 
     /// Try to load and apply a workspace for the active window. Thin
@@ -295,6 +320,10 @@ impl Editor {
                                 state.buffer.insert(0, &text);
                                 state.buffer.set_modified(true);
                                 state.buffer.set_recovery_pending(false);
+                                // The document is a different document now, and
+                                // this path never described the change as edit
+                                // damage. See `WrapIndex::damage_all`.
+                                state.wrap_indices.damage_all();
                                 // Invalidate saved position so undo can't
                                 // incorrectly clear the modified flag
                                 if let Some(log) =
@@ -389,20 +418,18 @@ impl Editor {
     /// override (`mouse_enabled`) is applied by
     /// `Window::apply_workspace_layout`.
     fn restore_config_overrides(&mut self, overrides: &WorkspaceConfigOverrides) {
-        if let Some(line_numbers) = overrides.line_numbers {
-            self.config_mut().editor.line_numbers = line_numbers;
-        }
+        // `line_numbers`, `line_wrap`, and `enable_inlay_hints` are legacy
+        // fields — read for serde compatibility with workspaces written by
+        // older builds, but no longer applied: their global toggles persist
+        // to the config file, which is the single source of truth. Stamping
+        // a workspace snapshot here silently overrode config edits made in
+        // other projects or by hand (same treatment as `menu_bar_hidden`,
+        // issue #1156).
         if let Some(relative_line_numbers) = overrides.relative_line_numbers {
             self.config_mut().editor.relative_line_numbers = relative_line_numbers;
         }
-        if let Some(line_wrap) = overrides.line_wrap {
-            self.config_mut().editor.line_wrap = line_wrap;
-        }
         if let Some(syntax_highlighting) = overrides.syntax_highlighting {
             self.config_mut().editor.syntax_highlighting = syntax_highlighting;
-        }
-        if let Some(enable_inlay_hints) = overrides.enable_inlay_hints {
-            self.config_mut().editor.enable_inlay_hints = enable_inlay_hints;
         }
         // `overrides.menu_bar_hidden` is a legacy field — kept for serde
         // compatibility with workspaces written by older builds, but no
@@ -423,6 +450,16 @@ impl Editor {
         if self.dormant_remote.contains_key(&id) {
             return Ok(());
         }
+        // A workspace whose contents are still being built has nothing worth
+        // recording — and it is temporarily rooted at its *project*
+        // directory (its own doesn't exist yet), so writing a workspace file
+        // here would file an empty layout against a directory that already
+        // has a real workspace of its own. The Orchestrator persists the
+        // in-flight create separately and rebuilds the row on the next
+        // launch; see `PreparingWindow`.
+        if self.preparing_windows.contains_key(&id) {
+            return Ok(());
+        }
         let Some(win) = self.windows.get(&id) else {
             return Ok(());
         };
@@ -432,13 +469,41 @@ impl Editor {
         win.sync_terminal_backing_files();
         win.save_all_global_file_states();
 
-        let workspace = win.capture_workspace();
+        // The single funnel for every workspace write, so `--no-restore`
+        // suppresses checkpoints as well as quit-time saves (#2735).
+        // Deliberately below the terminal/per-file flushes: those are not
+        // workspace files and a `--no-restore` session still reads them back.
+        if !self.workspace_persistence_enabled {
+            tracing::debug!(
+                "Skipping workspace save for window {id}: workspace persistence disabled (--no-restore)"
+            );
+            return Ok(());
+        }
+
+        let mut workspace = win.capture_workspace();
+        // The sidebar's sections are editor state (see `app::sidebar`), so
+        // the window's snapshot does not know them; they ride in its file.
+        workspace.file_explorer.sections = self.sidebar_section_states(id);
 
         // Refuse to overwrite a non-empty on-disk workspace with an
         // all-virtual snapshot (issue #2027). The protection is for
         // FILE/unnamed content only — terminals are live runtime state, so
         // a terminal-only on-disk workspace must NOT block this save.
-        if workspace.has_no_real_content() && win.has_any_virtual_buffer() {
+        //
+        // Only for a window that never restored. The guard exists for an
+        // instance that boots straight to a virtual surface without ever
+        // reading the workspace — it must not wipe content it never held.
+        // A window that *did* restore and is now all-virtual is the user
+        // having closed their files, and refusing that save resurrected
+        // them on the next launch: the welcome screen is a virtual
+        // buffer, so closing the last file left exactly the shape this
+        // guard rejects, and the stale snapshot survived every save and
+        // every checkpoint for the rest of the session (issue #2027's
+        // guard also sits on `checkpoint_window_workspace`).
+        if !win.workspace_restored
+            && workspace.has_no_real_content()
+            && win.has_any_virtual_buffer()
+        {
             let root = win.root.clone();
             let on_disk = Workspace::load(&root).ok().flatten();
             if let Some(existing) = on_disk {
@@ -539,7 +604,7 @@ impl Editor {
             let (label, root2, authority, resources, tw, th, pstate) = (
                 old.label,
                 old.root,
-                old.authority,
+                old.connection,
                 old.resources,
                 old.terminal_width,
                 old.terminal_height,
@@ -554,6 +619,10 @@ impl Editor {
             built.authority_spec = workspace.authority_spec.clone();
             self.windows.insert(id, built);
         }
+
+        // The window's own sections come back scoped to it; the editor-wide
+        // ones to everyone (see `app::sidebar::SectionScope`).
+        self.restore_sidebar_sections(id, &workspace.file_explorer.sections);
 
         // Active-window only: the restored active buffer never went through a
         // focus path, so nothing has derived the terminal live/scrollback
@@ -579,16 +648,11 @@ impl Editor {
         if id == self.active_window {
             #[cfg(feature = "plugins")]
             {
-                let buffer_id = self.active_buffer();
-                self.update_plugin_state_snapshot();
                 tracing::debug!(
-                    "Firing buffer_activated for active buffer {:?} after workspace restore",
-                    buffer_id
+                    "Announcing focus for active buffer {:?} after workspace restore",
+                    self.active_buffer()
                 );
-                self.plugin_manager.read().unwrap().run_hook(
-                    "buffer_activated",
-                    crate::services::plugins::hooks::HookArgs::BufferActivated { buffer_id },
-                );
+                self.announce_focus();
             }
         }
 
@@ -900,6 +964,15 @@ impl crate::app::window::Window {
         };
         let wrapper_for_spawn = self.apply_remote_terminal_env(wrapper_for_spawn);
         let env_delta = self.terminal_env_delta(&wrapper_for_spawn);
+        // A terminal saved with the script grant comes back holding it: mint a
+        // token bound to *this* (restored) window and stamp it into the child's
+        // environment. The saved workspace records only that the grant existed
+        // — the token itself belonged to the editor run that is gone.
+        let extra_env = if terminal.script_access {
+            self.remint_terminal_script_env(predicted_id)
+        } else {
+            std::collections::HashMap::new()
+        };
         let terminal_id = match self.terminal_manager.spawn(
             terminal.cols,
             terminal.rows,
@@ -911,7 +984,7 @@ impl crate::app::window::Window {
             crate::services::terminal::BackingMode::Continue,
             wrapper_for_spawn,
             env_delta,
-            std::collections::HashMap::new(),
+            extra_env,
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -925,6 +998,7 @@ impl crate::app::window::Window {
         };
 
         // Ensure maps keyed by actual ID
+        self.rekey_terminal_script_token(predicted_id, terminal_id);
         if terminal_id != predicted_id {
             self.terminal_log_files
                 .insert(terminal_id, log_path.clone());
@@ -1018,6 +1092,9 @@ impl crate::app::window::Window {
                 // A restored terminal is re-persisted by the branch above on
                 // the next save, so it must not be treated as throwaway.
                 ephemeral: false,
+                // Nothing is spawned here, so no token is minted — the grant
+                // is carried so the restart (which does spawn) mints one.
+                script_access: terminal.script_access,
                 title: terminal.title.clone(),
             },
         );
@@ -1331,6 +1408,7 @@ impl crate::app::window::Window {
         let Some(split_state) = split_states.get(&saved_split_id) else {
             return;
         };
+        let ephemeral_patterns = self.config().editor.ephemeral_file_patterns.clone();
 
         // Resolve the split-manager-assigned buffer before taking the
         // &mut borrow on windows so the borrow stays disjoint from
@@ -1437,6 +1515,12 @@ impl crate::app::window::Window {
 
                 // Restore cursor, scroll, view_mode, and compose_width for ALL buffers in file_states
                 for (rel_path, file_state) in &split_state.file_states {
+                    // Saved offsets for an ephemeral file point into content
+                    // that no longer exists; gating on load also heals
+                    // workspaces written before the save-side gate (#2761).
+                    if crate::workspace::is_ephemeral_file(rel_path, &ephemeral_patterns) {
+                        continue;
+                    }
                     // Look up buffer by path, or by unnamed recovery ID
                     let rel_str = rel_path.to_string_lossy();
                     let buffer_id = if let Some(recovery_id) = rel_str.strip_prefix("__unnamed__") {
@@ -1466,9 +1550,12 @@ impl crate::app::window::Window {
                         (file_state.cursor.sticky_column != 0)
                             .then_some(file_state.cursor.sticky_column);
 
-                    buf_state.viewport.top_byte = file_state.scroll.top_byte.min(max_pos);
-                    buf_state.viewport.top_view_line_offset =
-                        file_state.scroll.top_view_line_offset;
+                    buf_state
+                        .viewport
+                        .set_top_byte(file_state.scroll.top_byte.min(max_pos));
+                    buf_state
+                        .viewport
+                        .set_top_view_line_offset(file_state.scroll.top_view_line_offset);
                     buf_state.viewport.left_column = file_state.scroll.left_column;
                     buf_state.viewport.set_skip_resize_sync();
 
@@ -1477,7 +1564,7 @@ impl crate::app::window::Window {
                     // before the user closed) the restore re-creates an off-screen
                     // cursor that arrow keys can't escape (the wrap-mode early return
                     // in `viewport.rs::ensure_visible` no-ops for any cursor whose
-                    // byte position is `>= viewport.top_byte`). Reconcile so the
+                    // byte position is `>= viewport.top_byte()`). Reconcile so the
                     // restored view always shows the cursor (#1689 follow-up).
                     if let Some(state) = __buffers_mut.get_mut(&buffer_id) {
                         super::navigation::reconcile_restored_buffer_view(
@@ -1518,6 +1605,10 @@ impl crate::app::window::Window {
                         buf_state.line_wrap_override = Some(line_wrap);
                         buf_state.viewport.line_wrap_enabled = line_wrap;
                     }
+                    if let Some(highlight_current_line) = file_state.highlight_current_line {
+                        buf_state.highlight_current_line_override = Some(highlight_current_line);
+                        buf_state.highlight_current_line = highlight_current_line;
+                    }
                     buf_state.plugin_state = file_state.plugin_state.clone();
                     if let Some(state) = __buffers_mut.get_mut(&buffer_id) {
                         // Re-apply the explicit per-buffer virtual-space
@@ -1525,6 +1616,45 @@ impl crate::app::window::Window {
                         if let Some(virtual_space) = file_state.virtual_space {
                             state.buffer_settings.virtual_space = virtual_space;
                             state.buffer_settings.virtual_space_override = Some(virtual_space);
+                        }
+                        // Same for the per-buffer indentation-guide and
+                        // folding-indicator toggles: both are consulted at
+                        // render time, so restoring the override is all it
+                        // takes for the buffer to come back looking the way
+                        // the user left it.
+                        // Guide/fold pins are per (split, buffer): they land
+                        // on this split's view state, not on the shared
+                        // BufferSettings.
+                        if let Some(indentation_guide) = file_state.indentation_guide {
+                            buf_state.indentation_guide_user_override = Some(indentation_guide);
+                        }
+                        if let Some(fold_indicators) = file_state.fold_indicators {
+                            buf_state.fold_indicators_override = Some(fold_indicators);
+                        }
+                        if let Some(use_tabs) = file_state.use_tabs {
+                            state.buffer_settings.use_tabs = use_tabs;
+                            state.buffer_settings.use_tabs_override = Some(use_tabs);
+                        }
+                        // The whitespace toggles store bools, not the
+                        // resolved struct, so the visibility is re-derived from
+                        // config here — that way a config edit between sessions
+                        // still lands. `buffer_settings.whitespace` is still the
+                        // configured value at this point (nothing has toggled
+                        // it yet), so it is the right baseline to pass in.
+                        if file_state.whitespace_indicators.is_some()
+                            || file_state.tab_indicators.is_some()
+                        {
+                            let configured = state.buffer_settings.whitespace;
+                            state.buffer_settings.whitespace_override =
+                                file_state.whitespace_indicators;
+                            state.buffer_settings.tab_indicators_override =
+                                file_state.tab_indicators;
+                            state.buffer_settings.apply_whitespace_override(configured);
+                        }
+                        if let Some(highlight_occurrences) = file_state.highlight_occurrences {
+                            state.buffer_settings.highlight_occurrences_override =
+                                Some(highlight_occurrences);
+                            state.reference_highlight_overlay.enabled = highlight_occurrences;
                         }
                         buf_state.folds.clear(&mut state.marker_list);
                         for fold in &file_state.folds {
@@ -1540,8 +1670,8 @@ impl crate::app::window::Window {
                                 fold.header_text.as_deref(),
                             ) else {
                                 tracing::debug!(
-                                    "Dropping stale fold: header_line={} no longer matches stored \
-                             header_text after external edit",
+                                    "Dropping stale fold: header_line={} no longer resolves to a \
+                             usable header (text drift, or the line it lands on is blank)",
                                     fold.header_line,
                                 );
                                 continue;
@@ -1564,6 +1694,7 @@ impl crate::app::window::Window {
                                 .line_start_offset(end_line.saturating_add(1))
                                 .unwrap_or_else(|| state.buffer.len());
                             buf_state.folds.add(
+                                &state.buffer,
                                 &mut state.marker_list,
                                 start_byte,
                                 end_byte,
@@ -1576,7 +1707,7 @@ impl crate::app::window::Window {
                         "Restored keyed state for {:?}: cursor={}, top_byte={}, view_mode={:?}",
                         rel_path,
                         cursor_pos,
-                        buf_state.viewport.top_byte,
+                        buf_state.viewport.top_byte(),
                         buf_state.view_mode,
                     );
                 }
@@ -1601,27 +1732,18 @@ impl crate::app::window::Window {
                     active_buffer_id = view_state.buffer_tab_ids().next();
                 }
 
-                // For buffers without saved file_state (e.g., terminals), apply split-level
-                // view_mode/compose_width as fallback (backward compatibility)
-                let restored_view_mode = match split_state.view_mode {
-                    SerializedViewMode::Source => ViewMode::Source,
-                    SerializedViewMode::PageView => ViewMode::PageView,
-                };
-
+                // **A buffer restores its own view state or none.** What used
+                // to stand here read the split's `view_mode` and
+                // `compose_width` — a copy of whatever buffer was active when
+                // the session was saved — onto whatever buffer came up active
+                // now, whenever that buffer had no state of its own. A scratch
+                // buffer never has state of its own, so the session saved with
+                // the welcome page in front reopened with that page's column
+                // around an empty buffer. Both fields are gone from the split
+                // (see `SerializedSplitViewState`); the per-buffer restore
+                // above is the only one there is.
                 if let Some(active_buf_id) = active_buffer_id {
-                    // Switch the split to the active buffer
                     view_state.switch_buffer(active_buf_id);
-
-                    // If no per-buffer file_state was saved, apply split-level settings
-                    let active_has_file_state = split_state.file_states.keys().any(|rel_path| {
-                        path_to_buffer.get(rel_path).copied() == Some(active_buf_id)
-                    });
-                    if !active_has_file_state {
-                        view_state.active_state_mut().view_mode = restored_view_mode.clone();
-                        view_state.active_state_mut().compose_width = split_state.compose_width;
-                    }
-
-                    // Cursors now live in SplitViewState, no need to sync to EditorState
                 }
                 view_state.tab_scroll_offset = split_state.tab_scroll_offset;
                 active_buffer_id
@@ -1924,10 +2046,10 @@ impl crate::app::window::Window {
                 .map(|(mgr, _)| mgr)
                 .expect("window must have a populated split layout")
                 .root()
-                .get_leaves_with_rects(ratatui::layout::Rect::default())
+                .visible_leaves()
                 .into_iter()
-                .find(|(sid, _, _)| *sid == *leaf_id)
-                .map(|(_, buffer_id, _)| buffer_id);
+                .find(|(sid, _)| *sid == *leaf_id)
+                .map(|(_, buffer_id)| buffer_id);
 
             if let Some(buffer_id) = active_buffer {
                 self.save_buffer_file_state(buffer_id, view_state);
@@ -1963,8 +2085,8 @@ impl crate::app::window::Window {
                 })
                 .collect(),
             scroll: SerializedScroll {
-                top_byte: view_state.viewport.top_byte,
-                top_view_line_offset: view_state.viewport.top_view_line_offset,
+                top_byte: view_state.viewport.top_byte(),
+                top_view_line_offset: view_state.viewport.top_view_line_offset(),
                 left_column: view_state.viewport.left_column,
             },
             view_mode: Default::default(),
@@ -1974,17 +2096,28 @@ impl crate::app::window::Window {
             line_numbers: None,
             line_wrap: None,
             virtual_space: None,
+            indentation_guide: None,
+            fold_indicators: None,
+            use_tabs: None,
+            whitespace_indicators: None,
+            tab_indicators: None,
+            highlight_current_line: None,
+            highlight_occurrences: None,
             plugin_state: std::collections::HashMap::new(),
             folds: Vec::new(),
         };
 
-        PersistedFileWorkspace::save(&abs_path, file_state);
+        PersistedFileWorkspace::save(
+            &abs_path,
+            file_state,
+            &self.config().editor.ephemeral_file_patterns,
+        );
     }
 
     /// Sync this window's active terminal visible screens to their
     /// backing files (so the snapshot captures complete terminal state).
     pub(crate) fn sync_terminal_backing_files(&self) {
-        use std::io::BufWriter;
+        use std::io::{BufWriter, Write};
 
         let terminals_to_sync: Vec<_> = self
             .terminal_buffers
@@ -2000,6 +2133,25 @@ impl crate::app::window::Window {
         for (terminal_id, backing_path) in terminals_to_sync {
             if let Some(handle) = self.terminal_manager.get(terminal_id) {
                 if let Ok(mut state) = handle.state.lock() {
+                    // Drop a visible-screen tail an earlier checkpoint or
+                    // scroll-back visit left behind: this snapshot writes a
+                    // fresh one below, and scrollback appended past a tail is
+                    // cut away by the truncation that ends the next scroll-back
+                    // visit (fresh#3151).
+                    if state.backing_file_has_tail() {
+                        let history_end = state.backing_file_history_end();
+                        match crate::app::terminal::terminal_backing_fs()
+                            .set_file_length(&backing_path, history_end)
+                        {
+                            Ok(()) => state.set_backing_file_has_tail(false),
+                            Err(e) => tracing::warn!(
+                                "Failed to drop terminal {:?} visible-screen tail: {}",
+                                terminal_id,
+                                e
+                            ),
+                        }
+                    }
+
                     // Persist any scrolled-off lines not yet in the file (e.g.
                     // lines a resize spilled into history on a terminal that was
                     // never viewed before quitting) so a restored workspace keeps
@@ -2017,16 +2169,30 @@ impl crate::app::window::Window {
                         }
                     }
 
+                    // Record the scrollback end before the tail goes in, so
+                    // the next writer knows where to cut it back off.
+                    if let Ok(metadata) =
+                        crate::app::terminal::terminal_backing_fs().metadata(&backing_path)
+                    {
+                        state.set_backing_file_history_end(metadata.size);
+                    }
+
                     if let Ok(mut file) = crate::app::terminal::terminal_backing_fs()
                         .open_file_for_append(&backing_path)
                     {
                         let mut writer = BufWriter::new(&mut *file);
-                        if let Err(e) = state.append_visible_screen(&mut writer) {
-                            tracing::warn!(
+                        // Claim the tail before writing it: a part-written
+                        // tail still leaves bytes past the history end, and
+                        // the flag is what gets them cut back off later.
+                        state.set_backing_file_has_tail(true);
+                        let appended = state.append_visible_screen(&mut writer);
+                        match appended.and_then(|_| writer.flush()) {
+                            Ok(()) => {}
+                            Err(e) => tracing::warn!(
                                 "Failed to sync terminal {:?} to backing file: {}",
                                 terminal_id,
                                 e
-                            );
+                            ),
                         }
                     }
                 }
@@ -2268,6 +2434,9 @@ impl crate::app::window::Window {
                             state.buffer.insert(0, &text);
                             state.buffer.set_modified(true);
                             state.buffer.set_recovery_pending(false);
+                            // Wholesale replacement, never described as edit
+                            // damage. See `WrapIndex::damage_all`.
+                            state.wrap_indices.damage_all();
                             mutated = true;
                             tracing::info!(
                                 "Restored unsaved changes for {:?} from hot exit recovery",
@@ -2362,6 +2531,10 @@ impl crate::app::window::Window {
             workspace.split_states.len()
         );
 
+        // This window now continues an on-disk workspace, which is what
+        // licenses a later all-virtual save to overwrite it.
+        self.workspace_restored = true;
+
         // Adopt the snapshot's durable identity: the window continues the
         // persisted workspace rather than starting a new one, so saves keep
         // landing in the same id-keyed file instead of minting a sibling on
@@ -2369,6 +2542,15 @@ impl crate::app::window::Window {
         // minted one — the next save re-keys the file under it.
         if let Some(id) = &workspace.stable_id {
             self.stable_id = id.clone();
+        }
+
+        // Same reasoning for when it was last focused: the window continues
+        // the persisted workspace, so it inherits that workspace's place in
+        // the recency order rather than the "now" its construction seeded.
+        // A legacy snapshot without the field keeps the seed, which is the
+        // right answer too — it is being materialized, so it is current.
+        if let Some(focused) = workspace.last_focused_at {
+            self.last_focused_at = focused;
         }
 
         // Window-local config override (the rest of the overrides mutate
@@ -2414,6 +2596,15 @@ impl crate::app::window::Window {
                 .set_active_split(LeafId(new_active_split));
         }
 
+        // Heal workspaces written before the invariant existed: a restored
+        // `UtilityDock` role on the sole root leaf makes every later panel
+        // open land as a full-window tab, permanently (#2415). A no-op
+        // rather than an expect: a snapshot whose layout could not be
+        // rebuilt at all leaves `splits` unseeded.
+        if let Some(splits) = self.buffers.split_manager_mut() {
+            splits.clear_root_leaf_role();
+        }
+
         self.restore_bookmarks_from_workspace(&workspace.bookmarks, &path_to_buffer);
         self.clean_orphaned_buffers();
         self.log_restore_summary(session_name);
@@ -2431,11 +2622,11 @@ impl crate::app::window::Window {
         id: fresh_core::WindowId,
         label: impl Into<String>,
         root: PathBuf,
-        authority: crate::services::authority::Authority,
+        connection: std::sync::Arc<crate::services::authority::Connection>,
         resources: crate::app::window_resources::WindowResources,
         workspace: &Workspace,
     ) -> Self {
-        let mut window = Self::new(id, label, root, authority, resources);
+        let mut window = Self::new(id, label, root, connection, resources);
         window.seed_initial_layout();
         window.apply_workspace_layout(workspace, None);
         window
@@ -2519,6 +2710,7 @@ impl crate::app::window::Window {
                     agent_resume,
                     exited: None,
                     title,
+                    script_access: self.terminal_has_script_access(terminal_id),
                 });
             }
         }
@@ -2567,6 +2759,7 @@ impl crate::app::window::Window {
                 // The pre-exit tab title, not the "(exited)" form the tab is
                 // showing now — restore re-applies the marker itself.
                 title: exited.title.clone(),
+                script_access: exited.script_access,
             });
         }
 
@@ -2596,12 +2789,8 @@ impl crate::app::window::Window {
             mgr.labels(),
         );
 
-        let active_buffers: HashMap<LeafId, BufferId> = mgr
-            .root()
-            .get_leaves_with_rects(ratatui::layout::Rect::default())
-            .into_iter()
-            .map(|(leaf_id, buffer_id, _)| (leaf_id, buffer_id))
-            .collect();
+        let active_buffers: HashMap<LeafId, BufferId> =
+            mgr.root().visible_leaves().into_iter().collect();
 
         let mut split_states = HashMap::new();
         for (leaf_id, view_state) in view_states {
@@ -2614,6 +2803,7 @@ impl crate::app::window::Window {
                 active_buffer,
                 &terminal_id_map,
                 &terminal_indices,
+                &self.config().editor.ephemeral_file_patterns,
             );
             split_states.insert(leaf_id.0 .0, serialized);
         }
@@ -2628,6 +2818,7 @@ impl crate::app::window::Window {
                 scroll_offset: explorer.get_scroll_offset(),
                 show_hidden: explorer.ignore_patterns().show_hidden(),
                 show_gitignored: explorer.ignore_patterns().show_gitignored(),
+                sections: Vec::new(),
             }
         } else {
             FileExplorerState {
@@ -2638,16 +2829,27 @@ impl crate::app::window::Window {
                 scroll_offset: 0,
                 show_hidden: false,
                 show_gitignored: false,
+                sections: Vec::new(),
             }
         };
 
         let cfg = &self.resources.config.editor;
         let config_overrides = WorkspaceConfigOverrides {
-            line_numbers: Some(cfg.line_numbers),
+            // `line_numbers`, `line_wrap`, and `enable_inlay_hints` are no
+            // longer snapshotted: their global toggles persist straight to the
+            // config file, so a workspace copy could only ever be stale — it
+            // shadowed a default the user changed elsewhere (or edited by
+            // hand) every time this workspace was opened, forever, because
+            // the restore stamped the stale value and the next save
+            // re-serialized it. `None` here also self-heals workspaces that
+            // still carry a stale value from an older build. The fields that
+            // remain are the settings whose toggles are session-scoped — the
+            // workspace file is their only persistence.
+            line_numbers: None,
             relative_line_numbers: Some(cfg.relative_line_numbers),
-            line_wrap: Some(cfg.line_wrap),
+            line_wrap: None,
             syntax_highlighting: Some(cfg.syntax_highlighting),
-            enable_inlay_hints: Some(cfg.enable_inlay_hints),
+            enable_inlay_hints: None,
             mouse_enabled: Some(
                 self.resources
                     .mouse_capture
@@ -2754,6 +2956,12 @@ impl crate::app::window::Window {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            // Carried through from the window rather than stamped here: this
+            // records when the workspace was last *focused*, and a save is
+            // not a focus. At quit every materialized window is captured in
+            // the same instant, so stamping here would make them all equally
+            // recent and the "reopen where I was" pick meaningless.
+            last_focused_at: Some(self.last_focused_at),
             // Workspace identity (windows.json is gone — the per-dir
             // workspace file is the sole record).
             label: Some(self.label.clone()),
@@ -2956,6 +3164,7 @@ fn serialize_split_node_pruned(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serialize_split_view_state(
     view_state: &crate::view::split::SplitViewState,
     buffers: &HashMap<BufferId, EditorState>,
@@ -2964,6 +3173,7 @@ fn serialize_split_view_state(
     active_buffer: Option<BufferId>,
     terminal_buffers: &HashMap<BufferId, TerminalId>,
     terminal_indices: &HashMap<TerminalId, usize>,
+    ephemeral_patterns: &[String],
 ) -> SerializedSplitViewState {
     let mut open_tabs = Vec::new();
     let mut open_files = Vec::new();
@@ -3031,6 +3241,13 @@ fn serialize_split_view_state(
             continue;
         };
 
+        // Something outside the editor rewrites these files (git regenerates
+        // COMMIT_EDITMSG every operation), so their state is always stale by
+        // the time it would be restored (#2761).
+        if crate::workspace::is_ephemeral_file(abs_path, ephemeral_patterns) {
+            continue;
+        }
+
         // Determine the key for this buffer's state
         let state_key = if abs_path.as_os_str().is_empty() {
             // Unnamed buffer - use recovery ID as key
@@ -3083,8 +3300,8 @@ fn serialize_split_view_state(
                     })
                     .collect(),
                 scroll: SerializedScroll {
-                    top_byte: buf_state.viewport.top_byte,
-                    top_view_line_offset: buf_state.viewport.top_view_line_offset,
+                    top_byte: buf_state.viewport.top_byte(),
+                    top_view_line_offset: buf_state.viewport.top_view_line_offset(),
                     left_column: buf_state.viewport.left_column,
                 },
                 view_mode: match buf_state.view_mode {
@@ -3097,23 +3314,26 @@ fn serialize_split_view_state(
                 virtual_space: buffers
                     .get(buffer_id)
                     .and_then(|state| state.buffer_settings.virtual_space_override),
+                indentation_guide: buf_state.indentation_guide_user_override,
+                fold_indicators: buf_state.fold_indicators_override,
+                use_tabs: buffers
+                    .get(buffer_id)
+                    .and_then(|state| state.buffer_settings.use_tabs_override),
+                whitespace_indicators: buffers
+                    .get(buffer_id)
+                    .and_then(|state| state.buffer_settings.whitespace_override),
+                tab_indicators: buffers
+                    .get(buffer_id)
+                    .and_then(|state| state.buffer_settings.tab_indicators_override),
+                highlight_current_line: buf_state.highlight_current_line_override,
+                highlight_occurrences: buffers
+                    .get(buffer_id)
+                    .and_then(|state| state.buffer_settings.highlight_occurrences_override),
                 plugin_state: buf_state.plugin_state.clone(),
                 folds,
             },
         );
     }
-
-    // Active buffer's view_mode/compose_width for the split-level fields (backward compat)
-    let active_view_mode = active_buffer
-        .and_then(|id| view_state.keyed_states.get(&id))
-        .map(|bs| match bs.view_mode {
-            ViewMode::Source => SerializedViewMode::Source,
-            ViewMode::PageView => SerializedViewMode::PageView,
-        })
-        .unwrap_or(SerializedViewMode::Source);
-    let active_compose_width = active_buffer
-        .and_then(|id| view_state.keyed_states.get(&id))
-        .and_then(|bs| bs.compose_width);
 
     SerializedSplitViewState {
         open_tabs,
@@ -3122,8 +3342,6 @@ fn serialize_split_view_state(
         active_file_index,
         file_states,
         tab_scroll_offset: view_state.tab_scroll_offset,
-        view_mode: active_view_mode,
-        compose_width: active_compose_width,
     }
 }
 

@@ -1341,8 +1341,14 @@ fn test_vi_visual_line_indent_stops_at_selection() {
     harness.render().unwrap();
     enable_vi_mode(&mut harness);
 
-    // V then j highlights the first three lines (vi visual-line selection);
-    // `four` is not selected and must stay unindented.
+    // `V` then `j` selects two lines, as it does in Vim: `select_line` already
+    // leaves the caret on the next line's first column, so `select_down`
+    // extends the selection by exactly one more line. `three` and `four` are
+    // not selected and must stay unindented.
+    //
+    // This test previously asserted three indented lines, which is what the
+    // plugin did before the extra `select_line_end` was dropped from
+    // `vi_vline_down` — checked against Vim 9.1, which indents two.
     harness
         .send_key(KeyCode::Char('V'), KeyModifiers::SHIFT)
         .unwrap();
@@ -1354,7 +1360,7 @@ fn test_vi_visual_line_indent_stops_at_selection() {
     send_key(&mut harness, '>');
 
     harness
-        .wait_for_buffer_content("    one\n    two\n    three\nfour\n")
+        .wait_for_buffer_content("    one\n    two\nthree\nfour\n")
         .unwrap();
 }
 
@@ -1443,6 +1449,14 @@ fn test_vi_bug_2441_dfr_deletes_through_target() {
         .wait_until(|h| h.editor().editor_mode() == Some("vi-operator-pending".to_string()))
         .unwrap();
     send_key(&mut harness, 'f');
+    // `f` enters vi-find-char and consumes the *next* key as the target.
+    // Wait for that mode before sending 'r': without it, a slow-CI race
+    // delivers 'r' while still in vi-operator-pending, the find never
+    // happens, and the wait below hangs to the external timeout. Same guard
+    // as the normal-mode f-find tests above.
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-find-char".to_string()))
+        .unwrap();
     send_key(&mut harness, 'r');
 
     harness.wait_for_buffer_content("ld foo bar baz\n").unwrap();
@@ -1464,6 +1478,14 @@ fn test_vi_bug_2441_dfw_target_is_motion_key() {
         .wait_until(|h| h.editor().editor_mode() == Some("vi-operator-pending".to_string()))
         .unwrap();
     send_key(&mut harness, 'f');
+    // `f` enters vi-find-char and consumes the *next* key as the target.
+    // Wait for that mode before sending 'w': without it, a slow-CI race
+    // delivers 'w' while still in vi-operator-pending, the find never
+    // happens, and the wait below hangs to the external timeout. Same guard
+    // as the normal-mode f-find tests above.
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-find-char".to_string()))
+        .unwrap();
     send_key(&mut harness, 'w');
 
     harness
@@ -1486,6 +1508,14 @@ fn test_vi_bug_2441_dtr_deletes_until_target() {
         .wait_until(|h| h.editor().editor_mode() == Some("vi-operator-pending".to_string()))
         .unwrap();
     send_key(&mut harness, 't');
+    // `t` enters vi-find-char and consumes the *next* key as the target.
+    // Wait for that mode before sending 'r': without it, a slow-CI race
+    // delivers 'r' while still in vi-operator-pending, the find never
+    // happens, and the wait below hangs to the external timeout. Same guard
+    // as the normal-mode f-find tests above.
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-find-char".to_string()))
+        .unwrap();
     send_key(&mut harness, 'r');
 
     harness
@@ -1508,6 +1538,14 @@ fn test_vi_bug_2441_cfr_changes_through_target() {
         .wait_until(|h| h.editor().editor_mode() == Some("vi-operator-pending".to_string()))
         .unwrap();
     send_key(&mut harness, 'f');
+    // `f` enters vi-find-char and consumes the *next* key as the target.
+    // Wait for that mode before sending 'r': without it, a slow-CI race
+    // delivers 'r' while still in vi-operator-pending, the find never
+    // happens, and the wait below hangs to the external timeout. Same guard
+    // as the normal-mode f-find tests above.
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-find-char".to_string()))
+        .unwrap();
     send_key(&mut harness, 'r');
     wait_insert(&mut harness);
     harness.type_text("X").unwrap();
@@ -1572,4 +1610,934 @@ fn test_vi_bug_2441_comma_repeats_find_reverse() {
 
     send_key(&mut harness, ',');
     harness.wait_until(|h| h.cursor_position() == 4).unwrap();
+}
+
+// =============================================================================
+// Issue #2443: dot-repeat (`.`) of the cursor-repositioning insert commands
+// (`o`/`O`/`a`/`A`) corrupted the buffer: the recorded change spanned from the
+// PRE-reposition cursor position to the insert end, so replay re-inserted
+// intervening buffer text instead of only the typed keystrokes.
+//
+// These reproducers observe only what is on screen: the rendered text rows and
+// the status line's mode and `Ln N, Col N` readouts.
+// =============================================================================
+
+/// First screen row that shows buffer text (row 0 is the menu bar, row 1 the
+/// tab bar).
+const FIRST_TEXT_ROW: u16 = 2;
+
+/// Consecutive identical frames that count as "the editor has finished
+/// reacting". Used only to decide that a *wrong* result is final; the expected
+/// result short-circuits the wait as soon as it renders.
+const SETTLED_RENDERS: usize = 20;
+
+/// The buffer lines as rendered, with the line-number gutter stripped and the
+/// scrollbar column dropped.
+///
+/// A line the editor renders empty comes back as `""`; rows past the end of the
+/// buffer come back as the `~` filler verbatim, so an expectation that lists the
+/// filler also pins the buffer's line count.
+fn rendered_buffer_lines(harness: &EditorTestHarness, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|i| {
+            let row = harness.screen_row_text(FIRST_TEXT_ROW + i as u16);
+            // The scrollbar paints a block glyph in the last column of some
+            // rows; it is chrome, not buffer text.
+            let row = row.trim_end_matches(['▌', '▐', '█', ' ']).to_string();
+            if let Some((_gutter, text)) = row.split_once(" │ ") {
+                text.to_string()
+            } else if row.ends_with('│') {
+                // Gutter with no text after it: an empty buffer line.
+                String::new()
+            } else {
+                row
+            }
+        })
+        .collect()
+}
+
+/// Wait for the rendered buffer rows to become exactly `expected`, and fail with
+/// a diff if the screen settles on anything else.
+///
+/// Both arms wait on observed state rather than elapsed time: the success arm
+/// fires the moment the expected rows render, and the failure arm fires once the
+/// screen has stopped changing. The failure arm is what makes these reproducers
+/// useful regression guards — waiting only for the expected text means a
+/// regression never asserts at all, it just runs until the external test timeout
+/// kills it, which reports a hang instead of naming the corrupted text.
+fn assert_renders(harness: &mut EditorTestHarness, expected: &[&str]) {
+    let mut previous = String::new();
+    let mut settled = 0usize;
+    harness
+        .wait_until(|h| {
+            if rendered_buffer_lines(h, expected.len()) == expected {
+                return true;
+            }
+            let screen = h.screen_to_string();
+            if screen == previous {
+                settled += 1;
+            } else {
+                previous = screen;
+                settled = 0;
+            }
+            settled >= SETTLED_RENDERS
+        })
+        .unwrap();
+
+    assert_eq!(
+        rendered_buffer_lines(harness, expected.len()),
+        expected,
+        "editor settled on the wrong buffer text"
+    );
+}
+
+/// Wait for the status line to report the cursor on the given 1-based line.
+fn wait_cursor_line(harness: &mut EditorTestHarness, line: usize) {
+    harness
+        .wait_for_screen_contains(&format!("Ln {line},"))
+        .unwrap();
+}
+
+/// Wait for the status line to report the given 1-based line and column.
+fn wait_cursor_at(harness: &mut EditorTestHarness, line: usize, col: usize) {
+    harness
+        .wait_for_screen_contains(&format!("Ln {line}, Col {col}"))
+        .unwrap();
+}
+
+/// Wait for the status line to show vi insert mode.
+fn wait_insert_indicator(harness: &mut EditorTestHarness) {
+    harness.wait_for_screen_contains("-- INSERT --").unwrap();
+}
+
+/// Leave insert mode, waiting for the status line to show normal mode again.
+fn escape_to_normal(harness: &mut EditorTestHarness) {
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+    harness.wait_for_screen_contains("-- NORMAL --").unwrap();
+}
+
+/// `o hello Esc` then `.` on another line must open a line below it containing
+/// exactly the typed text. BUG: `.` injected the original line's content plus
+/// the typed text mid-word (`charalpha` / `hellolie`).
+#[test]
+fn test_vi_bug_2443_dot_repeat_open_below() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "alpha\nbravo\ncharlie\ndelta\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'o');
+    wait_insert_indicator(&mut harness);
+    harness.type_text("hello").unwrap();
+    escape_to_normal(&mut harness);
+    assert_renders(
+        &mut harness,
+        &["alpha", "hello", "bravo", "charlie", "delta", "", "~"],
+    );
+
+    // Move from the inserted "hello" line down to "charlie", waiting for each
+    // motion to land so `.` replays at the intended position.
+    send_key(&mut harness, 'j');
+    wait_cursor_line(&mut harness, 3);
+    send_key(&mut harness, 'j');
+    wait_cursor_line(&mut harness, 4);
+
+    send_key(&mut harness, '.');
+    assert_renders(
+        &mut harness,
+        &[
+            "alpha", "hello", "bravo", "charlie", "hello", "delta", "", "~",
+        ],
+    );
+}
+
+/// `a Y Esc` then `.` on another line must append the typed text after the
+/// cursor. BUG: `.` re-injected the original line's leading character
+/// (`aYbravo` instead of `bYravo`).
+#[test]
+fn test_vi_bug_2443_dot_repeat_append_after_cursor() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "alpha\nbravo\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'a');
+    wait_insert_indicator(&mut harness);
+    harness.type_text("Y").unwrap();
+    escape_to_normal(&mut harness);
+    assert_renders(&mut harness, &["aYlpha", "bravo", "", "~"]);
+
+    // `j` then `0`: land on the `b` of "bravo".
+    send_key(&mut harness, 'j');
+    wait_cursor_line(&mut harness, 2);
+    send_key(&mut harness, '0');
+    wait_cursor_at(&mut harness, 2, 1);
+
+    send_key(&mut harness, '.');
+    assert_renders(&mut harness, &["aYlpha", "bYravo", "", "~"]);
+}
+
+/// `A X Esc` then `.` on another line must append the typed text at end of
+/// line. BUG: `.` injected the entire original line's content at the cursor
+/// (`bravalphaXo` instead of `bravoX`).
+#[test]
+fn test_vi_bug_2443_dot_repeat_append_line_end() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "alpha\nbravo\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'A');
+    wait_insert_indicator(&mut harness);
+    harness.type_text("X").unwrap();
+    escape_to_normal(&mut harness);
+    assert_renders(&mut harness, &["alphaX", "bravo", "", "~"]);
+
+    send_key(&mut harness, 'j');
+    wait_cursor_line(&mut harness, 2);
+
+    send_key(&mut harness, '.');
+    assert_renders(&mut harness, &["alphaX", "bravoX", "", "~"]);
+}
+
+/// `O` must open the empty line above the current line AND leave the cursor on
+/// it, so the typed text goes into the new line. BUG: the empty line opened at
+/// the right place but the cursor landed on the line above it, so the text
+/// corrupted that line (`bheyravo`), and `.` afterwards reported "No change to
+/// repeat".
+#[test]
+fn test_vi_bug_2443_open_above_cursor_placement_and_repeat() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "alpha\nbravo\ncharlie\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    // Move to "charlie".
+    send_key(&mut harness, 'j');
+    wait_cursor_line(&mut harness, 2);
+    send_key(&mut harness, 'j');
+    wait_cursor_line(&mut harness, 3);
+
+    send_key(&mut harness, 'O');
+    wait_insert_indicator(&mut harness);
+    harness.type_text("hey").unwrap();
+    escape_to_normal(&mut harness);
+    assert_renders(&mut harness, &["alpha", "bravo", "hey", "charlie", "", "~"]);
+
+    // `.` must repeat the whole change: open a line above and insert "hey".
+    send_key(&mut harness, '.');
+    assert_renders(
+        &mut harness,
+        &["alpha", "bravo", "hey", "hey", "charlie", "", "~"],
+    );
+}
+
+/// An insert entered with `i` after an unrelated `x` must be recorded for `.`.
+/// BUG: `.` still repeated the old `x` (the insert was never recorded), so the
+/// second line lost a character instead of gaining the typed one.
+#[test]
+fn test_vi_bug_2443_insert_after_delete_char_is_recorded() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "abc\nxyz\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'x');
+    assert_renders(&mut harness, &["bc", "xyz", "", "~"]);
+
+    send_key(&mut harness, 'i');
+    wait_insert_indicator(&mut harness);
+    harness.type_text("Q").unwrap();
+    escape_to_normal(&mut harness);
+    assert_renders(&mut harness, &["Qbc", "xyz", "", "~"]);
+
+    // `j` then `0`: land on the `x` of "xyz".
+    send_key(&mut harness, 'j');
+    wait_cursor_line(&mut harness, 2);
+    send_key(&mut harness, '0');
+    wait_cursor_at(&mut harness, 2, 1);
+
+    // `.` must repeat the insert (`iQ`), not the earlier `x`.
+    send_key(&mut harness, '.');
+    assert_renders(&mut harness, &["Qbc", "Qxyz", "", "~"]);
+}
+
+/// Control: dot-repeat of a plain `i` insert (already correct before the fix)
+/// keeps working, so the fix cannot regress it.
+#[test]
+fn test_vi_bug_2443_control_dot_repeat_insert_before() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "alpha\nbravo\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'i');
+    wait_insert_indicator(&mut harness);
+    harness.type_text("AB").unwrap();
+    escape_to_normal(&mut harness);
+    assert_renders(&mut harness, &["ABalpha", "bravo", "", "~"]);
+
+    // Cursor rests on `B` (col 2). `j` keeps the column, so `.` inserts before
+    // the `r` of "bravo".
+    send_key(&mut harness, 'j');
+    wait_cursor_at(&mut harness, 2, 2);
+
+    send_key(&mut harness, '.');
+    assert_renders(&mut harness, &["ABalpha", "bABravo", "", "~"]);
+}
+
+/// Control: dot-repeat of `x` (already correct before the fix) keeps deleting
+/// successive characters, so the fix cannot regress it.
+#[test]
+fn test_vi_bug_2443_control_dot_repeat_delete_char() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "abcdef\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'x');
+    assert_renders(&mut harness, &["bcdef", "", "~"]);
+
+    send_key(&mut harness, '.');
+    assert_renders(&mut harness, &["cdef", "", "~"]);
+
+    send_key(&mut harness, '.');
+    assert_renders(&mut harness, &["def", "", "~"]);
+}
+
+/// A recorded `ci"` must replay as a change, and stay one across repeated `.`.
+///
+/// Two bugs met here. The replay re-recorded itself from the `"d"` it is
+/// handed, downgrading the record to a delete; and `ci"` entered insert mode
+/// before its queued `deleteRange`/`setBufferCursor` had landed, so the
+/// session's start offset was the pre-command cursor and the Escape-time
+/// capture recorded surrounding buffer text as if it had been typed. The
+/// second is the `c`-operator half of #2443 — `.` pasted line 1's text into
+/// line 2 (`b "a "Q" y`). Found by driving the editor in tmux.
+#[test]
+fn test_vi_ci_quote_dot_repeat_twice_stays_a_change() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "a \"one\" z\nb \"two\" y\nc \"six\" x\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    harness.wait_until(|h| h.cursor_position() == 0).unwrap();
+
+    send_operator_text_object(&mut harness, 'c', 'i', '"');
+    wait_insert(&mut harness);
+    harness.type_text("Q").unwrap();
+    harness.render().unwrap();
+    escape(&mut harness);
+    harness
+        .wait_for_buffer_content("a \"Q\" z\nb \"two\" y\nc \"six\" x\n")
+        .unwrap();
+
+    // First `.` on line 2.
+    send_key(&mut harness, 'j');
+    wait_cursor_line(&mut harness, 2);
+    send_key(&mut harness, '0');
+    send_key(&mut harness, '.');
+    harness
+        .wait_for_buffer_content("a \"Q\" z\nb \"Q\" y\nc \"six\" x\n")
+        .unwrap();
+
+    // Second `.` on line 3 must still insert, not just delete.
+    send_key(&mut harness, 'j');
+    wait_cursor_line(&mut harness, 3);
+    send_key(&mut harness, '0');
+    send_key(&mut harness, '.');
+    harness
+        .wait_for_buffer_content("a \"Q\" z\nb \"Q\" y\nc \"Q\" x\n")
+        .unwrap();
+}
+
+/// Vi's modal state is scoped to one buffer: a visual anchor is a byte offset
+/// into the text it was taken in. Opening another buffer must return to normal
+/// mode rather than carry the anchor across, where it would address unrelated
+/// bytes.
+#[test]
+fn test_vi_buffer_switch_leaves_visual_mode() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let first = TestFixture::new("first.txt", "aaaaaaaaaaaaaaaa\nbbbb\n").unwrap();
+    let second = TestFixture::new("second.txt", "xyz\n").unwrap();
+    harness.open_file(&first.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    // Anchor a visual selection well past the end of the other buffer.
+    send_key(&mut harness, 'v');
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-visual".to_string()))
+        .unwrap();
+    for _ in 0..8 {
+        send_key(&mut harness, 'l');
+    }
+    harness.render().unwrap();
+
+    harness.open_file(&second.path).unwrap();
+    harness.render().unwrap();
+    wait_normal(&mut harness);
+
+    // `dl` is a fresh operator+motion in the new buffer. Had the abandoned
+    // anchor survived, the operator would have resolved against it instead of
+    // deleting the single character under the cursor.
+    send_key(&mut harness, 'd');
+    send_key(&mut harness, 'l');
+    harness.wait_for_buffer_content("yz\n").unwrap();
+}
+
+/// Returning to a buffer vi left mid-selection must not find normal mode
+/// sitting over a live selection: the host keeps the selection per buffer, so
+/// the next `x` would extend and cut the whole thing.
+#[test]
+fn test_vi_returning_to_buffer_collapses_abandoned_selection() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let first = TestFixture::new("first.txt", "abcdefgh\n").unwrap();
+    let second = TestFixture::new("second.txt", "zzzz\n").unwrap();
+    harness.open_file(&first.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'v');
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-visual".to_string()))
+        .unwrap();
+    for _ in 0..4 {
+        send_key(&mut harness, 'l');
+    }
+    harness.render().unwrap();
+    assert!(
+        harness.has_selection(),
+        "visual mode should be holding a selection before the switch — \
+         without one this test proves nothing"
+    );
+
+    harness.open_file(&second.path).unwrap();
+    harness.render().unwrap();
+    wait_normal(&mut harness);
+
+    // Back to the buffer that still holds the abandoned selection.
+    harness.open_file(&first.path).unwrap();
+    harness.render().unwrap();
+    wait_normal(&mut harness);
+
+    // The assertion is on the selection itself rather than on the result of an
+    // edit: after a visual selection the cursor sits at its end, so what `x`
+    // would remove depends on a column this test has no reason to pin down.
+    // `setBufferCursor` is dispatched to the editor thread, hence the wait.
+    harness.wait_until(|h| !h.has_selection()).unwrap();
+}
+
+/// The same for an insert session: its start offset belongs to the buffer it
+/// was opened in, so a buffer switch drops it instead of trying to capture
+/// typed text against the new buffer's cursor.
+#[test]
+fn test_vi_buffer_switch_leaves_insert_mode() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let first = TestFixture::new("first.txt", "alpha\n").unwrap();
+    let second = TestFixture::new("second.txt", "beta\n").unwrap();
+    harness.open_file(&first.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'i');
+    wait_insert(&mut harness);
+    harness.type_text("Z").unwrap();
+    harness.render().unwrap();
+
+    harness.open_file(&second.path).unwrap();
+    harness.render().unwrap();
+    wait_normal(&mut harness);
+
+    // Typing now goes through normal mode: `x` deletes a character rather
+    // than being inserted literally.
+    send_key(&mut harness, 'x');
+    harness.wait_for_buffer_content("eta\n").unwrap();
+}
+
+/// `memory` is deliberately not reset by a buffer switch: Vim's `.` is global,
+/// and it records a command rather than an offset, so it stays valid in any
+/// buffer. This is the half of the contract most likely to regress.
+#[test]
+fn test_vi_dot_repeat_survives_buffer_switch() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let first = TestFixture::new("first.txt", "alpha\n").unwrap();
+    let second = TestFixture::new("second.txt", "bravo\n").unwrap();
+    harness.open_file(&first.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    // Record a change in the first buffer.
+    send_key(&mut harness, 'x');
+    harness.wait_for_buffer_content("lpha\n").unwrap();
+
+    harness.open_file(&second.path).unwrap();
+    harness.render().unwrap();
+    wait_normal(&mut harness);
+
+    // `.` must still replay it here.
+    send_key(&mut harness, '.');
+    harness.wait_for_buffer_content("ravo\n").unwrap();
+}
+
+/// The same decay on the operator+motion path: `applyOperatorWithMotion`
+/// records too, and the replay hands it `"d"` for a recorded `cw`.
+#[test]
+fn test_vi_cw_dot_repeat_twice_stays_a_change() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "one two\nthree four\nfive six\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    harness.wait_until(|h| h.cursor_position() == 0).unwrap();
+
+    send_key(&mut harness, 'c');
+    send_key(&mut harness, 'w');
+    wait_insert(&mut harness);
+    harness.type_text("X").unwrap();
+    harness.render().unwrap();
+    escape(&mut harness);
+    harness
+        .wait_for_buffer_content("X two\nthree four\nfive six\n")
+        .unwrap();
+
+    send_key(&mut harness, 'j');
+    wait_cursor_line(&mut harness, 2);
+    send_key(&mut harness, '0');
+    send_key(&mut harness, '.');
+    harness
+        .wait_for_buffer_content("X two\nX four\nfive six\n")
+        .unwrap();
+
+    // The second `.` must still insert.
+    send_key(&mut harness, 'j');
+    wait_cursor_line(&mut harness, 3);
+    send_key(&mut harness, '0');
+    send_key(&mut harness, '.');
+    harness
+        .wait_for_buffer_content("X two\nX four\nX six\n")
+        .unwrap();
+}
+
+/// `buffer_activated` does not mean "the active buffer changed" — moving
+/// focus between two splits showing the same buffer fires it too, and
+/// deliberately so. Vi must not drop the selection being made in a file just
+/// because focus moved between two views of it.
+#[test]
+fn test_vi_split_focus_keeps_visual_mode() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "abcdefgh\nijkl\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    harness.wait_until(|h| h.cursor_position() == 0).unwrap();
+
+    // Two splits on the same buffer.
+    harness
+        .editor_mut()
+        .dispatch_action_for_tests(fresh::input::keybindings::Action::SplitVertical);
+    harness.render().unwrap();
+
+    send_key(&mut harness, 'v');
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-visual".to_string()))
+        .unwrap();
+    send_key(&mut harness, 'l');
+    harness.render().unwrap();
+
+    // Focus the other split: same buffer, so vi stays in visual mode.
+    harness.editor_mut().next_split();
+    harness.render().unwrap();
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-visual".to_string()))
+        .unwrap();
+}
+
+// =============================================================================
+// Vim-parity gaps found by running the same keystrokes through Vim 9.1
+// =============================================================================
+
+/// `Vk` has to grow the selection *upward* from the anchor line. The host's
+/// `select_up` shrank a selection that already ended at a line start to
+/// nothing, so `Vkd` deleted no lines at all.
+#[test]
+fn test_vi_visual_line_up_extends_selection() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'j');
+    send_key(&mut harness, 'j');
+    harness
+        .send_key(KeyCode::Char('V'), KeyModifiers::SHIFT)
+        .unwrap();
+    harness.render().unwrap();
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-visual-line".to_string()))
+        .unwrap();
+    send_key(&mut harness, 'k');
+    send_key(&mut harness, 'd');
+
+    harness
+        .wait_for_buffer_content("one\nfour\nfive\n")
+        .unwrap();
+}
+
+/// `VJ` joins every line the selection touches. Vim performs one join fewer
+/// than the number of selected lines.
+#[test]
+fn test_vi_visual_line_join() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "one\ntwo\nthree\nfour\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    harness
+        .send_key(KeyCode::Char('V'), KeyModifiers::SHIFT)
+        .unwrap();
+    harness.render().unwrap();
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-visual-line".to_string()))
+        .unwrap();
+    send_key(&mut harness, 'j');
+    send_key(&mut harness, 'J');
+
+    harness
+        .wait_for_buffer_content("one two\nthree\nfour\n")
+        .unwrap();
+}
+
+/// Visual mode takes `i`/`a` text objects: `viw` selects the word under the
+/// caret, and `d` then removes exactly that word.
+#[test]
+fn test_vi_visual_inner_word() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "hello world foo\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'w');
+    send_key(&mut harness, 'v');
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-visual".to_string()))
+        .unwrap();
+    send_key(&mut harness, 'i');
+    send_key(&mut harness, 'w');
+    send_key(&mut harness, 'd');
+
+    harness.wait_for_buffer_content("hello  foo\n").unwrap();
+}
+
+/// `vb` covers the character `v` started on, the way Vim's does: from the
+/// start of `world`, `vbd` removes `hello w`.
+#[test]
+fn test_vi_visual_word_back_includes_anchor() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "hello world foo\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'w');
+    send_key(&mut harness, 'v');
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-visual".to_string()))
+        .unwrap();
+    send_key(&mut harness, 'b');
+    send_key(&mut harness, 'd');
+
+    harness.wait_for_buffer_content("orld foo\n").unwrap();
+}
+
+/// Vim's bracket text objects do not fail when the caret is outside every
+/// pair: they fall forward to the next one.
+#[test]
+fn test_vi_inner_paren_falls_forward() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "foo(bar, baz)\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'd');
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-operator-pending".to_string()))
+        .unwrap();
+    send_key(&mut harness, 'i');
+    send_key(&mut harness, '(');
+
+    harness.wait_for_buffer_content("foo()\n").unwrap();
+}
+
+/// `I` inserts before the first non-blank, not in column 0 — that is `gI`.
+/// `.` replays the same motion.
+#[test]
+fn test_vi_insert_line_start_skips_indent() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "    one\n        two\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    harness
+        .send_key(KeyCode::Char('I'), KeyModifiers::SHIFT)
+        .unwrap();
+    harness.render().unwrap();
+    wait_insert(&mut harness);
+    harness.type_text("X").unwrap();
+    escape(&mut harness);
+
+    send_key(&mut harness, 'j');
+    send_key(&mut harness, '0');
+    send_key(&mut harness, '.');
+
+    harness
+        .wait_for_buffer_content("    Xone\n        Xtwo\n")
+        .unwrap();
+}
+
+/// `r` is a change, so `.` repeats it.
+#[test]
+fn test_vi_replace_char_dot_repeat() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "one\ntwo\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'r');
+    send_key(&mut harness, 'Z');
+    wait_normal(&mut harness);
+    send_key(&mut harness, 'j');
+    send_key(&mut harness, '0');
+    send_key(&mut harness, '.');
+
+    harness.wait_for_buffer_content("Zne\nZwo\n").unwrap();
+}
+
+/// `;` after a `t` skips the match it is already sitting in front of, instead
+/// of landing on the same column forever.
+#[test]
+fn test_vi_till_repeat_advances() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "hello world foo\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 't');
+    send_key(&mut harness, 'o');
+    wait_normal(&mut harness);
+    send_key(&mut harness, ';');
+    send_key(&mut harness, 'x');
+
+    // `to` lands on the `l` before the `o` of "hello". `;` skips that same `o`
+    // and stops before the one in "world", so `x` takes the `w`. Checked
+    // against Vim 9.1.
+    harness.wait_for_buffer_content("hello orld foo\n").unwrap();
+}
+
+/// Vim's `v$` lands *on* the end-of-line position, so the inclusive selection
+/// takes the line break and `v$d` joins the next line up. `d$` does not.
+#[test]
+fn test_vi_visual_line_end_takes_line_break() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "hello world\nnext\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'w');
+    send_key(&mut harness, 'v');
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-visual".to_string()))
+        .unwrap();
+    send_key(&mut harness, '$');
+    send_key(&mut harness, 'd');
+
+    harness.wait_for_buffer_content("hello next\n").unwrap();
+}
+
+/// `dj` on the last line and `dk` on the first are no-ops in Vim: the whole
+/// operator fails when the motion cannot move.
+#[test]
+fn test_vi_linewise_operator_fails_at_buffer_edge() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "one\ntwo\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_operator_motion(&mut harness, 'd', 'k');
+    wait_normal(&mut harness);
+    harness.wait_for_buffer_content("one\ntwo\n").unwrap();
+
+    send_key(&mut harness, 'j');
+    send_operator_motion(&mut harness, 'd', 'j');
+    wait_normal(&mut harness);
+    harness.wait_for_buffer_content("one\ntwo\n").unwrap();
+}
+
+// =============================================================================
+// Bugs found by an unprimed review of this branch, each checked against Vim 9.1
+// =============================================================================
+
+/// `[count]J` near the end of the file joined past the last line, deleting the
+/// trailing newline and appending a space. Vim joins what it can and stops.
+#[test]
+fn test_vi_join_count_stops_at_last_line() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "aaa\nbbb\nccc\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'j');
+    send_key(&mut harness, '5');
+    send_key(&mut harness, 'J');
+
+    harness.wait_for_buffer_content("aaa\nbbb ccc\n").unwrap();
+}
+
+/// Visual `J` took its line span from the line-wise mode's own bookkeeping, so
+/// in charwise visual it always joined exactly one pair.
+#[test]
+fn test_vi_visual_charwise_join_spans_selection() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "aaa\nbbb\nccc\nddd\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'v');
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-visual".to_string()))
+        .unwrap();
+    send_key(&mut harness, 'j');
+    send_key(&mut harness, 'j');
+    send_key(&mut harness, 'J');
+
+    harness
+        .wait_for_buffer_content("aaa bbb ccc\nddd\n")
+        .unwrap();
+}
+
+/// `r` replaces on the caret's line only. An unclamped count ran over the line
+/// break; Vim refuses the command outright when the line is too short.
+#[test]
+fn test_vi_replace_char_count_stays_on_line() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "ab\ncd\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, '5');
+    send_key(&mut harness, 'r');
+    send_key(&mut harness, 'z');
+    wait_normal(&mut harness);
+
+    // Nothing changes: five characters are not available on this line.
+    send_key(&mut harness, 'x');
+    harness.wait_for_buffer_content("b\ncd\n").unwrap();
+}
+
+/// `d3G` deletes to line 3, not to the end of the file. The count was dropped
+/// because a count defaulted to 1 is indistinguishable from no count at all.
+#[test]
+fn test_vi_delete_to_counted_line() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "aaa\nbbb\nccc\nddd\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'd');
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-operator-pending".to_string()))
+        .unwrap();
+    send_key(&mut harness, '3');
+    send_key(&mut harness, 'G');
+
+    harness.wait_for_buffer_content("ddd\n").unwrap();
+}
+
+/// A line-wise change leaves an empty line to type into; `.` replayed it as a
+/// plain delete, so the repeated text landed on the following line.
+#[test]
+fn test_vi_linewise_change_dot_repeat() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_operator_motion(&mut harness, 'c', 'j');
+    wait_insert(&mut harness);
+    harness.type_text("X").unwrap();
+    escape(&mut harness);
+
+    send_key(&mut harness, 'j');
+    send_key(&mut harness, 'j');
+    send_key(&mut harness, '.');
+
+    harness.wait_for_buffer_content("X\nthree\nX\n").unwrap();
+}
+
+/// `vh` and `vk` have to take the character `v` started on with them. Driving
+/// the host's selection backwards just shrank it to nothing.
+#[test]
+fn test_vi_visual_backward_keeps_anchor_character() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "hello world\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'l');
+    send_key(&mut harness, 'l');
+    send_key(&mut harness, 'l');
+    send_key(&mut harness, 'v');
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-visual".to_string()))
+        .unwrap();
+    send_key(&mut harness, 'h');
+    send_key(&mut harness, 'd');
+
+    harness.wait_for_buffer_content("heo world\n").unwrap();
+}
+
+/// Visual `k` grows the selection upward from the anchor.
+#[test]
+fn test_vi_visual_up_keeps_anchor_character() {
+    let (mut harness, _td) = vi_mode_harness(80, 24);
+    let fixture = TestFixture::new("test.txt", "aaa\nbbb\nccc\n").unwrap();
+    harness.open_file(&fixture.path).unwrap();
+    harness.render().unwrap();
+    enable_vi_mode(&mut harness);
+
+    send_key(&mut harness, 'j');
+    send_key(&mut harness, 'v');
+    harness
+        .wait_until(|h| h.editor().editor_mode() == Some("vi-visual".to_string()))
+        .unwrap();
+    send_key(&mut harness, 'k');
+    send_key(&mut harness, 'd');
+
+    harness.wait_for_buffer_content("bb\nccc\n").unwrap();
 }

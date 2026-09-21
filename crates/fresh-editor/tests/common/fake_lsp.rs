@@ -1335,9 +1335,394 @@ done
         dir.join("fake_lsp_server_logging.sh")
     }
 
+    /// Spawn a fake LSP server that mimics rust-analyzer's "flyimport"
+    /// gating (sinelaw/fresh#2603), as observed against rust-analyzer 1.94.1:
+    ///
+    /// - The auto-import completion candidate (`HashMap`, carrying its
+    ///   import path in `labelDetails` and delivering the `use` line lazily
+    ///   through `completionItem/resolve`) is only offered when the client's
+    ///   `initialize` capabilities declare
+    ///   `completionItem.resolveSupport.properties` containing
+    ///   `"additionalTextEdits"`. Otherwise the completion list is empty.
+    /// - `completionProvider.resolveProvider` is only advertised as `true`
+    ///   when the client can also resolve `"documentation"` lazily — even
+    ///   though the import edit is still deferred to resolve. A client that
+    ///   declares only `additionalTextEdits` therefore never resolves (it
+    ///   respects `resolveProvider: false`) and silently loses the import.
+    ///
+    /// Like the logging server, it takes a log-file path as its first
+    /// argument and appends every received method name to it, so tests can
+    /// wait for `textDocument/didOpen` before requesting completion.
+    pub fn spawn_flyimport(dir: &std::path::Path) -> anyhow::Result<Self> {
+        let (stop_tx, stop_rx) = mpsc::channel();
+
+        let script = r#"#!/bin/bash
+
+# Log file path (passed as first argument, or default)
+LOG_FILE="${1:-/tmp/fake_lsp_flyimport_log.txt}"
+> "$LOG_FILE"
+
+# Function to read a message
+read_message() {
+    local content_length=0
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
+            break
+        fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
+    done
+
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
+    fi
+}
+
+# Function to send a message
+send_message() {
+    local message="$1"
+    local length=${#message}
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
+}
+
+# Whether the client can lazily resolve additionalTextEdits
+# (rust-analyzer gates flyimport candidates on this).
+RESOLVE_ADDITIONAL_EDITS=0
+
+# Main loop
+while true; do
+    msg=$(read_message)
+
+    if [ -z "$msg" ]; then
+        break
+    fi
+
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+    if [ -n "$method" ]; then
+        echo "$method" >> "$LOG_FILE"
+    fi
+
+case "$method" in
+    "initialize")
+        if echo "$msg" | grep -q '"additionalTextEdits"'; then
+            RESOLVE_ADDITIONAL_EDITS=1
+        fi
+        # Like rust-analyzer: resolveProvider is only advertised when the
+        # client can lazily resolve documentation, even though the import
+        # edit itself is deferred to resolve. Match "documentation" inside a
+        # resolveSupport "properties" array specifically — the capability
+        # payload also contains "documentation" as a semantic-token modifier.
+        if echo "$msg" | grep -Eq '"properties":[^]]*"documentation"'; then
+            RESOLVE_PROVIDER=true
+        else
+            RESOLVE_PROVIDER=false
+        fi
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"capabilities":{"completionProvider":{"resolveProvider":'$RESOLVE_PROVIDER',"triggerCharacters":["."]},"textDocumentSync":1}}}'
+        ;;
+    "textDocument/completion")
+        if [ "$RESOLVE_ADDITIONAL_EDITS" = "1" ]; then
+            # The flyimport candidate: bare label, import path in
+            # labelDetails, additionalTextEdits deferred to resolve.
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"isIncomplete":false,"items":[{"label":"HashMap","kind":22,"insertText":"HashMap","labelDetails":{"detail":" (use std::collections::HashMap)"}}]}}'
+        else
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"isIncomplete":false,"items":[]}}'
+        fi
+        ;;
+    "completionItem/resolve")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"label":"HashMap","kind":22,"insertText":"HashMap","labelDetails":{"detail":" (use std::collections::HashMap)"},"additionalTextEdits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"use std::collections::HashMap;\n"}]}}'
+        ;;
+    "textDocument/didOpen"|"textDocument/didChange"|"textDocument/didSave"|"textDocument/didClose"|"initialized"|"$/cancelRequest")
+        # Notifications - no response needed
+        ;;
+    "shutdown")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        break
+        ;;
+    *)
+        # Respond to any unhandled requests to prevent pending request buildup
+        if [ -n "$msg_id" ]; then
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        fi
+        ;;
+esac
+done
+"#;
+
+        let script_path = Self::flyimport_script_path(dir);
+        std::fs::write(&script_path, script)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms)?;
+        }
+
+        let handle = Some(thread::spawn(move || {
+            let _ = stop_rx.recv();
+        }));
+
+        Ok(Self { handle, stop_tx })
+    }
+
+    /// Get the path to the flyimport fake LSP server script
+    pub fn flyimport_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_flyimport.sh")
+    }
+
     /// Get the default log file path used by the logging server
     pub fn default_log_path() -> std::path::PathBuf {
         std::path::PathBuf::from("/tmp/fake_lsp_log.txt")
+    }
+
+    /// Spawn a fake LSP server that offers **two candidates sharing one
+    /// label** — exactly what an auto-import list looks like once
+    /// unimported symbols are advertised (sinelaw/fresh#2603): every crate
+    /// exporting a `HashMap` contributes a row labelled `HashMap`, and the
+    /// rows differ only in the `use` line they bring along.
+    ///
+    /// The first row imports `wrong_crate::HashMap`, the second
+    /// `std::collections::HashMap`, so a client that recovers the accepted
+    /// item by *label* rather than by identity visibly inserts the wrong
+    /// import (sinelaw/fresh#2952).
+    ///
+    /// Takes the log-file path as its first argument (every received method
+    /// name is appended to it, so tests can wait for `textDocument/didOpen`)
+    /// and the delivery mode as its second:
+    ///
+    /// - `"eager"` — both items carry their own `additionalTextEdits`.
+    /// - `"resolve"` — neither does; the import arrives through
+    ///   `completionItem/resolve`, keyed on the item's `data` field. This
+    ///   is rust-analyzer's actual behaviour.
+    pub fn spawn_duplicate_labels(dir: &std::path::Path) -> anyhow::Result<Self> {
+        let (stop_tx, stop_rx) = mpsc::channel();
+
+        let script = r#"#!/bin/bash
+
+LOG_FILE="${1:-/tmp/fake_lsp_duplicate_labels_log.txt}"
+MODE="${2:-eager}"
+> "$LOG_FILE"
+
+read_message() {
+    local content_length=0
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
+            break
+        fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
+    done
+
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
+    fi
+}
+
+send_message() {
+    local message="$1"
+    local length=${#message}
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
+}
+
+WRONG_EDIT='[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"use wrong_crate::HashMap;\n"}]'
+RIGHT_EDIT='[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"use std::collections::HashMap;\n"}]'
+
+while true; do
+    msg=$(read_message)
+
+    if [ -z "$msg" ]; then
+        break
+    fi
+
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+    if [ -n "$method" ]; then
+        echo "$method" >> "$LOG_FILE"
+    fi
+
+case "$method" in
+    "initialize")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"capabilities":{"completionProvider":{"resolveProvider":true,"triggerCharacters":["."]},"textDocumentSync":1}}}'
+        ;;
+    "textDocument/completion")
+        # Two candidates, same label, different imports. The wrong one is
+        # deliberately first: accepting the second must not pick it up.
+        if [ "$MODE" = "resolve" ]; then
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"isIncomplete":false,"items":[{"label":"HashMap","kind":22,"insertText":"HashMap","labelDetails":{"detail":" (use wrong_crate::HashMap)"},"data":"wrong_crate"},{"label":"HashMap","kind":22,"insertText":"HashMap","labelDetails":{"detail":" (use std::collections::HashMap)"},"data":"std"}]}}'
+        else
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"isIncomplete":false,"items":[{"label":"HashMap","kind":22,"insertText":"HashMap","labelDetails":{"detail":" (use wrong_crate::HashMap)"},"data":"wrong_crate","additionalTextEdits":'"$WRONG_EDIT"'},{"label":"HashMap","kind":22,"insertText":"HashMap","labelDetails":{"detail":" (use std::collections::HashMap)"},"data":"std","additionalTextEdits":'"$RIGHT_EDIT"'}]}}'
+        fi
+        ;;
+    "completionItem/resolve")
+        # Answer the item that was actually sent: the `data` tag is what
+        # tells the two same-labelled candidates apart.
+        echo "RESOLVE:$msg" >> "$LOG_FILE"
+        if echo "$msg" | grep -q '"data":"wrong_crate"'; then
+            EDIT="$WRONG_EDIT"
+        else
+            EDIT="$RIGHT_EDIT"
+        fi
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"label":"HashMap","kind":22,"insertText":"HashMap","additionalTextEdits":'"$EDIT"'}}'
+        ;;
+    "textDocument/didOpen"|"textDocument/didChange"|"textDocument/didSave"|"textDocument/didClose"|"initialized"|"$/cancelRequest")
+        ;;
+    "shutdown")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        break
+        ;;
+    *)
+        if [ -n "$msg_id" ]; then
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        fi
+        ;;
+esac
+done
+"#;
+
+        let script_path = Self::duplicate_labels_script_path(dir);
+        std::fs::write(&script_path, script)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms)?;
+        }
+
+        let handle = Some(thread::spawn(move || {
+            let _ = stop_rx.recv();
+        }));
+
+        Ok(Self { handle, stop_tx })
+    }
+
+    /// Get the path to the duplicate-label fake LSP server script
+    pub fn duplicate_labels_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("fake_lsp_server_duplicate_labels.sh")
+    }
+
+    /// Write the script for a fake LSP server that offers **one
+    /// `HashMap` candidate whose auto-import only it can produce**, and
+    /// return the path. One script, run once per configured server: a
+    /// language served by several servers at once (fresh supports that as
+    /// a first-class list) merges all of their candidates into one popup.
+    ///
+    /// Takes the log-file path as its first argument and the server's own
+    /// name as its second. The name is both the candidate's `data` handle
+    /// and the crate in the `use` line the server answers
+    /// `completionItem/resolve` with — so the import that lands names the
+    /// server that was actually asked. A server can only mint its own
+    /// import, which is the point: `data` is opaque and server-private, so
+    /// resolving a candidate against a *different* server produces
+    /// somebody else's `use` line (sinelaw/fresh#2952).
+    ///
+    /// The candidates carry no `additionalTextEdits`, so the import has to
+    /// come from resolve — rust-analyzer's actual behaviour.
+    pub fn write_per_server_import_script(
+        dir: &std::path::Path,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let script = r#"#!/bin/bash
+
+LOG_FILE="${1:-/tmp/fake_lsp_per_server_import_log.txt}"
+NAME="${2:-server}"
+> "$LOG_FILE"
+
+read_message() {
+    local content_length=0
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [ -z "$line" ]; then
+            break
+        fi
+        case "$line" in
+            Content-Length:*)
+                content_length="${line#Content-Length:}"
+                content_length="${content_length// /}"
+                ;;
+        esac
+    done
+
+    if [ "$content_length" -gt 0 ] 2>/dev/null; then
+        dd bs=1 count="$content_length" 2>/dev/null
+    fi
+}
+
+send_message() {
+    local message="$1"
+    local length=${#message}
+    printf "Content-Length: %d\r\n\r\n%s" "$length" "$message"
+}
+
+while true; do
+    msg=$(read_message)
+
+    if [ -z "$msg" ]; then
+        break
+    fi
+
+    method=$(echo "$msg" | grep -o '"method":"[^"]*"' | cut -d'"' -f4)
+    msg_id=$(echo "$msg" | grep -o '"id":[0-9]*' | cut -d':' -f2)
+
+    if [ -n "$method" ]; then
+        echo "$method" >> "$LOG_FILE"
+    fi
+
+case "$method" in
+    "initialize")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"capabilities":{"completionProvider":{"resolveProvider":true,"triggerCharacters":["."]},"textDocumentSync":1}}}'
+        ;;
+    "textDocument/completion")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"isIncomplete":false,"items":[{"label":"HashMap","kind":22,"insertText":"HashMap","labelDetails":{"detail":" (use '"$NAME"'::HashMap)"},"data":"'"$NAME"'"}]}}'
+        ;;
+    "completionItem/resolve")
+        # This server knows one import and one only — its own. Handed a
+        # candidate minted by a sibling server it cannot do better, which
+        # is exactly why the request has to go to the right server.
+        echo "RESOLVE:$msg" >> "$LOG_FILE"
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":{"label":"HashMap","kind":22,"insertText":"HashMap","additionalTextEdits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"use '"$NAME"'::HashMap;\n"}]}}'
+        ;;
+    "textDocument/didOpen"|"textDocument/didChange"|"textDocument/didSave"|"textDocument/didClose"|"initialized"|"$/cancelRequest")
+        ;;
+    "shutdown")
+        send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        break
+        ;;
+    *)
+        if [ -n "$msg_id" ]; then
+            send_message '{"jsonrpc":"2.0","id":'$msg_id',"result":null}'
+        fi
+        ;;
+esac
+done
+"#;
+
+        let script_path = dir.join("fake_lsp_server_per_server_import.sh");
+        std::fs::write(&script_path, script)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms)?;
+        }
+
+        Ok(script_path)
     }
 
     /// Spawn a fake LSP server that returns hover content WITHOUT a range
@@ -2672,6 +3057,152 @@ impl Drop for FakeLspServer {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+// ===================================================================
+// Document-tracking server
+//
+// Keeps its own copy of each document by applying the changes it is
+// sent, exactly as a real server does, and logs that copy. Lets a test
+// assert "the server holds what the buffer holds" directly, instead of
+// inferring it from the diagnostics on screen (#3258).
+// ===================================================================
+
+/// A fake LSP server that keeps its own copy of the document and logs it as
+/// `DOC <json-encoded text>` after each notification it applies.
+///
+/// Arguments: `<log>`.
+pub fn write_document_tracking_server(dir: &std::path::Path) -> std::path::PathBuf {
+    let script = r#"#!/usr/bin/env python3
+import sys, os, json
+
+LOG = sys.argv[1]
+fin = os.fdopen(sys.stdin.fileno(), "rb", 0)
+fout = os.fdopen(sys.stdout.fileno(), "wb", 0)
+
+docs = {}
+
+
+def log(msg):
+    with open(LOG, "a") as f:
+        f.write(msg + "\n")
+
+
+def send(payload):
+    body = json.dumps(payload).encode()
+    fout.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+
+
+def read_message():
+    length = 0
+    while True:
+        line = fin.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        key, _, value = line.decode().partition(":")
+        if key.strip().lower() == "content-length":
+            length = int(value.strip())
+    if length <= 0:
+        return None
+    body = b""
+    while len(body) < length:
+        chunk = fin.read(length - len(body))
+        if not chunk:
+            return None
+        body += chunk
+    return json.loads(body.decode())
+
+
+def apply_change(text, change):
+    # A change with no range replaces the whole document.
+    if change.get("range") is None:
+        return change["text"]
+    lines = text.split("\n")
+
+    def offset(pos):
+        line = max(0, min(pos["line"], len(lines) - 1))
+        base = sum(len(l) + 1 for l in lines[:line])
+        return base + min(pos["character"], len(lines[line]))
+
+    start = max(0, min(offset(change["range"]["start"]), len(text)))
+    end = max(start, min(offset(change["range"]["end"]), len(text)))
+    return text[:start] + change["text"] + text[end:]
+
+
+while True:
+    msg = read_message()
+    if msg is None:
+        break
+    method = msg.get("method")
+    params = msg.get("params") or {}
+
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": msg.get("id"),
+              "result": {"capabilities": {"textDocumentSync": 2}}})
+    elif method == "shutdown":
+        send({"jsonrpc": "2.0", "id": msg.get("id"), "result": None})
+    elif method == "exit":
+        break
+    elif method == "textDocument/didOpen":
+        doc = params["textDocument"]
+        docs[doc["uri"]] = doc["text"]
+        log("DOC " + json.dumps(docs[doc["uri"]]))
+    elif method == "textDocument/didChange":
+        doc = params["textDocument"]
+        uri = doc["uri"]
+        text = docs.get(uri, "")
+        for change in params.get("contentChanges", []):
+            text = apply_change(text, change)
+        docs[uri] = text
+        log("DOC " + json.dumps(text))
+    elif method == "textDocument/didSave":
+        doc = params["textDocument"]
+        log("DIDSAVE %s %s" % (doc["uri"], json.dumps(params.get("text"))))
+    elif msg.get("id") is not None:
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+"#;
+
+    let script_path = dir.join("document_tracking_lsp.py");
+    std::fs::write(&script_path, script).expect("write fake server");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod script");
+    }
+
+    script_path
+}
+
+/// The document the server currently holds, read fresh: it appends as it works.
+pub fn server_document(log_file: &std::path::Path) -> Option<String> {
+    let log = std::fs::read_to_string(log_file).ok()?;
+    let last = log.lines().rev().find_map(|l| l.strip_prefix("DOC "))?;
+    serde_json::from_str::<String>(last).ok()
+}
+
+/// The text the server was handed by the `didSave` for the file named
+/// `basename`, or `None` if it has had no such save.
+pub fn saved_text(log_file: &std::path::Path, basename: &str) -> Option<String> {
+    let log = std::fs::read_to_string(log_file).ok()?;
+    let line = log
+        .lines()
+        .rev()
+        .filter_map(|l| l.strip_prefix("DIDSAVE "))
+        .find(|rest| {
+            rest.split(' ')
+                .next()
+                .is_some_and(|uri| uri.ends_with(basename))
+        })?;
+    let (_uri, text) = line.split_once(' ')?;
+    serde_json::from_str::<Option<String>>(text).ok().flatten()
 }
 
 #[cfg(test)]

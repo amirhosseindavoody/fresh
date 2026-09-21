@@ -18,9 +18,7 @@
 //! registry. With the bug present this fails (the remote fs sees
 //! `…/workspaces/…` paths); with the fix it passes (those reads go local).
 
-mod common;
-
-use common::harness::{EditorTestHarness, HarnessOptions};
+use crate::common::harness::{EditorTestHarness, HarnessOptions};
 use fresh::config_io::DirectoryContext;
 use fresh::model::filesystem::{
     DirEntry, FileMetadata, FilePermissions, FileReader, FileSearchCursor, FileSearchOptions,
@@ -28,7 +26,6 @@ use fresh::model::filesystem::{
 };
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// A filesystem that delegates to the local `StdFileSystem` but pretends to be
@@ -179,15 +176,14 @@ impl FileSystem for RecordingRemoteFs {
         self.record(path);
         self.inner.sudo_write(path, data, mode, uid, gid)
     }
-    fn walk_files(
+    fn walk(
         &self,
         root: &Path,
-        skip_dirs: &[&str],
-        cancel: &AtomicBool,
-        on_file: &mut dyn FnMut(&Path, &str) -> bool,
-    ) -> io::Result<()> {
-        self.record(root);
-        self.inner.walk_files(root, skip_dirs, cancel, on_file)
+            opts: &fresh_editor_core::model::filesystem::WalkOptions<'_>,
+            cancel: &std::sync::atomic::AtomicBool,
+            on_entry: &mut dyn FnMut(fresh_editor_core::model::filesystem::WalkEntry<'_>) -> bool,
+    ) -> std::io::Result<()> {
+        self.inner.walk(root, opts, cancel, on_entry)
     }
     // Present as a live remote connection so the editor treats this authority
     // as a remote (SSH) backend, exactly as in the bug report.

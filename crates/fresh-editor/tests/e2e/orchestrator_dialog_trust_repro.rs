@@ -97,7 +97,7 @@ fn open_dock(h: &mut EditorTestHarness) {
     h.wait_until(|h| h.screen_to_string().contains("Toggle Dock"))
         .unwrap();
     h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
-    h.wait_until(|h| h.screen_to_string().contains("Orchestrator") && h.editor().is_dock_focused())
+    h.wait_until(|h| h.screen_to_string().contains("+ New") && h.editor().is_dock_focused())
         .unwrap();
 }
 
@@ -120,13 +120,23 @@ fn open_delete_confirmation(height: u16) -> (tempfile::TempDir, EditorTestHarnes
 
     let card_row = row_of(&h, "alphaproj") as u16;
     h.mouse_right_click(4, card_row).unwrap();
-    // Match the rendered button, not the bare word — "Delete" alone could pick
-    // up any other row that happens to mention it.
-    h.wait_until(|h| h.screen_to_string().contains("[ Delete ]"))
-        .unwrap();
+    // The menu's entries draw as plain uniform rows inside its box, not as
+    // `[ bracketed ]` buttons, so match "Delete" *within the menu* — a bare
+    // word match could pick up any other row that mentions it, and the box
+    // border on the same line is what distinguishes one.
+    let menu_row = |h: &EditorTestHarness| -> Option<(u16, u16)> {
+        h.screen_to_string().lines().enumerate().find_map(|(r, l)| {
+            if !l.contains('│') {
+                return None;
+            }
+            l.find("Delete")
+                .map(|b| (l[..b].chars().count() as u16, r as u16))
+        })
+    };
+    h.wait_until(|h| menu_row(h).is_some()).unwrap();
 
-    let (dcol, drow) = pos_of(&h, "[ Delete ]");
-    h.mouse_click(dcol + 2, drow).unwrap();
+    let (dcol, drow) = menu_row(&h).expect("the row menu lists Delete");
+    h.mouse_click(dcol + 1, drow).unwrap();
     h.wait_until(|h| h.screen_to_string().contains("Confirm Delete"))
         .unwrap();
     (tmp, h)
@@ -134,16 +144,22 @@ fn open_delete_confirmation(height: u16) -> (tempfile::TempDir, EditorTestHarnes
 
 /// A destructive confirmation is useless if the user can't see how to answer
 /// it. On a short terminal the centered panel must grow to fit its content
-/// instead of clipping the tail: both the warning and the Cancel / Confirm
-/// pair have to be on screen.
+/// instead of clipping the tail: both the consequence list and the Cancel /
+/// Confirm pair have to be on screen.
+///
+/// The anchor is a consequence line rather than the "uncommitted changes"
+/// warning because this session is the project row — in-place, no worktree —
+/// and deleting it removes no files, so the pane no longer carries a warning
+/// that would not be true of it. The buttons are what prove nothing is
+/// clipped: they render after everything else.
 #[test]
 fn dock_delete_confirmation_shows_its_buttons_on_a_short_terminal() {
     let (_tmp, h) = open_delete_confirmation(SHORT_HEIGHT);
 
     let screen = h.screen_to_string();
     assert!(
-        screen.contains("Uncommitted changes will be lost"),
-        "the delete warning was clipped off the confirmation.\nScreen:\n{screen}"
+        screen.contains("drop the workspace record"),
+        "the consequence list was clipped off the confirmation.\nScreen:\n{screen}"
     );
     assert!(
         screen.contains("[ Cancel ]"),

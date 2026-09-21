@@ -3,7 +3,7 @@
 //! The frontend renders the real editor by tapping the **actual render
 //! pipeline**: we run `Editor::render` once into an in-memory cell buffer, then
 //! read the geometry the pipeline already aggregated for the frame
-//! (`WindowLayoutCache` + `ChromeLayout`) and slice the rendered cells. Nothing
+//! (the frame's tree + `ChromeLayout`) and slice the rendered cells. Nothing
 //! about layout, highlighting, tabs, scrollbars, or split borders is
 //! re-implemented — we only re-target the final drawing:
 //!
@@ -97,9 +97,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+// The browser sends a chord, never a keyboard layout's shifted codepoint, so
+// the web path builds plain key presses (`Event::key`) with no layout char.
+use fresh_input_parser::Event;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -188,7 +189,16 @@ impl ClipboardSync {
 /// enabled, init.ts loaded, chrome drawn as a semantic model (not cells). Shared
 /// by `run()`, the `/reset` route (scenario isolation) and the parity test
 /// runner so all three drive an identical editor.
-pub fn build_editor(cols: u16, rows: u16, files: &[PathBuf]) -> Result<Editor> {
+/// Build the editor the bridge serves.
+///
+/// `fire_ready` is the startup lifecycle's second hook. A SERVED session wants
+/// it — it is where the Orchestrator opens its dock and the welcome screen
+/// opens itself. The harness entry points (`POST /reset`, the scene-parity
+/// runner) want it OFF: both exist to hand a test a known editor, and the
+/// hook's effects arrive asynchronously from the plugin thread, so firing it
+/// would let a dock or a welcome tab land on the buffer a tick or two after
+/// the reset returned — exactly the race the reset exists to remove.
+pub fn build_editor(cols: u16, rows: u16, files: &[PathBuf], fire_ready: bool) -> Result<Editor> {
     let dir_context = DirectoryContext::from_system()?;
     let working_dir = std::env::current_dir().unwrap_or_default();
     let mut cfg = config::Config::load_with_layers(&dir_context, &working_dir);
@@ -226,6 +236,19 @@ pub fn build_editor(cols: u16, rows: u16, files: &[PathBuf]) -> Result<Editor> {
             eprintln!("open_file {f:?} failed: {e}");
         }
     }
+    // The second startup lifecycle hook, in the order main.rs and the daemon
+    // fire them: `plugins_loaded` once the registry and init.ts are in, then
+    // `ready` once the startup files are open. `ready` is the "we have
+    // finished starting up" signal — it is where the Orchestrator opens its
+    // dock and the welcome screen opens itself — so a bridge that fired only
+    // the first served a session with neither, while a directly-launched
+    // editor and `fresh -a` had both. Opening the files first is what lets a
+    // plugin branching on "is a real file open?" see them rather than race
+    // them.
+    if fire_ready {
+        editor.process_pending_file_opens();
+        editor.fire_ready_hook();
+    }
     Ok(editor)
 }
 
@@ -242,9 +265,14 @@ pub fn apply_step(editor: &mut Editor, step: &Value) {
     } else if step.get("kind").is_some() {
         apply_mouse(editor, step);
     } else if let Some(name) = step.get("action").and_then(|a| a.as_str()) {
-        if let Some(act) =
-            crate::input::keybindings::Action::from_str(name, &std::collections::HashMap::new())
-        {
+        // Optional `args` object for parameterised actions
+        // (e.g. {"action": "menu_open", "args": {"name": "File"}}).
+        let args: std::collections::HashMap<String, Value> = step
+            .get("args")
+            .and_then(|a| a.as_object())
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        if let Some(act) = crate::input::keybindings::Action::from_str(name, &args) {
             if let Err(e) = editor.handle_action(act) {
                 eprintln!("[webui] action error: {e}");
             }
@@ -405,14 +433,6 @@ impl WebBridge {
     /// How many browsers are connected.
     pub fn client_count(&self) -> usize {
         self.ws.len()
-    }
-
-    /// Re-seed the clipboard mirror against a freshly built editor — the daemon
-    /// rebuilds in place on an authority / working-directory change. Without
-    /// this the next scene would bump `seq` for a clipboard nobody touched and
-    /// the browser would paste stale text into its system clipboard.
-    pub fn rebound_editor(&mut self, editor: &Editor) {
-        self.clip = ClipboardSync::new(editor);
     }
 
     /// The grid size that fits every connected browser: the element-wise MIN of
@@ -615,7 +635,7 @@ impl WebBridge {
 /// so TUI clients can attach to the very same editor.
 pub fn run(addr: &str, files: &[PathBuf]) -> Result<()> {
     let (mut cols, mut rows) = DEFAULT_SIZE;
-    let mut editor = build_editor(cols, rows, files)?;
+    let mut editor = build_editor(cols, rows, files, true)?;
 
     // Bind the in-process control socket so a `fresh` run inside an embedded
     // terminal can forward opens *and* drive the command channel
@@ -968,7 +988,9 @@ fn handle_http(
         }
         ("POST", "/reset") => {
             (*cols, *rows) = DEFAULT_SIZE;
-            match build_editor(*cols, *rows, files) {
+            // No `ready`: a reset hands the harness a known editor, and the
+            // hook's effects would arrive asynchronously after it returned.
+            match build_editor(*cols, *rows, files, false) {
                 Ok(e) => *editor = e,
                 Err(err) => eprintln!("reset failed: {err}"),
             }
@@ -1045,45 +1067,21 @@ fn apply_paste(editor: &mut Editor, v: &Value) {
 /// Native plugin-widget interaction. For the overlay prompt toolbar, a
 /// Toggle/Button click forwards the widget `key`; the editor flips the toggle
 /// in-spec and fires the plugin's `widget_event` — the exact path a TUI
-/// toolbar click takes. Floating/dock widgets deliver the clicked hit by
-/// index, running the same path as a TUI cell click.
+/// toolbar click takes.
+///
+/// **The `"panel"` surface is gone with the web's plugin panels.** It resolved
+/// a click against the recorded hit list the scene shipped — by identity, with
+/// the index as a tiebreaker — and placed a caret from a byte the browser had
+/// measured. Both read `WidgetPanelState::hits`, which existed for a described
+/// panel only to be sent here. A request naming it now falls through the
+/// wildcard and does nothing, which is what it should do while there is no
+/// panel on the page to have clicked. See
+/// `docs/internal/retained-mode-ui.md` "The web".
 fn apply_widget(editor: &mut Editor, v: &Value) {
     match v.get("surface").and_then(|s| s.as_str()) {
         Some("toolbar") => {
             if let Some(key) = v.get("key").and_then(|k| k.as_str()) {
                 editor.toggle_overlay_toolbar_widget(key);
-            }
-        }
-        Some("panel") => {
-            let plugin = v.get("plugin").and_then(|p| p.as_str()).unwrap_or("");
-            let panel_id = v.get("panelId").and_then(|p| p.as_u64()).unwrap_or(0);
-            // Caret placement from a native text input: the browser
-            // positioned its caret on click and reports the byte offset;
-            // the host TextEdit (source of truth) follows. Not a widget
-            // *event* — no plugin hook fires, exactly like a TUI click
-            // that only moves the caret.
-            if let Some(byte) = v.get("textCursor").and_then(|b| b.as_u64()) {
-                let widget_key = v.get("widgetKey").and_then(|k| k.as_str()).unwrap_or("");
-                editor.set_widget_text_cursor(plugin, panel_id, widget_key, byte as usize);
-                return;
-            }
-            let hit_index = v
-                .get("hitIndex")
-                .and_then(|i| i.as_u64())
-                .map(|i| i as usize);
-            // Preferred shape: the hit's IDENTITY (widgetKey + eventType +
-            // payload) with the raw index as tiebreaker — robust against the
-            // hits list being regenerated (or windowed to the TUI viewport)
-            // between the pushed frame and the click. The bare-index shape
-            // stays for compat (curl, older clients).
-            if let Some(event_type) = v.get("eventType").and_then(|e| e.as_str()) {
-                let widget_key = v.get("widgetKey").and_then(|k| k.as_str()).unwrap_or("");
-                let payload = v.get("payload").cloned().unwrap_or_else(|| json!({}));
-                editor.deliver_widget_hit_semantic(
-                    plugin, panel_id, widget_key, event_type, &payload, hit_index,
-                );
-            } else if let Some(idx) = hit_index {
-                editor.deliver_widget_hit_by_index(plugin, panel_id, idx);
             }
         }
         _ => {}
@@ -1110,10 +1108,20 @@ fn apply_settings(editor: &mut Editor, v: &Value) {
         editor.entry_dialog_activate_button(btn);
         return;
     }
+    // The category tree's chevron and section rows: their `SettingsHit`s were
+    // the painter's rectangles and are gone with them, so these reach the
+    // same three bodies the TUI's nodes do (`Editor::settings_*`) rather than
+    // going round through `dispatch_settings_hit`.
+    if kind == "categoryDisclosure" {
+        editor.settings_toggle_category(a);
+        return;
+    }
+    if kind == "categorySection" {
+        editor.settings_jump_to_section(a, bb);
+        return;
+    }
     let hit = match kind {
         "category" => Some(H::Category(a)),
-        "categoryDisclosure" => Some(H::CategoryDisclosure(a)),
-        "categorySection" => Some(H::CategorySection(a, bb)),
         "item" => Some(H::Item(a)),
         "controlToggle" => Some(H::ControlToggle(a)),
         "controlDropdown" => Some(H::ControlDropdown(a)),
@@ -1124,6 +1132,7 @@ fn apply_settings(editor: &mut Editor, v: &Value) {
         "controlMapRow" => Some(H::ControlMapRow(a, bb)),
         "controlMapAddNew" => Some(H::ControlMapAddNew(a)),
         "controlTextListRow" => Some(H::ControlTextListRow(a, bb)),
+        "controlTextListRemove" => Some(H::ControlTextListRemove(a, bb)),
         "controlDualListAvailable" => Some(H::ControlDualListAvailable(a, bb)),
         "controlDualListIncluded" => Some(H::ControlDualListIncluded(a, bb)),
         "controlDualListAdd" => Some(H::ControlDualListAdd(a)),
@@ -1141,7 +1150,7 @@ fn apply_settings(editor: &mut Editor, v: &Value) {
         _ => None,
     };
     if let Some(hit) = hit {
-        editor.dispatch_settings_hit(hit, 0, dbl);
+        editor.dispatch_settings_hit(hit, dbl);
     }
 }
 
@@ -1719,51 +1728,45 @@ fn rect_json(r: Rect) -> Value {
 }
 
 /// Slice the rendered cells inside `r` into rows of styled runs.
-/// Plugin scrollbar markers for one pane, as `[{row, color}]`.
+/// The marks on one pane's vertical bar, as `[{row, color}]`.
 ///
-/// Reads the projection the render pass just cached for this track height
-/// (see [`ScrollbarMarkerBuckets::latest_for_height`]) rather than
-/// re-projecting, so the web scrollbar shows exactly the rows the terminal
-/// painted. Theme keys are resolved to concrete hex here — the frontend has
-/// no theme-key resolver.
-fn scrollbar_markers_json(
-    editor: &Editor,
-    buffer_id: crate::model::event::BufferId,
-    scrollbar_rect: Rect,
-) -> Value {
-    let Some(state) = editor.active_window().buffer_state(buffer_id) else {
+/// Read off the bar's own item in the frame's display list — the marks the
+/// bar's leaf bucketed onto the track layout gave it — so the web scrollbar
+/// shows exactly the cells the terminal painted. Theme names are resolved
+/// to hex here: the frontend has no theme-key resolver.
+fn scrollbar_markers_json(editor: &Editor, leaf: crate::model::event::LeafId) -> Value {
+    let key = crate::view::shell::splits::vscroll_key(leaf);
+    let Some(ui) = editor.shell_ui.as_ref() else {
         return json!([]);
     };
-    let Some(cells) = state
-        .scrollbar_marker_buckets
-        .latest_for_height(scrollbar_rect.height as usize)
-    else {
-        return json!([]);
-    };
-
     let theme = editor.theme.read().unwrap();
-    let out: Vec<Value> = cells
+    let out: Vec<Value> = ui
+        .spec()
+        .items
         .iter()
-        .enumerate()
-        .filter_map(|(row, cell)| {
-            let cell = cell.as_ref()?;
-            let color = match &cell.color {
-                fresh_core::api::OverlayColorSpec::Rgb(r, g, b) => (*r, *g, *b),
-                fresh_core::api::OverlayColorSpec::ThemeKey(key) => {
-                    let resolved = crate::view::theme::named_color_from_str(key)
-                        .or_else(|| theme.resolve_theme_key(key))?;
-                    match resolved {
-                        ratatui::style::Color::Rgb(r, g, b) => (r, g, b),
-                        _ => return None,
-                    }
-                }
-            };
-            Some(json!({
-                "row": row,
-                "color": format!("#{:02x}{:02x}{:02x}", color.0, color.1, color.2),
-            }))
+        .filter(|i| i.key.as_ref() == Some(&key))
+        .find_map(|i| match &i.draw {
+            fresh_ui::Draw::Scrollbar { marks, .. } => Some(marks.clone()),
+            _ => None,
         })
-        .collect();
+        .map(|marks| {
+            marks
+                .iter()
+                .filter(|m| !m.full)
+                .filter_map(|m| {
+                    let style =
+                        crate::app::shell_host::shell_theme::resolve(m.theme.as_str(), &theme);
+                    let ratatui::style::Color::Rgb(r, g, b) = style.fg? else {
+                        return None;
+                    };
+                    Some(json!({
+                        "row": m.at,
+                        "color": format!("#{r:02x}{g:02x}{b:02x}"),
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     json!(out)
 }
 
@@ -1894,21 +1897,41 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
     let submenu_path = get("submenuPath");
     let dropdown = get("dropdown");
 
-    // --- per-window geometry from the pipeline's layout cache ---
-    let layout = editor.active_layout();
-    let content = layout.editor_content_area.unwrap_or(Rect::new(0, 0, w, h));
+    // --- per-window geometry, read off the frame's tree ---
+    let content = editor.body_area().unwrap_or(Rect::new(0, 0, w, h));
     // The menu bar spans the FULL width at row 0 — exactly as the TUI draws it,
     // *above* any left dock (the dock/file-explorer carve the rows below). Using
     // `content.x` here would shift the whole menu right when a left dock opens.
-    // Per-menu title x still comes from the editor's MenuLayout cell positions
-    // (so titles + their dropdowns align); only the container is full-width.
+    // Per-menu title x still comes from the tree's label rectangles (so
+    // titles + their dropdowns align); only the container is full-width.
     let menubar_rect = (content.y > 0).then(|| Rect::new(0, 0, w, content.y));
 
-    let panes: Vec<Value> = layout
-        .split_areas
+    // **The rectangles are the tree's here too, and so is the thumb.** The
+    // web is a consumer of the same layout the TUI folds (D.3), so a pane's
+    // content and its scrollbar come from the nodes under `content_key` /
+    // `vscroll_key`, and the thumb from the bar's own facts. A pane the tree
+    // has no rectangle for is dropped, which is what a zero-size entry meant.
+    let pane_list = editor.window_panes();
+    let panes: Vec<Value> = pane_list
         .iter()
+        .filter_map(|(leaf, bufid)| {
+            // Owned, because these are read *out* of the tree rather than
+            // borrowed from the vector being iterated.
+            let content_rect = editor.pane_content_rect(*leaf)?;
+            let scrollbar_rect = editor
+                .pane_vscroll_rect(*leaf)
+                .unwrap_or(Rect::new(0, 0, 0, 0));
+            // The thumb is the bar's own: its facts on the track the tree
+            // gave it, the arithmetic the bar's leaf paints with.
+            let (thumb_s, thumb_e) = editor
+                .bar_thumb(*leaf, fresh_ui::Axis::Vertical)
+                .map(|(s, e, _)| (s, e))
+                .unwrap_or((0, 0));
+            Some((leaf, bufid, content_rect, scrollbar_rect, thumb_s, thumb_e))
+        })
         .map(
             |(leaf, bufid, content_rect, scrollbar_rect, thumb_s, thumb_e)| {
+                let (content_rect, scrollbar_rect) = (&content_rect, &scrollbar_rect);
                 // Tabs are derived once in the core (`Editor::tab_bar_view`).
                 let tb = editor.tab_bar_view(*leaf);
                 // Emit the line-number gutter as its own cell block, separate
@@ -1946,14 +1969,14 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
                     // painted cells, so markers must travel as data too.
                     // Colours are resolved here — the frontend has no theme-key
                     // resolver.
-                    "vscrollMarkers": scrollbar_markers_json(editor, *bufid, *scrollbar_rect),
+                    "vscrollMarkers": scrollbar_markers_json(editor, *leaf),
                 })
             },
         )
         .collect();
 
-    let separators: Vec<Value> = layout
-        .separator_areas
+    let separators: Vec<Value> = editor
+        .separator_rects()
         .iter()
         .map(|(_id, dir, x, y, len)| {
             json!({
@@ -1998,9 +2021,6 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
         }
     }
     let trust_dialog = serde_json::to_value(editor.trust_dialog_view()).unwrap_or(Value::Null);
-    // Plugin-mounted floating / dock widget panels (e.g. the orchestrator dock),
-    // rendered natively from their WidgetSpec.
-    let widgets = serde_json::to_value(editor.widgets_view()).unwrap_or(Value::Null);
     // Active right-click / new-tab context menu, rendered natively.
     let context_menu = serde_json::to_value(editor.context_menu_view()).unwrap_or(Value::Null);
     // Auxiliary modals (keybinding editor / event-debug / theme-info popup).
@@ -2028,6 +2048,11 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
             "menuBg": color_css(t.menu_bg),
             "menuFg": color_css(t.menu_fg),
             "menuHi": color_css(t.menu_highlight_bg),
+            // The ink the theme itself chose for its highlight fill. The
+            // frontend can only guess black or white from the fill; a theme
+            // that names this beats the guess, so send it and let the guess be
+            // the fallback for a theme that leaves it at terminal reset.
+            "menuHighlightFg": color_css(t.menu_highlight_fg),
             "popupBg": color_css(t.popup_bg),
             "popupFg": color_css(t.popup_text_fg),
             "border": color_css(t.popup_border_fg),
@@ -2049,9 +2074,11 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
         "panes": panes,
         "separators": separators,
         "popups": popups,
+        // The plugin panels, as the display list the tree produced for them
+        // (`Editor::tree_view`); the web folds it into DOM.
+        "tree": serde_json::to_value(editor.tree_view()).unwrap_or_else(|_| json!({})),
         "palette": palette,
         "trustDialog": trust_dialog,
-        "widgets": widgets,
         "contextMenu": context_menu,
         "auxModal": aux_modal,
         "keybindingEditor": keybinding_editor,
@@ -2069,6 +2096,16 @@ fn scene_json(editor: &mut Editor, cols: u16, rows: u16) -> Value {
     // (explorer toggle) — the former gets a hard cut, not layout motion.
     let window_id = editor.active_window.0;
     json!({ "w": w, "h": h, "windowId": window_id, "regions": regions, "theme": theme })
+}
+
+/// The digit a browser's physical `code` names — `"Digit1"` → `'1'`. Every
+/// other code (letters, punctuation, named keys) is left to the reported
+/// character, which already matches what a terminal sends.
+fn digit_row_char(code: &str) -> Option<char> {
+    let rest = code.strip_prefix("Digit")?;
+    let mut chars = rest.chars();
+    let d = chars.next()?;
+    (chars.next().is_none() && d.is_ascii_digit()).then_some(d)
 }
 
 /// Map a browser key to a crossterm key and run the real input path.
@@ -2096,6 +2133,25 @@ fn apply_key(editor: &mut Editor, v: &Value) {
         s if s.chars().count() == 1 => KeyCode::Char(s.chars().next().unwrap()),
         _ => return,
     };
+    // A browser reports the SHIFTED character a key produces: Ctrl+Shift+1
+    // arrives as `{key:"!", code:"Digit1"}`. Keybindings — and the kitty-
+    // protocol events a terminal delivers — are written against the UNSHIFTED
+    // key plus a SHIFT modifier (`set_bookmark` is Ctrl+Shift+0..9), so
+    // forwarding '!' left all ten bookmark slots unreachable from a browser.
+    // With CONTROL held the character is not text being typed, so the physical
+    // `code` is the better witness, and it is what the terminal reports. Plain
+    // typing is untouched (no CONTROL), and ALT is excluded so AltGr layouts
+    // keep producing their own characters.
+    let digit_row = match ctrl && !alt {
+        true => v
+            .get("code")
+            .and_then(|c| c.as_str())
+            .and_then(digit_row_char),
+        false => None,
+    };
+    if let Some(d) = digit_row {
+        code = KeyCode::Char(d);
+    }
     let mut mods = KeyModifiers::empty();
     if ctrl {
         mods |= KeyModifiers::CONTROL;
@@ -2115,6 +2171,10 @@ fn apply_key(editor: &mut Editor, v: &Value) {
     // already baked into the character, so a bare symbol is what the terminal
     // sends (a spurious SHIFT would diverge and could break symbol input).
     let shift_is_meaningful = match code {
+        // A digit recovered from the physical key above is the UNSHIFTED
+        // character, so its SHIFT is real information (Ctrl+Shift+1 →
+        // `set_bookmark`), unlike the '!' the browser reported.
+        KeyCode::Char(_) if digit_row.is_some() => true,
         KeyCode::Char(c) => c.is_ascii_alphabetic(),
         _ => true,
     };
@@ -2134,7 +2194,7 @@ fn apply_key(editor: &mut Editor, v: &Value) {
     // the daemon server loop): ANY key press dismisses the interactive wave
     // and is CONSUMED — it only stops the show, it doesn't also act on the
     // editor. `KeyEvent::new` sets kind=Press, which the dismissal requires.
-    if editor.maybe_dismiss_wave_animation(&Event::Key(KeyEvent::new(code, mods))) {
+    if editor.maybe_dismiss_wave_animation(&Event::key(KeyEvent::new(code, mods))) {
         return;
     }
     if let Err(e) = editor.handle_key(code, mods) {
@@ -2300,7 +2360,27 @@ fn indexed_css(i: u8) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_only, origin_host_matches, try_parse_request, HTTP_REQUEST_CAP};
+    use super::{
+        digit_row_char, host_only, origin_host_matches, try_parse_request, HTTP_REQUEST_CAP,
+    };
+
+    #[test]
+    fn digit_row_is_recovered_from_the_physical_key() {
+        // Regression: a browser reports Ctrl+Shift+1 as `{key:"!",
+        // code:"Digit1"}`, and the ten `set_bookmark` bindings are written
+        // against the unshifted digit plus SHIFT, so the bridge reads the
+        // digit off the physical key.
+        assert_eq!(digit_row_char("Digit1"), Some('1'));
+        assert_eq!(digit_row_char("Digit0"), Some('0'));
+        assert_eq!(digit_row_char("Digit9"), Some('9'));
+        // Everything else keeps the character the browser reported.
+        assert_eq!(digit_row_char("KeyA"), None);
+        assert_eq!(digit_row_char("Numpad1"), None);
+        assert_eq!(digit_row_char("Digit"), None);
+        assert_eq!(digit_row_char("Digit12"), None);
+        assert_eq!(digit_row_char("Digitx"), None);
+        assert_eq!(digit_row_char(""), None);
+    }
 
     #[test]
     fn absurd_content_length_is_rejected_not_panicked() {

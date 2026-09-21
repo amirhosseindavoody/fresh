@@ -22,6 +22,10 @@ impl Window {
         &mut self,
         col: u16,
         row: u16,
+        // The terminal under the pointer and the rectangle its grid occupies,
+        // resolved by `Editor::terminal_pane_at`. Asked there because it is a
+        // question about the shell's tree, which this side cannot see.
+        at: (BufferId, Rect),
         mouse_event: MouseEvent,
         forwarding: crate::config::TerminalMouseForwarding,
     ) -> Option<AnyhowResult<bool>> {
@@ -53,8 +57,7 @@ impl Window {
             return None;
         }
 
-        // Find terminal buffer at this position.
-        let (buffer_id, content_rect) = self.get_terminal_content_area_at_position(col, row)?;
+        let (buffer_id, content_rect) = at;
 
         // `send_terminal_mouse` writes to the *focused* terminal and makes the
         // coordinates relative to `content_rect`, so both must describe the
@@ -161,6 +164,8 @@ impl Window {
         &self,
         col: u16,
         row: u16,
+        // See `try_forward_mouse_to_terminal`.
+        at: (BufferId, Rect),
     ) -> Option<(
         BufferId,
         u16,
@@ -170,7 +175,7 @@ impl Window {
         if !self.focused_terminal_live() {
             return None;
         }
-        let (buffer_id, content_rect) = self.get_terminal_content_area_at_position(col, row)?;
+        let (buffer_id, content_rect) = at;
         // Detection runs even for alternate-screen / mouse-reporting programs:
         // this is only reached for Ctrl-held gestures (see the callers in
         // `terminal_link.rs`, both Ctrl-gated), which `try_forward_mouse_to_terminal`
@@ -203,10 +208,16 @@ impl Window {
     ///
     /// Returns the terminal buffer, the detected link, and the terminal's
     /// OSC 7 working directory (for resolving relative paths).
+    /// `at` is the pane the cell is over and where its content sits, which
+    /// the caller asks the shell tree for — the same parameter, for the same
+    /// reason, as its sibling [`Window::detect_terminal_link_at`]. A `Window`
+    /// cannot see the tree, and the scan this replaces answered "which pane
+    /// covers this cell" out of the painter's record of the last frame.
     pub(crate) fn detect_terminal_scrollback_link_at(
         &self,
         col: u16,
         row: u16,
+        at: (crate::model::event::LeafId, ratatui::layout::Rect),
     ) -> Option<(
         BufferId,
         crate::services::terminal::path_link::DetectedLink,
@@ -222,27 +233,22 @@ impl Window {
             return None;
         }
 
-        let (split_id, content_rect) =
-            self.layout_cache
-                .split_areas
-                .iter()
-                .find_map(|(sid, bid, rect, _, _, _)| {
-                    (*bid == active
-                        && col >= rect.x
-                        && col < rect.x + rect.width
-                        && row >= rect.y
-                        && row < rect.y + rect.height)
-                        .then_some((*sid, *rect))
-                })?;
+        // The scan also checked that the pane it found is showing the active
+        // terminal, which is a question about the model rather than about the
+        // paint.
+        let (split_id, content_rect) = at;
+        if self.pane_buffer(split_id) != Some(active) {
+            return None;
+        }
 
         let state = self.buffers.get(&active)?;
         let gutter_width = state.margins.left_total_width() as u16;
-        let cached_mappings = self.layout_cache.view_line_mappings.get(&split_id).cloned();
+        let cached_mappings = self.pane_view(split_id).map(|v| v.rows.clone());
         let (fallback, compose_width) = self
             .buffers
             .splits()
             .and_then(|(_, vs)| vs.get(&split_id))
-            .map(|vs| (vs.viewport.top_byte, vs.compose_width))
+            .map(|vs| (vs.viewport.top_byte(), vs.compose_width))
             .unwrap_or((0, None));
 
         // `allow_gutter_click = false`: a click in the gutter isn't on a path.
@@ -251,7 +257,7 @@ impl Window {
             row,
             content_rect,
             gutter_width,
-            &cached_mappings,
+            cached_mappings.as_deref(),
             fallback,
             false,
             compose_width,
@@ -280,27 +286,6 @@ impl Window {
             });
 
         Some((active, link, cwd))
-    }
-
-    /// Get the terminal buffer and its content area if the mouse position is over a terminal buffer.
-    /// Returns the buffer ID and content rect if found.
-    fn get_terminal_content_area_at_position(
-        &self,
-        col: u16,
-        row: u16,
-    ) -> Option<(BufferId, Rect)> {
-        for (_, buffer_id, content_rect, _, _, _) in &self.layout_cache.split_areas {
-            // Check if position is within content area.
-            if col >= content_rect.x
-                && col < content_rect.x + content_rect.width
-                && row >= content_rect.y
-                && row < content_rect.y + content_rect.height
-                && self.is_terminal_buffer(*buffer_id)
-            {
-                return Some((*buffer_id, *content_rect));
-            }
-        }
-        None
     }
 
     /// Forward a mouse event to the terminal PTY.
@@ -572,12 +557,19 @@ impl super::Editor {
         {
             return None;
         }
-        let content_rect = self
-            .active_layout()
-            .split_areas
-            .iter()
-            .find(|(sid, bid, _, _, _, _)| *sid == split_id && *bid == buffer_id)
-            .map(|(_, _, rect, _, _, _)| *rect)?;
+        // The pane is named, so its content rectangle is the tree's; the scan
+        // this replaces also checked that the pane still shows this buffer,
+        // which `pane_buffer` answers from the model rather than from the
+        // painter's record of the last frame.
+        let content_rect = self.pane_content_rect(split_id)?;
+        if self
+            .windows
+            .get(&self.active_window)
+            .and_then(|w| w.pane_buffer(split_id))
+            != Some(buffer_id)
+        {
+            return None;
+        }
 
         // Drop into read-only scrollback. The press already focused the
         // split, so the sync pins THIS split's viewport to the grid's row 0.
@@ -608,7 +600,7 @@ impl super::Editor {
         let (_, view_states) = win.buffers.splits()?;
         let vs = view_states.get(&split_id)?;
         let state = win.buffers.get(&buffer_id)?;
-        let (top_line, _) = state.buffer.position_to_line_col(vs.viewport.top_byte);
+        let (top_line, _) = state.buffer.position_to_line_col(vs.viewport.top_byte());
         let grid_row = row.saturating_sub(content_rect.y) as usize;
         // Account for horizontal scroll (a pinned view starts at 0, but an
         // explicit scrollback view may have been scrolled right).
@@ -623,7 +615,7 @@ impl super::Editor {
         // wrong buffer line entirely).
         if vs.viewport.grid_wrap && vs.viewport.line_wrap_enabled {
             let cols = vs.viewport.grid_cols();
-            let mut remaining = vs.viewport.top_view_line_offset + grid_row;
+            let mut remaining = vs.viewport.top_view_line_offset() + grid_row;
             let mut line_idx = top_line;
             loop {
                 let Some(bytes) = state.buffer.get_line(line_idx) else {

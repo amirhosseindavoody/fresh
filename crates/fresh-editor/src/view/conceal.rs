@@ -32,10 +32,13 @@ pub struct ConcealRange {
     /// Namespace for bulk operations (shared with overlay namespace system)
     pub namespace: OverlayNamespace,
 
-    /// Start marker (left affinity - stays before inserted text)
+    /// Start marker. Right gravity, like every marker `MarkerList::create`
+    /// makes: text inserted exactly at the conceal's start is swallowed by
+    /// the conceal rather than appearing before it.
     pub start_marker: MarkerId,
 
-    /// End marker (right affinity - moves after inserted text)
+    /// End marker, also right gravity: text typed at the conceal's end
+    /// extends it.
     pub end_marker: MarkerId,
 
     /// Optional replacement text to show instead of the concealed content.
@@ -114,8 +117,8 @@ impl ConcealManager {
         replacement: Option<String>,
         activation: Option<MarkerActivation>,
     ) {
-        let start_marker = marker_list.create(range.start, true); // left affinity
-        let end_marker = marker_list.create(range.end, false); // right affinity
+        let start_marker = marker_list.create(range.start);
+        let end_marker = marker_list.create(range.end);
 
         let idx = self.ranges.len();
         self.marker_to_idx.insert(start_marker, idx);
@@ -125,7 +128,8 @@ impl ConcealManager {
             start_marker,
             end_marker,
             replacement,
-            activation: activation.map(|rule| ScopedActivation::from_absolute(&rule, range.start)),
+            activation: activation
+                .map(|rule| ScopedActivation::from_absolute(&rule, range.start, marker_list)),
         });
         self.version = self.version.wrapping_add(1);
     }
@@ -244,6 +248,9 @@ impl ConcealManager {
         for range in &self.ranges {
             marker_list.delete(range.start_marker);
             marker_list.delete(range.end_marker);
+            if let Some(a) = &range.activation {
+                a.release(marker_list);
+            }
         }
         self.ranges.clear();
         self.marker_to_idx.clear();
@@ -261,6 +268,9 @@ impl ConcealManager {
         self.marker_to_idx.remove(&removed.end_marker);
         marker_list.delete(removed.start_marker);
         marker_list.delete(removed.end_marker);
+        if let Some(a) = &removed.activation {
+            a.release(marker_list);
+        }
         if let Some(moved) = self.ranges.get(idx) {
             self.marker_to_idx.insert(moved.start_marker, idx);
             self.marker_to_idx.insert(moved.end_marker, idx);
@@ -272,7 +282,7 @@ impl ConcealManager {
     ///
     /// `cursors` are the rendering split's cursor byte positions, used to
     /// evaluate cursor-dependent activation rules. Pass `&[]` for
-    /// cursor-blind consumers (scroll math, `VisualRowIndex`) — they see
+    /// cursor-blind consumers (scroll math, `WrapIndex`) — they see
     /// the canonical "no cursor anywhere" rendering.
     pub fn query_viewport(
         &self,
@@ -282,6 +292,34 @@ impl ConcealManager {
         cursors: &[usize],
     ) -> Vec<(Range<usize>, Option<&str>)> {
         self.query_viewport_excluding(start, end, marker_list, None, cursors)
+    }
+
+    /// Earliest conceal in `start..end` whose cursor-dependent activation
+    /// currently differs from the canonical (cursor-less) evaluation.
+    ///
+    /// The wrap index is canonical, so rows at and after this byte can wrap
+    /// differently on screen than the index says. An anchored build whose
+    /// anchor sits past this byte must re-anchor here — the model's
+    /// `_stable_anchor` — or the frame draws rows the placement never meant.
+    pub fn earliest_cursor_divergence(
+        &self,
+        start: usize,
+        end: usize,
+        marker_list: &MarkerList,
+        cursors: &[usize],
+    ) -> Option<usize> {
+        self.ranges
+            .iter()
+            .filter_map(|r| {
+                let a = r.activation.as_ref()?;
+                let range = r.range(marker_list);
+                if range.start < start || range.start >= end {
+                    return None;
+                }
+                (a.is_active(marker_list, cursors) != a.is_active(marker_list, &[]))
+                    .then_some(range.start)
+            })
+            .min()
     }
 
     /// Like [`query_viewport`](Self::query_viewport), but skips ranges whose
@@ -308,7 +346,7 @@ impl ConcealManager {
             .filter_map(|r| {
                 let range = r.range(marker_list);
                 if let Some(a) = &r.activation {
-                    if !a.is_active(range.start, cursors) {
+                    if !a.is_active(marker_list, cursors) {
                         return None;
                     }
                 }
@@ -353,6 +391,13 @@ impl ConcealManager {
             }
         }
         None
+    }
+
+    /// Number of stored conceal ranges. Every viewport query walks all of
+    /// them (see [`query_viewport_excluding`](Self::query_viewport_excluding)),
+    /// so this is the size of a per-frame scan.
+    pub fn len(&self) -> usize {
+        self.ranges.len()
     }
 
     /// Returns true if there are no conceal ranges
@@ -400,6 +445,77 @@ mod tests {
 
     fn ns() -> OverlayNamespace {
         OverlayNamespace::from_string("test".to_string())
+    }
+
+    /// Typing at the end of a scoped line must not flip an
+    /// `unless-cursor-in` conceal on for a frame.
+    ///
+    /// The reported flicker, at its smallest: a buffer holding `# a`, compose
+    /// mode, markdown_compose's conceal over `# ` scoped to the heading's line.
+    /// Type one more character and the editor renders the next frame straight
+    /// away — the plugin has not seen the edit yet, so this conceal, with the
+    /// scope it was emitted with, is what the frame asks. The scope has to have
+    /// grown with the text the cursor just typed, or the cursor reads as off
+    /// the line, the `# ` conceals itself for that frame and the whole line
+    /// re-lays out; the next frame, built from the plugin's rebuilt conceal,
+    /// puts it back.
+    ///
+    /// Driven through the manager rather than [`ScopedActivation`] directly,
+    /// because the marker tree's *shape* is part of the bug: the conceal's own
+    /// two markers sit beside the scope's, and a span marker in that company
+    /// stops being widened at all.
+    #[test]
+    fn a_conceal_scoped_to_its_line_stays_off_while_the_line_is_typed_on() {
+        let mut marker_list = MarkerList::new();
+        marker_list.set_buffer_size(4);
+        let mut manager = ConcealManager::new();
+
+        // `# a`: conceal `# `, scoped to the line and one byte past it — the
+        // position a cursor at the end of the line holds.
+        manager.add_with_activation(
+            &mut marker_list,
+            ns(),
+            0..2,
+            None,
+            Some(MarkerActivation {
+                if_cursor_in: false,
+                scope_start: 0,
+                scope_end: 4,
+            }),
+        );
+        let concealed = |marker_list: &MarkerList, cursors: &[usize]| {
+            !manager
+                .query_viewport(0, 1000, marker_list, cursors)
+                .is_empty()
+        };
+
+        assert!(
+            !concealed(&marker_list, &[3]),
+            "editing the line: syntax shown"
+        );
+        assert!(
+            concealed(&marker_list, &[]),
+            "nothing on the line: concealed"
+        );
+
+        // Type `b` at the end of the line. Markers are adjusted before the
+        // buffer, exactly as `EditorState::apply_insert` does it, and the
+        // cursor lands on 4.
+        marker_list.adjust_for_insert(3, 1);
+        assert!(
+            !concealed(&marker_list, &[4]),
+            "the cursor is at the end of the character it just typed, still on \
+             the heading's line, so the `# ` must stay visible for this frame"
+        );
+
+        // And through a burst, which is what outran the single byte of slack
+        // an emitted scope carries.
+        marker_list.adjust_for_insert(4, 6);
+        assert!(!concealed(&marker_list, &[10]));
+
+        // Deleting back off the line hands the conceal back.
+        marker_list.adjust_for_delete(2, 8);
+        assert!(concealed(&marker_list, &[20]));
     }
 
     #[test]

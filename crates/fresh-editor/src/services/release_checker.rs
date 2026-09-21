@@ -22,6 +22,34 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Default GitHub releases API URL for the fresh editor
 pub const DEFAULT_RELEASES_URL: &str = "https://api.github.com/repos/sinelaw/fresh/releases/latest";
 
+/// Environment overrides for the release feed and asset host, matching the
+/// `--releases-url` / `--download-base` flags on `fresh --cmd update`.
+///
+/// The env var is what makes the override reach the *whole* editor rather than
+/// one CLI invocation: the background check reads it here, and the update child
+/// the popup spawns inherits it through the environment, so the version the
+/// indicator offers and the artifact that gets installed come from the same
+/// place. Pointing only the CLI at a mirror while the UI still asked GitHub
+/// would be worse than no override at all.
+pub use fresh_update::endpoint::{DOWNLOAD_BASE_ENV, RELEASES_URL_ENV};
+
+/// The release feed to poll.
+///
+/// Resolution and the https-only host policy live in
+/// `fresh_update::endpoint`, so the background check, the `fresh --cmd update`
+/// child and the engine cannot disagree about where a release comes from. An
+/// override the policy refuses falls back to the pinned default here rather
+/// than failing the poll: a background check is not worth a startup error, and
+/// the CLI path reports the same rejection loudly.
+pub fn releases_url() -> String {
+    fresh_update::endpoint::Endpoints::from_env()
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "ignoring an unusable release endpoint override");
+            fresh_update::endpoint::Endpoints::production()
+        })
+        .releases_url
+}
+
 /// Lifecycle of an interactive in-editor self-update, surfaced through the
 /// status-bar update indicator (never a transient status message). Stays
 /// [`SelfUpdatePhase::Idle`] unless the `self-update` feature actually launches
@@ -35,8 +63,32 @@ pub enum SelfUpdatePhase {
     Running,
     /// The background update finished successfully; a restart applies it.
     Succeeded,
+    /// The update ran cleanly but did **not** install anything: it needs a step
+    /// the editor won't take for the user (a root `apt-get install`/`dnf install`, or a
+    /// package-manager command we only print). Neither a success nor a failure
+    /// — the pending command is waiting in the update output.
+    ActionRequired,
     /// The background update failed; the log has details.
     Failed,
+}
+
+impl SelfUpdatePhase {
+    /// The terminal phase for an update child that exited with `code`.
+    ///
+    /// Three outcomes, not two: `fresh --cmd update` reports "you must finish
+    /// this yourself" with [`fresh_update::EXIT_ACTION_REQUIRED`], which is
+    /// neither success nor failure. Collapsing it into either one produces a
+    /// visibly wrong indicator — "Update failed" when nothing failed, or
+    /// "Updated — restart fresh" when nothing was installed.
+    ///
+    /// `None` (killed by a signal) is a failure.
+    pub fn from_exit_code(code: Option<i32>) -> Self {
+        match code {
+            Some(0) => SelfUpdatePhase::Succeeded,
+            Some(c) if c == fresh_update::EXIT_ACTION_REQUIRED => SelfUpdatePhase::ActionRequired,
+            _ => SelfUpdatePhase::Failed,
+        }
+    }
 }
 
 /// Result of checking for a new release
@@ -247,11 +299,12 @@ pub fn fetch_latest_version(url: &str) -> Result<String, String> {
 
 /// Parse the version from a GitHub releases API body.
 ///
-/// Thin wrapper over `fresh_update::version::parse_tag_name` kept because
-/// callers/tests use the `Result` shape.
+/// Thin wrapper over `fresh_update::feed::Release` kept because callers/tests
+/// use the `Result` shape.
 fn parse_version_from_json(json: &str) -> Result<String, String> {
-    fresh_update::version::parse_tag_name(json)
-        .ok_or_else(|| "tag_name not found in response".to_string())
+    Ok(fresh_update::feed::Release::parse(json)?
+        .version()
+        .to_string())
 }
 
 /// Compare two versions; `true` if `latest` is newer than `current`.
@@ -262,8 +315,9 @@ pub fn is_newer_version(current: &str, latest: &str) -> bool {
 
 /// Detect how this copy of `fresh` was installed.
 ///
-/// Delegates entirely to `fresh_update::resolve()` (receipt → embedded channel
-/// → path heuristic). See `docs/internal/packaging-self-update.md`.
+/// Delegates entirely to `fresh_update::resolve()` (override → receipt →
+/// embedded channel; no path guessing, so an install that recorded nothing
+/// resolves to Unknown). See `docs/internal/packaging-self-update.md`.
 pub fn detect_provenance() -> Provenance {
     fresh_update::resolve()
 }
@@ -273,14 +327,52 @@ pub fn plan_for(prov: &Provenance) -> UpdatePlan {
     fresh_update::plan(prov)
 }
 
+/// Resolve the latest release, over the network.
+///
+/// With the `http` feature this goes through `fresh_update::fetch`, which is
+/// the same path `fresh --cmd update` takes: it sends a `GITHUB_TOKEN` from
+/// the environment if there is one, and when GitHub's API refuses because the
+/// address's hourly budget is spent it reads the version from the
+/// `releases/latest` redirect instead. Sharing that matters here — the daily
+/// check is *also* an API request, and a check that silently gave up on a
+/// rate limit is how the indicator goes quiet for an hour at a time.
+#[cfg(feature = "http")]
+fn fetch_release(releases_url: &str) -> Result<fresh_update::feed::Release, String> {
+    // From the environment, so both overrides are honoured: which route the
+    // check takes depends on the download base too — a mirror's own feed is
+    // authoritative for a mirror, and GitHub's redirect is not.
+    let mut endpoints = fresh_update::endpoint::Endpoints::from_env().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "ignoring an unusable release endpoint override");
+        fresh_update::endpoint::Endpoints::production()
+    });
+    if releases_url != endpoints.releases_url {
+        // A URL the policy refuses cannot reach here in a release build —
+        // `releases_url()` above already sanitised the env override — but a
+        // background check is not worth an error either way.
+        if let Err(e) = endpoints.set_releases_url(releases_url.to_string()) {
+            tracing::warn!(error = %e, "ignoring an unusable release endpoint; using the default");
+            endpoints = fresh_update::endpoint::Endpoints::production();
+        }
+    }
+    let transport = fresh_update::net::Transport::new(&endpoints);
+    Ok(fresh_update::fetch::latest(&transport, &endpoints, false)?.release)
+}
+
+/// Without the `http` feature there is no transport; `services::http` says so.
+#[cfg(not(feature = "http"))]
+fn fetch_release(releases_url: &str) -> Result<fresh_update::feed::Release, String> {
+    fresh_update::feed::Release::parse(&super::http::get_release_json(releases_url)?)
+}
+
 /// Check for a new release (blocking).
 ///
-/// Fetches the release feed here (HTTP lives in `services::http`) and hands the
-/// body to `fresh_update::check::evaluate`, which parses it, compares versions,
-/// and resolves provenance.
+/// Fetches the release feed and hands the result to
+/// `fresh_update::check::evaluate_release`, which compares versions and pairs
+/// them with this copy's provenance.
 pub fn check_for_update(releases_url: &str) -> Result<ReleaseCheckResult, String> {
-    let body = super::http::get_release_json(releases_url)?;
-    let check = fresh_update::check::evaluate(CURRENT_VERSION, &body)?;
+    let release = fetch_release(releases_url)?;
+    let check =
+        fresh_update::check::evaluate_release(CURRENT_VERSION, &release, fresh_update::resolve());
 
     tracing::debug!(
         current = CURRENT_VERSION,
@@ -327,9 +419,10 @@ mod tests {
         }
     }
 
-    // Install-method detection now lives in `fresh_update::heuristic` and
-    // `fresh_update::provenance` (see that crate's tests). release_checker only
-    // delegates, so there is nothing path-specific to test here.
+    // Install-method detection lives in `fresh_update::provenance` (see that
+    // crate's tests). release_checker only delegates, so there is nothing to
+    // test here — and nothing path-specific anywhere, since provenance is read
+    // from what the installer recorded rather than inferred from the exe path.
 
     #[test]
     fn test_parse_version_from_json() {
@@ -469,5 +562,75 @@ mod tests {
         assert!(checker.get_cached_result().is_none());
 
         stop_tx.send(()).ok();
+    }
+
+    /// The update child reports three distinct outcomes, and the indicator has
+    /// to keep them apart. Collapsing them into a success/failure pair produced
+    /// both possible lies: `ManualRequired` exited 1 and rendered as "Update
+    /// failed" when nothing had failed, and a delegated run that only *printed*
+    /// a command exited 0 and rendered as "Updated — restart fresh" when
+    /// nothing had been installed.
+    #[test]
+    fn exit_code_maps_to_three_distinct_terminal_phases() {
+        assert_eq!(
+            SelfUpdatePhase::from_exit_code(Some(0)),
+            SelfUpdatePhase::Succeeded
+        );
+        assert_eq!(
+            SelfUpdatePhase::from_exit_code(Some(fresh_update::EXIT_ACTION_REQUIRED)),
+            SelfUpdatePhase::ActionRequired
+        );
+        assert_eq!(
+            SelfUpdatePhase::from_exit_code(Some(1)),
+            SelfUpdatePhase::Failed
+        );
+
+        // All three are distinct — the whole point of the third state.
+        let phases = [
+            SelfUpdatePhase::from_exit_code(Some(0)),
+            SelfUpdatePhase::from_exit_code(Some(fresh_update::EXIT_ACTION_REQUIRED)),
+            SelfUpdatePhase::from_exit_code(Some(1)),
+        ];
+        for (i, a) in phases.iter().enumerate() {
+            for b in &phases[i + 1..] {
+                assert_ne!(a, b, "terminal phases collapsed into one another");
+            }
+        }
+    }
+
+    /// The override has to reach the whole editor, not one CLI invocation:
+    /// the background check that decides whether to show the indicator, and
+    /// the update child the popup spawns, must agree on where releases come
+    /// from. They share one env var so they cannot drift.
+    #[test]
+    fn the_release_feed_override_is_shared_by_check_and_update() {
+        // Not set: both fall back to the GitHub API.
+        std::env::remove_var(RELEASES_URL_ENV);
+        assert_eq!(releases_url(), DEFAULT_RELEASES_URL);
+
+        std::env::set_var(RELEASES_URL_ENV, "http://mirror:8080/releases/latest");
+        assert_eq!(releases_url(), "http://mirror:8080/releases/latest");
+
+        // Blank is treated as unset rather than as an empty URL.
+        std::env::set_var(RELEASES_URL_ENV, "   ");
+        assert_eq!(releases_url(), DEFAULT_RELEASES_URL);
+        std::env::remove_var(RELEASES_URL_ENV);
+    }
+
+    /// Signals and unrecognised codes are failures, not silent successes.
+    #[test]
+    fn unknown_exit_codes_are_failures() {
+        assert_eq!(
+            SelfUpdatePhase::from_exit_code(None),
+            SelfUpdatePhase::Failed
+        );
+        assert_eq!(
+            SelfUpdatePhase::from_exit_code(Some(101)),
+            SelfUpdatePhase::Failed
+        );
+        assert_eq!(
+            SelfUpdatePhase::from_exit_code(Some(-1)),
+            SelfUpdatePhase::Failed
+        );
     }
 }

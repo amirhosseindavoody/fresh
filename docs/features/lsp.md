@@ -80,6 +80,12 @@ Fresh includes built-in LSP configurations for many languages. Install the serve
 | LaTeX | texlab | `brew install texlab` |
 | Markdown | marksman | `brew install marksman` |
 | C/C++ | clangd | `brew install llvm` |
+| Odin | ols | build from source: <https://github.com/DanielGavin/ols> |
+
+`ols` ships no binaries for most platforms, so Fresh does not start it on
+its own — otherwise every Odin file would report a server that isn't there.
+Once you have built it, set `lsp.odin.auto_start` to `true` (or start it
+from the palette) and it behaves like any other server.
 
 ## Python LSP Configuration
 
@@ -209,7 +215,7 @@ Some LSP servers expect a different `languageId` than Fresh's internal language 
 
 ### Rust LSP Mode Switching
 
-Use "Switch Rust Analyzer Mode" from the command palette to toggle between Full and Reduced Memory modes for rust-analyzer.
+Use "Rust LSP: Configure Mode" from the command palette to toggle between Full and Reduced Memory modes for rust-analyzer.
 
 ## Configuring Language Detection via Settings UI
 

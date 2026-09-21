@@ -4,7 +4,7 @@
 // Two blog posts: "editing" (text editing features) and "productivity" (broader features).
 //
 // Usage:
-//   cargo test --package fresh-editor --test e2e_tests blog_showcase_ -- --ignored --nocapture
+//   cargo test --package fresh-editor --test all_tests blog_showcase_ -- --ignored --nocapture
 //   # Then for each generated showcase:
 //   scripts/frames-to-gif.sh docs/blog/editing/multi-cursor
 //   scripts/frames-to-gif.sh docs/blog/editing/search-replace
@@ -12,7 +12,7 @@
 
 use crate::common::blog_showcase::BlogShowcase;
 use crate::common::fixtures::TestFixture;
-use crate::common::git_test_helper::{git_command, DirGuard, GitTestRepo};
+use crate::common::git_test_helper::{git_command, GitTestRepo};
 use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness, HarnessOptions};
 use crossterm::event::{KeyCode, KeyModifiers};
 use lsp_types::FoldingRange;
@@ -1494,10 +1494,10 @@ fn blog_showcase_fresh_0_2_9_large_file_scanning() {
     snap(&mut h, &mut s, Some("Ctrl+G"), 500);
     hold(&mut h, &mut s, 3, 200);
 
-    // Type "y" to accept the scan
-    h.send_key(KeyCode::Char('y'), KeyModifiers::NONE).unwrap();
+    // Press the Scan button's letter to accept the scan
+    h.send_key(KeyCode::Char('s'), KeyModifiers::NONE).unwrap();
     h.render().unwrap();
-    snap(&mut h, &mut s, Some("y"), 300);
+    snap(&mut h, &mut s, Some("s"), 300);
     h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
     h.render().unwrap();
     snap(&mut h, &mut s, Some("Enter"), 400);
@@ -3363,23 +3363,24 @@ fn blog_showcase_fresh_0_4_0_ssh_session() {
     snap(&mut h, &mut s, Some("Enter"), 110);
     hold(&mut h, &mut s, 4, 75);
 
-    // --- Switch to the SSH backend by clicking the "Run in: … SSH" tab. -----
-    let (ssh_col, ssh_row) = h
-        .find_text_on_screen("SSH")
-        .expect("the 'Run in:' tab row should offer an SSH backend");
-    snap_mouse(&mut h, &mut s, None, (ssh_col, ssh_row), 100);
-    h.mouse_click(ssh_col, ssh_row).unwrap();
-    h.wait_until(|h| h.screen_to_string().contains("Remote Path"))
+    // --- Switch the Machine control to `Other host…`: Shift+Tab from the
+    //     Project Path onto it, then → to the next option (no ~/.ssh/config
+    //     and no saved machines on the demo box). -----------------------------
+    h.send_key(KeyCode::BackTab, KeyModifiers::NONE).unwrap();
+    h.render().unwrap();
+    snap(&mut h, &mut s, Some("⇧Tab"), 60);
+    h.send_key(KeyCode::Right, KeyModifiers::NONE).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("Target:"))
         .unwrap();
-    snap_mouse(&mut h, &mut s, Some("Click"), (ssh_col, ssh_row), 90);
+    snap(&mut h, &mut s, Some("→"), 90);
     hold(&mut h, &mut s, 2, 55);
 
-    // Enter on the already-active SSH tab dives into the first field (Host).
-    h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
+    // Tab from the Machine control into the first SSH field (Target).
+    h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
     h.render().unwrap();
-    snap(&mut h, &mut s, Some("Enter"), 65);
+    snap(&mut h, &mut s, Some("Tab"), 65);
 
-    // --- Host: the fake hostname + the throwaway sshd's port. ---------------
+    // --- Target: the fake hostname + the throwaway sshd's port. -------------
     let host_value = format!("{}:{}", sup::DEMO_HOST, server.port);
     for ch in host_value.chars() {
         h.send_key(KeyCode::Char(ch), KeyModifiers::NONE).unwrap();
@@ -3390,14 +3391,6 @@ fn blog_showcase_fresh_0_4_0_ssh_session() {
 
     // --- The remaining fields fill in quickly (they're the "plumbing"; the
     //     host is the star). Each lands its whole value in one go. -----------
-    // Remote Path: where the session is rooted on the remote.
-    h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
-    h.render().unwrap();
-    snap(&mut h, &mut s, Some("Tab"), 45);
-    h.type_text(&server.work.to_string_lossy()).unwrap();
-    h.render().unwrap();
-    snap(&mut h, &mut s, None, 60);
-
     // Identity file: the keypair authorized on the demo sshd.
     h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
     h.render().unwrap();
@@ -3416,6 +3409,14 @@ fn blog_showcase_fresh_0_4_0_ssh_session() {
         server.known_hosts.to_string_lossy()
     ))
     .unwrap();
+    h.render().unwrap();
+    snap(&mut h, &mut s, None, 60);
+
+    // Project Path: where the session is rooted on the remote.
+    h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+    h.render().unwrap();
+    snap(&mut h, &mut s, Some("Tab"), 45);
+    h.type_text(&server.work.to_string_lossy()).unwrap();
     h.render().unwrap();
     snap(&mut h, &mut s, None, 60);
 
@@ -4184,8 +4185,7 @@ fn blog_showcase_fresh_0_4_0_live_diff() {
     repo.git_commit("initial");
     repo.setup_live_diff_plugin();
 
-    let original_dir = repo.change_to_repo_dir();
-    let _guard = DirGuard::new(original_dir);
+    let _guard = repo.change_to_repo_dir();
 
     let mut h = EditorTestHarness::with_config_and_working_dir(
         100,
@@ -4348,13 +4348,14 @@ fn blog_showcase_fresh_0_4_0_review_diff() {
         "Review Diff, Reimagined",
         "A real review workflow: a file sidebar grouped by directory, a true \
          side-by-side OLD/NEW view, and comments anywhere — collected in a \
-         dedicated panel. (Plus Review Stash and a watch mode that auto-reloads \
+         dedicated panel. (Plus Review Diff: Stash and a watch mode that auto-reloads \
          on save.)",
     );
 
     hold(&mut h, &mut s, 4, 110);
 
-    // Open Review Diff — a three-column layout: FILES | diff | COMMENTS.
+    // Open Review Diff — the full-width unified stream, with the FILES and
+    // COMMENTS panels a keystroke away.
     h.send_key(KeyCode::Char('p'), KeyModifiers::CONTROL)
         .unwrap();
     h.wait_for_prompt().unwrap();
@@ -4363,19 +4364,45 @@ fn blog_showcase_fresh_0_4_0_review_diff() {
         .unwrap();
     snap(&mut h, &mut s, Some("Review Diff"), 150);
     h.send_key(KeyCode::Enter, KeyModifiers::NONE).unwrap();
-    h.wait_until(|h| {
-        let scr = h.screen_to_string();
-        scr.contains("FILES") && scr.contains("auth.rs") && scr.contains("COMMENTS")
-    })
-    .unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("auth.rs"))
+        .unwrap();
     snap(&mut h, &mut s, Some("Enter"), 260);
-    hold(&mut h, &mut s, 7, 140);
+    hold(&mut h, &mut s, 5, 140);
 
-    // [1] switches the center panel to a side-by-side OLD/NEW view.
-    h.send_key(KeyCode::Char('1'), KeyModifiers::NONE).unwrap();
+    // The diff opens full-width; [F] and [C] bring in the file sidebar and
+    // the comments rail for the three-column review layout.
+    h.send_key(KeyCode::Char('F'), KeyModifiers::SHIFT).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("FILES"))
+        .unwrap();
+    snap(&mut h, &mut s, Some("F"), 220);
+    h.send_key(KeyCode::Char('C'), KeyModifiers::SHIFT).unwrap();
+    h.wait_until(|h| h.screen_to_string().contains("COMMENTS"))
+        .unwrap();
+    snap(&mut h, &mut s, Some("C"), 220);
+    // Each panel takes focus as it appears; Tab back to the diff so the
+    // walk below moves the diff cursor and not a panel's selection. The
+    // Tab order is FILES → diff → COMMENTS, so how many steps that takes
+    // depends on which panels are open.
+    let panel_focused = |h: &EditorTestHarness| {
+        let screen = h.screen_to_string();
+        screen.contains("▸FILES") || screen.contains("▸COMMENTS")
+    };
+    for _ in 0..3 {
+        if !panel_focused(&h) {
+            break;
+        }
+        let before = h.screen_to_string();
+        h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
+        h.wait_until(|h| h.screen_to_string() != before).unwrap();
+    }
+    assert!(!panel_focused(&h), "focus never came back to the diff");
+    hold(&mut h, &mut s, 6, 140);
+
+    // [2] switches the center panel to a side-by-side OLD/NEW view.
+    h.send_key(KeyCode::Char('2'), KeyModifiers::NONE).unwrap();
     h.wait_until(|h| h.screen_to_string().contains("OLD (HEAD)"))
         .unwrap();
-    snap(&mut h, &mut s, Some("1"), 240);
+    snap(&mut h, &mut s, Some("2"), 240);
     hold(&mut h, &mut s, 6, 150);
 
     // Move onto a changed line and leave a comment with [c].

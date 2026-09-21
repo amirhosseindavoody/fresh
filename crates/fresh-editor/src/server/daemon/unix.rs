@@ -59,9 +59,8 @@ pub fn daemonize() -> io::Result<()> {
 ///
 /// This is used when the client starts and no server is running.
 /// The server inherits the current working directory.
-/// `ssh_url`, when set, is forwarded as `--ssh-url <URL>` so the
-/// spawned daemon boots into an SSH authority instead of the default
-/// `Authority::local()` (see `EditorServerConfig.startup_authority`).
+/// Everything the daemon cannot rediscover for itself travels in
+/// [`DaemonSpawn`], which documents each flag and builds the argv.
 /// Returns the PID of the spawned server (intermediate, not final daemon PID).
 ///
 /// The child calls `setsid()` before exec so the daemon leads its own session
@@ -75,24 +74,12 @@ pub fn daemonize() -> io::Result<()> {
 /// `setsid()` rather than [`daemonize`] because the daemon must keep the
 /// inherited working directory (it serves that project); `daemonize` chdirs
 /// to `/`.
-pub fn spawn_server_detached(session_name: Option<&str>, ssh_url: Option<&str>) -> io::Result<u32> {
+pub fn spawn_server_detached(spawn: &super::DaemonSpawn<'_>) -> io::Result<u32> {
     let exe = std::env::current_exe()?;
-
-    let mut args = vec!["--server".to_string()];
-
-    if let Some(name) = session_name {
-        args.push("--session-name".to_string());
-        args.push(name.to_string());
-    }
-
-    if let Some(url) = ssh_url {
-        args.push("--ssh-url".to_string());
-        args.push(url.to_string());
-    }
 
     // Use Command to spawn, which properly handles the process
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(&args);
+    cmd.args(super::server_args(spawn));
     detach_from_terminal(&mut cmd);
 
     let child = cmd.spawn()?;

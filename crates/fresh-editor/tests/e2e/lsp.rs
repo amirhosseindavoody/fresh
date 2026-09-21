@@ -4971,14 +4971,14 @@ fn test_popup_mouse_wheel_scrolls() -> anyhow::Result<()> {
         "Popup should be visible before scroll"
     );
 
-    // Get initial scroll offset
-    let initial_offset = harness
-        .editor()
-        .active_state()
-        .popups
-        .top()
-        .map(|p| p.scroll_state().2)
-        .unwrap_or(0);
+    // What the user can see, not what the popup stores: the window belongs to
+    // the viewport in the shell's tree now, so `scroll_offset` is no longer
+    // where the answer lives — the top visible row is.
+    let before = harness.screen_to_string();
+    assert!(
+        before.contains("completion_item_0"),
+        "the list starts at the top. Screen:\n{before}"
+    );
 
     // Send scroll down event at a position over the popup (center of screen)
     let scroll_event = MouseEvent {
@@ -4996,20 +4996,10 @@ fn test_popup_mouse_wheel_scrolls() -> anyhow::Result<()> {
         "Popup should still be visible after scroll"
     );
 
-    // Verify scroll offset changed
-    let new_offset = harness
-        .editor()
-        .active_state()
-        .popups
-        .top()
-        .map(|p| p.scroll_state().2)
-        .unwrap_or(0);
-
+    let after = harness.screen_to_string();
     assert!(
-        new_offset > initial_offset,
-        "Scroll offset should increase after scroll down: {} -> {}",
-        initial_offset,
-        new_offset
+        !after.contains("completion_item_0"),
+        "the wheel scrolled the list past its first row. Screen:\n{after}"
     );
 
     Ok(())
@@ -5180,13 +5170,25 @@ fn test_popup_mouse_wheel_scroll_up() -> anyhow::Result<()> {
     }
     harness.render()?;
 
-    let offset_after_down = harness
-        .editor()
-        .active_state()
-        .popups
-        .top()
-        .map(|p| p.scroll_state().2)
-        .unwrap_or(0);
+    // Read the window off the screen: the viewport in the shell's tree owns it
+    // now, so the top visible row is where the answer is.
+    let top_row = |h: &EditorTestHarness| -> String {
+        let screen = h.screen_to_string();
+        // The row's border hugs its text (`│item_15`), so this reads from the
+        // marker to the next space rather than splitting on whitespace.
+        screen
+            .lines()
+            .find_map(|l| {
+                let at = l.find("item_")?;
+                Some(l[at..].split(' ').next().unwrap_or("").to_string())
+            })
+            .unwrap_or_else(|| panic!("no row. Screen:\n{screen}"))
+    };
+    let after_down = top_row(&harness);
+    assert_ne!(
+        after_down, "item_0",
+        "five notches moved the window off the first row"
+    );
 
     // Now scroll up
     let scroll_up = MouseEvent {
@@ -5198,26 +5200,16 @@ fn test_popup_mouse_wheel_scroll_up() -> anyhow::Result<()> {
     harness.send_mouse(scroll_up)?;
     harness.render()?;
 
-    let offset_after_up = harness
-        .editor()
-        .active_state()
-        .popups
-        .top()
-        .map(|p| p.scroll_state().2)
-        .unwrap_or(0);
-
     // Verify popup is still visible
     assert!(
         harness.editor().active_state().popups.is_visible(),
         "Popup should still be visible after scroll up"
     );
 
-    // Verify scroll offset decreased
-    assert!(
-        offset_after_up < offset_after_down,
-        "Scroll offset should decrease after scroll up: {} -> {}",
-        offset_after_down,
-        offset_after_up
+    assert_ne!(
+        top_row(&harness),
+        after_down,
+        "scrolling up moved the window back toward the first row"
     );
 
     Ok(())
@@ -5658,6 +5650,27 @@ fn test_completion_backspace_refilters() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Screen row showing the completion entry whose label is `label`, and
+/// whether the selection background is painted across that label — the way
+/// the user tells which row is highlighted.
+fn completion_row_is_highlighted(harness: &EditorTestHarness, label: &str) -> bool {
+    let screen = harness.screen_to_string();
+    let row = screen
+        .lines()
+        .position(|line| line.contains(label))
+        .unwrap_or_else(|| panic!("no popup row for '{label}'; screen was:\n{screen}"))
+        as u16;
+    let column = harness
+        .screen_row_text(row)
+        .find(label)
+        .expect("label located on this row") as u16;
+    let selection_bg = harness.editor().theme().popup_selection_bg;
+    harness
+        .get_cell_style(column, row)
+        .and_then(|style| style.bg)
+        == Some(selection_bg)
+}
+
 /// Test type-to-filter preserves selection when possible
 #[test]
 fn test_completion_type_to_filter_preserves_selection() -> anyhow::Result<()> {
@@ -5739,17 +5752,10 @@ fn test_completion_type_to_filter_preserves_selection() -> anyhow::Result<()> {
     harness.render()?;
 
     // Verify test_beta is selected
-    let selected = harness
-        .editor()
-        .active_state()
-        .popups
-        .top()
-        .and_then(|p| p.selected_item())
-        .map(|item| item.text.clone());
-    assert_eq!(
-        selected,
-        Some("test_beta".to_string()),
-        "test_beta should be selected"
+    assert!(
+        completion_row_is_highlighted(&harness, "test_beta"),
+        "precondition: test_beta should be the highlighted row; screen was:\n{}",
+        harness.screen_to_string()
     );
 
     // Type 's' to filter (all items still match "tes")
@@ -5757,17 +5763,18 @@ fn test_completion_type_to_filter_preserves_selection() -> anyhow::Result<()> {
     harness.render()?;
 
     // Verify selection is preserved
-    let selected_after = harness
-        .editor()
-        .active_state()
-        .popups
-        .top()
-        .and_then(|p| p.selected_item())
-        .map(|item| item.text.clone());
-    assert_eq!(
-        selected_after,
-        Some("test_beta".to_string()),
-        "Selection should be preserved after filtering"
+    let screen = harness.screen_to_string();
+    assert!(
+        screen.contains("test_alpha") && screen.contains("test_beta"),
+        "all three candidates still match the narrower prefix; screen was:\n{screen}"
+    );
+    assert!(
+        completion_row_is_highlighted(&harness, "test_beta"),
+        "the highlight must stay on the row the user picked; screen was:\n{screen}"
+    );
+    assert!(
+        !completion_row_is_highlighted(&harness, "test_alpha"),
+        "only one row may be highlighted; screen was:\n{screen}"
     );
 
     Ok(())
@@ -10102,16 +10109,27 @@ fn lsp_spawn_failure_writes_stub_log_for_view_log_popup() -> anyhow::Result<()> 
         }]),
     );
 
+    // Clear any pre-existing log *before* the editor exists, so the wait
+    // below can only be satisfied by a stub this test provoked.
+    //
+    // Ordering is load-bearing, not tidiness: the LSP config is already in
+    // the `Config` the harness is built from, so construction is a point at
+    // which the editor can reach `force_spawn` and write the stub. Deleting
+    // the file after construction races that write — and losing the race
+    // deletes the very stub the wait below is waiting for, which is not a
+    // failed assertion but a wait that can no longer resolve (a 180 s
+    // nextest kill) unless a later spawn attempt happens to rewrite it.
+    // Deleting first cannot lose: the only writer afterwards is this test's
+    // own failed spawn.
+    let log_path = fresh::services::log_dirs::lsp_log_path("pascal");
+    let _ = std::fs::remove_file(&log_path);
+
     let mut harness = EditorTestHarness::with_config_and_working_dir(
         100,
         30,
         config,
         temp_dir.path().to_path_buf(),
     )?;
-
-    // Snapshot any pre-existing log to detect the stub overwrite.
-    let log_path = fresh::services::log_dirs::lsp_log_path("pascal");
-    let _ = std::fs::remove_file(&log_path);
 
     // Open the file: triggers auto-spawn → spawn fails →
     // stub log is written.
@@ -10148,6 +10166,361 @@ fn lsp_spawn_failure_writes_stub_log_for_view_log_popup() -> anyhow::Result<()> 
         contents.contains(&bogus),
         "stub log should mention the actual configured binary path so the user can spot \
          typos / missing installs. got:\n{contents}"
+    );
+
+    Ok(())
+}
+
+/// Reproducer for sinelaw/fresh#2603: completions never offered unimported
+/// symbols because the client didn't advertise
+/// `completionItem.resolveSupport.properties: ["additionalTextEdits"]`, and
+/// rust-analyzer gates its auto-import ("flyimport") candidates on exactly
+/// that capability.
+///
+/// The fake server replicates the gating: it only returns the `HashMap`
+/// auto-import candidate when the `initialize` capabilities contain
+/// `"additionalTextEdits"`, carries the import path in `labelDetails`, and
+/// delivers the `use` line lazily via `completionItem/resolve`.
+///
+/// Without the capability fix this test times out waiting for the candidate:
+/// the server (like rust-analyzer) never offers it.
+#[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "FakeLspServer uses a Bash script which is not available on Windows"
+)]
+fn test_completion_offers_unimported_symbol_and_applies_auto_import() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn_flyimport(temp_dir.path())?;
+
+    let log_file = temp_dir.path().join("flyimport_test_log.txt");
+    let test_file = temp_dir.path().join("main.rs");
+    std::fs::write(&test_file, "fn main() {\n    let m = HashMa\n}\n")?;
+
+    let mut config = fresh::config::Config::default();
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::flyimport_script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
+            args: Some(vec![log_file.to_string_lossy().to_string()]),
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // Wait for the server to be initialized and the document opened.
+    harness.wait_until(|_| {
+        std::fs::read_to_string(&log_file)
+            .unwrap_or_default()
+            .contains("textDocument/didOpen")
+    })?;
+
+    // Put the cursor at the end of "    let m = HashMa" and request
+    // completion explicitly.
+    harness.send_key(KeyCode::Down, KeyModifiers::NONE)?;
+    harness.send_key(KeyCode::End, KeyModifiers::NONE)?;
+    harness.render()?;
+    harness.send_key(KeyCode::Char(' '), KeyModifiers::CONTROL)?;
+
+    // The unimported symbol must be offered, tagged with its import path
+    // (labelDetails rendered next to the label).
+    harness.wait_until(|h| {
+        h.screen_to_string()
+            .contains("HashMap (use std::collections::HashMap)")
+    })?;
+
+    // Accept the candidate: the identifier replaces the typed prefix, and
+    // the auto-import `use` line arrives through completionItem/resolve.
+    harness.send_key(KeyCode::Tab, KeyModifiers::NONE)?;
+    harness.wait_until(|h| {
+        h.screen_to_string()
+            .contains("use std::collections::HashMap;")
+    })?;
+
+    let buffer = harness.get_buffer_content().unwrap();
+    assert_eq!(
+        buffer, "use std::collections::HashMap;\nfn main() {\n    let m = HashMap\n}\n",
+        "accepting the auto-import completion must insert both the identifier \
+         and the use line"
+    );
+
+    Ok(())
+}
+
+/// Reproducer for sinelaw/fresh#2912: while a modal dialog (Open File,
+/// command palette) is open, mouse motion over the dialog area kept firing
+/// LSP hover requests for the buffer *behind* it, and the hover popups
+/// rendered on top of the dialog.
+///
+/// The mouse-motion tracker (`update_lsp_hover_state`) ignored modal
+/// overlays entirely, and the debounce timer (`check_mouse_hover_timer`)
+/// only gated on `mouse_hover_enabled` — so both a fresh motion over the
+/// dialog and a hover armed just before the dialog opened produced hover
+/// requests underneath it.
+#[test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "FakeLspServer uses a Bash script which is not available on Windows"
+)]
+fn test_no_hover_requests_while_modal_dialog_open() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+
+    let _fake_server = FakeLspServer::spawn(temp_dir.path())?;
+
+    // Enough lines that buffer text sits behind the Open File dialog area.
+    let mut content = String::new();
+    for i in 0..25 {
+        content.push_str(&format!("fn hover_target_{i}() {{}}\n"));
+    }
+    let test_file = temp_dir.path().join("test.rs");
+    std::fs::write(&test_file, content)?;
+
+    let mut config = fresh::config::Config::default();
+    // Fire the hover debounce on the next tick so the control phase below
+    // doesn't depend on wall-clock waits.
+    config.editor.mouse_hover_delay_ms = 0;
+    config.lsp.insert(
+        "rust".to_string(),
+        fresh::types::LspLanguageConfig::Multi(vec![fresh::services::lsp::LspServerConfig {
+            command: FakeLspServer::script_path(temp_dir.path())
+                .to_string_lossy()
+                .to_string(),
+            args: Some(vec![]),
+            enabled: true,
+            auto_start: true,
+            process_limits: fresh::services::process_limits::ProcessLimits::default(),
+            initialization_options: None,
+            env: Default::default(),
+            language_id_overrides: Default::default(),
+            root_markers: Default::default(),
+            name: None,
+            only_features: None,
+            except_features: None,
+        }]),
+    );
+
+    let mut harness = EditorTestHarness::with_config_and_working_dir(
+        120,
+        30,
+        config,
+        temp_dir.path().to_path_buf(),
+    )?;
+
+    harness.open_file(&test_file)?;
+    harness.render()?;
+
+    // Control: with no modal open, hovering a symbol produces a hover popup
+    // (proves the hover pipeline works in this setup, so the suppression
+    // assertions below can't pass vacuously).
+    harness.mouse_move(6, 2)?;
+    harness.wait_until(|h| h.screen_to_string().contains("Test hover content"))?;
+
+    // Leaving the editor area dismisses the popup and clears hover state.
+    harness.mouse_move(40, 0)?;
+    assert!(
+        !harness.editor().active_state().popups.is_visible(),
+        "hover popup should be dismissed when the mouse leaves the editor area"
+    );
+
+    // Open the Open File dialog.
+    harness.send_key(KeyCode::Char('o'), KeyModifiers::CONTROL)?;
+    harness.render()?;
+    harness.assert_screen_contains("Open file:");
+
+    // Mouse motion over the dialog area must not arm a hover for the buffer
+    // content behind it...
+    harness.mouse_move(8, 20)?;
+    assert!(
+        harness.editor().get_mouse_hover_state().is_none(),
+        "mouse motion over a modal dialog must not track hover for the buffer behind it"
+    );
+    // ...and the debounce timer must not fire a request either.
+    assert!(
+        !harness.editor_mut().check_mouse_hover_timer(),
+        "hover timer must not fire while a modal dialog is open"
+    );
+
+    // A hover armed just before the dialog opened must not fire underneath
+    // it: close the dialog, arm a hover, reopen, then run the timer.
+    harness.send_key(KeyCode::Esc, KeyModifiers::NONE)?;
+    harness.render()?;
+    harness.mouse_move(6, 3)?;
+    assert!(
+        harness.editor().get_mouse_hover_state().is_some(),
+        "hover should be armed again once the dialog is closed"
+    );
+    harness.send_key(KeyCode::Char('o'), KeyModifiers::CONTROL)?;
+    harness.render()?;
+    harness.assert_screen_contains("Open file:");
+    assert!(
+        !harness.editor_mut().check_mouse_hover_timer(),
+        "a hover armed before the dialog opened must not fire while it is up"
+    );
+
+    // And nothing hover-related renders over the dialog.
+    harness.render()?;
+    assert!(
+        !harness.screen_to_string().contains("Test hover content"),
+        "no hover popup may render on top of the dialog"
+    );
+
+    Ok(())
+}
+
+/// A language server asking Fresh to delete a file must not get its way.
+///
+/// `workspace/applyEdit` is server-initiated: it arrives with no user
+/// confirmation and names any URI the server likes. Fresh used to honour the
+/// `Delete` resource operation with `std::fs::remove_dir_all` /
+/// `remove_file` — permanently, bypassing the system trash the file explorer
+/// deletes through — so a buggy server could take a directory with it. The
+/// operation is now reported and ignored.
+#[test]
+fn test_lsp_delete_resource_op_is_refused() -> anyhow::Result<()> {
+    use lsp_types::{
+        DeleteFile, DeleteFileOptions, DocumentChangeOperation, DocumentChanges, ResourceOp,
+        WorkspaceEdit,
+    };
+
+    let mut harness = EditorTestHarness::new(80, 30)?;
+
+    let temp_dir = tempfile::tempdir()?;
+
+    // A file the server asks to unlink, and a directory it asks to remove
+    // recursively — the two shapes the old code handled.
+    let doomed_file = temp_dir.path().join("keep-me.rs");
+    std::fs::write(&doomed_file, "fn main() {}\n")?;
+
+    let doomed_dir = temp_dir.path().join("keep-me-too");
+    std::fs::create_dir(&doomed_dir)?;
+    std::fs::write(doomed_dir.join("nested.rs"), "fn nested() {}\n")?;
+
+    let file_uri = fresh_core::file_uri::path_to_lsp_uri(&doomed_file).unwrap();
+    let dir_uri = fresh_core::file_uri::path_to_lsp_uri(&doomed_dir).unwrap();
+
+    let workspace_edit = WorkspaceEdit {
+        changes: None,
+        document_changes: Some(DocumentChanges::Operations(vec![
+            DocumentChangeOperation::Op(ResourceOp::Delete(DeleteFile {
+                uri: file_uri,
+                options: None,
+            })),
+            DocumentChangeOperation::Op(ResourceOp::Delete(DeleteFile {
+                uri: dir_uri,
+                options: Some(DeleteFileOptions {
+                    recursive: Some(true),
+                    ignore_if_not_exists: Some(true),
+                    annotation_id: None,
+                }),
+            })),
+        ])),
+        change_annotations: None,
+    };
+
+    harness
+        .editor_mut()
+        .handle_rename_response(0, Ok(workspace_edit))?;
+    harness.render()?;
+
+    assert!(
+        doomed_file.exists(),
+        "a server-requested delete must leave the file on disk"
+    );
+    assert!(
+        doomed_dir.join("nested.rs").exists(),
+        "a server-requested recursive delete must leave the directory on disk"
+    );
+
+    Ok(())
+}
+
+/// A language server asking Fresh to overwrite a file must not get its way.
+///
+/// `Create` with `overwrite` truncates the existing file to empty, and
+/// `Rename` with `overwrite` clobbers the destination. Both arrive through a
+/// server-initiated `workspace/applyEdit` — no confirmation, no trash — so
+/// both are reported and ignored, like the `Delete` operation beside them.
+#[test]
+fn test_lsp_resource_ops_refuse_to_overwrite() -> anyhow::Result<()> {
+    use lsp_types::{
+        CreateFile, CreateFileOptions, DocumentChangeOperation, DocumentChanges, RenameFile,
+        RenameFileOptions, ResourceOp, WorkspaceEdit,
+    };
+
+    let mut harness = EditorTestHarness::new(80, 30)?;
+    let temp_dir = tempfile::tempdir()?;
+
+    let created_over = temp_dir.path().join("created-over.rs");
+    std::fs::write(&created_over, "fn keep_me() {}\n")?;
+
+    let rename_src = temp_dir.path().join("src.rs");
+    std::fs::write(&rename_src, "fn moved() {}\n")?;
+    let rename_dst = temp_dir.path().join("dst.rs");
+    std::fs::write(&rename_dst, "fn also_keep_me() {}\n")?;
+
+    let workspace_edit = WorkspaceEdit {
+        changes: None,
+        document_changes: Some(DocumentChanges::Operations(vec![
+            DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                uri: fresh_core::file_uri::path_to_lsp_uri(&created_over).unwrap(),
+                options: Some(CreateFileOptions {
+                    overwrite: Some(true),
+                    ignore_if_exists: None,
+                }),
+                annotation_id: None,
+            })),
+            DocumentChangeOperation::Op(ResourceOp::Rename(RenameFile {
+                old_uri: fresh_core::file_uri::path_to_lsp_uri(&rename_src).unwrap(),
+                new_uri: fresh_core::file_uri::path_to_lsp_uri(&rename_dst).unwrap(),
+                options: Some(RenameFileOptions {
+                    overwrite: Some(true),
+                    ignore_if_exists: None,
+                }),
+                annotation_id: None,
+            })),
+        ])),
+        change_annotations: None,
+    };
+
+    harness
+        .editor_mut()
+        .handle_rename_response(0, Ok(workspace_edit))?;
+    harness.render()?;
+
+    assert_eq!(
+        std::fs::read_to_string(&created_over)?,
+        "fn keep_me() {}\n",
+        "a server-requested create must not truncate an existing file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rename_dst)?,
+        "fn also_keep_me() {}\n",
+        "a server-requested rename must not clobber the destination"
+    );
+    assert!(
+        rename_src.exists(),
+        "the refused rename leaves the source where it was"
     );
 
     Ok(())

@@ -2,7 +2,7 @@
 //!
 //! This module contains handlers for different prompt types when the user confirms input.
 
-use rust_i18n::t;
+use fresh_i18n::t;
 
 use super::normalize_path;
 use super::BufferId;
@@ -12,6 +12,7 @@ use crate::config_io::{ConfigLayer, ConfigResolver};
 use crate::input::keybindings::Action;
 use crate::primitives::path_utils::expand_tilde;
 use crate::services::plugins::hooks::HookArgs;
+use crate::view::confirm::{Choice, Confirm, Tone};
 use crate::view::prompt::PromptType;
 
 /// Result of handling a prompt confirmation.
@@ -488,9 +489,11 @@ impl Editor {
                             &dst.file_name().unwrap_or_default().to_string_lossy(),
                             40,
                         );
-                        self.start_prompt(
-                            t!("explorer.paste_conflict", name = &name).to_string(),
+                        let confirm = crate::app::confirm_dialog::paste_conflict(&name);
+                        self.start_confirm_prompt(
+                            confirm.body.clone(),
                             PromptType::ConfirmPasteConflict { src, dst, is_cut },
+                            confirm,
                         );
                     }
                 }
@@ -506,13 +509,15 @@ impl Editor {
                 }
                 let new_dst = dst_dir.join(input.trim());
                 if self.authority().filesystem.exists(&new_dst) {
-                    self.start_prompt(
-                        t!("explorer.paste_conflict", name = input.trim()).to_string(),
+                    let confirm = crate::app::confirm_dialog::paste_conflict(input.trim());
+                    self.start_confirm_prompt(
+                        confirm.body.clone(),
                         PromptType::ConfirmPasteConflict {
                             src,
                             dst: new_dst,
                             is_cut,
                         },
+                        confirm,
                     );
                 } else {
                     self.perform_file_explorer_paste(src, new_dst, is_cut);
@@ -720,9 +725,25 @@ impl Editor {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| full_path.display().to_string());
-            self.start_prompt(
-                t!("buffer.overwrite_confirm", name = &filename).to_string(),
+            let body = t!("buffer.overwrite_confirm", name = &filename).to_string();
+            let confirm = Confirm::new(
+                t!("dialog.title.file_exists").into_owned(),
+                body.clone(),
+                vec![
+                    Choice::new(
+                        t!("dialog.btn.overwrite").into_owned(),
+                        "o",
+                        Tone::Destructive,
+                    ),
+                    crate::app::confirm_dialog::cancel(),
+                ],
+            )
+            .detail(full_path.display().to_string())
+            .selecting(1);
+            self.start_confirm_prompt(
+                body,
                 PromptType::ConfirmOverwriteFile { path: full_path },
+                confirm,
             );
             return;
         }
@@ -735,9 +756,11 @@ impl Editor {
                     .unwrap_or(parent)
                     .display()
                     .to_string();
-                self.start_prompt(
-                    t!("buffer.create_directory_confirm", name = &dir_name).to_string(),
+                let confirm = crate::app::confirm_dialog::create_directory(&dir_name);
+                self.start_confirm_prompt(
+                    confirm.body.clone(),
                     PromptType::ConfirmCreateDirectory { path: full_path },
+                    confirm,
                 );
                 return;
             }
@@ -842,6 +865,7 @@ impl Editor {
                     "after_file_save",
                     crate::services::plugins::hooks::HookArgs::AfterFileSave {
                         buffer_id: self.active_buffer(),
+                        window_id: self.active_window.0,
                         path: full_path.clone(),
                     },
                 );
@@ -855,11 +879,7 @@ impl Editor {
                     } else {
                         self.set_status_message(t!("buffer.saved_and_closed").to_string());
                     }
-                } else if !self
-                    .active_window_mut()
-                    .pending_quit_unnamed_save
-                    .is_empty()
-                {
+                } else if self.has_pending_quit_unnamed_save() {
                     // Pop the buffer we just saved off the head of the queue,
                     // then either advance to the next unnamed buffer or quit.
                     let just_saved = self.active_buffer();
@@ -884,7 +904,7 @@ impl Editor {
                 // can't honor the user's intent to save everything; abandon
                 // the quit rather than silently dropping the remaining
                 // unnamed buffers.
-                self.active_window_mut().pending_quit_unnamed_save.clear();
+                self.clear_pending_quit_unnamed_save();
                 self.set_status_message(t!("file.error_saving", error = e.to_string()).to_string());
             }
         }
@@ -1160,24 +1180,17 @@ impl Editor {
 
                 if file_size >= threshold && enc.requires_full_file_load() {
                     // Show confirmation prompt for large file with non-resynchronizable encoding
-                    let size_mb = file_size as f64 / (1024.0 * 1024.0);
-                    let load_key = t!("file.large_encoding.key.load").to_string();
-                    let encoding_key = t!("file.large_encoding.key.encoding").to_string();
-                    let cancel_key = t!("file.large_encoding.key.cancel").to_string();
-                    let prompt_msg = t!(
-                        "file.large_encoding_prompt",
-                        encoding = enc.display_name(),
-                        size = format!("{:.0}", size_mb),
-                        load_key = load_key,
-                        encoding_key = encoding_key,
-                        cancel_key = cancel_key
-                    )
-                    .to_string();
-                    self.start_prompt(
-                        prompt_msg,
+                    let confirm = crate::app::confirm_dialog::large_file_encoding(
+                        enc.display_name(),
+                        file_size,
+                        path,
+                    );
+                    self.start_confirm_prompt(
+                        confirm.body.clone(),
                         PromptType::ConfirmLargeFileEncoding {
                             path: path.to_path_buf(),
                         },
+                        confirm,
                     );
                     return;
                 }
@@ -1455,24 +1468,21 @@ impl Editor {
             // prompt for each one before actually quitting, so the user's
             // intent ("save everything") is honored instead of silently
             // dropping their content.
-            self.active_window_mut().pending_quit_unnamed_save =
-                self.collect_unnamed_modified_buffers();
+            self.queue_unnamed_modified_buffers_for_quit();
             if !self.start_next_quit_save_as() {
                 self.should_quit = true;
             }
         } else if first_char == discard_first {
-            // Discard changes and quit (no recovery). Clearing the modified flag
-            // on every buffer ensures `end_recovery_session` will not preserve
-            // their recovery files when hot_exit is enabled — the user has
-            // explicitly asked to throw the changes away.
-            for (_, state) in self
-                .windows
-                .get_mut(&self.active_window)
-                .map(|w| &mut w.buffers)
-                .expect("active window present")
-            {
-                state.buffer.clear_modified();
-                state.buffer.set_recovery_pending(false);
+            // Clearing modified is what stops `end_recovery_session`
+            // preserving these under hot_exit — the user asked to throw them
+            // away. Every workspace, since the prompt counted every workspace:
+            // otherwise the others' recovery data silently resurrects the
+            // changes (issue #3189).
+            for window in self.windows.values_mut() {
+                for (_, state) in &mut window.buffers {
+                    state.buffer.clear_modified();
+                    state.buffer.set_recovery_pending(false);
+                }
             }
             self.should_quit = true;
         } else if first_char == quit_first && self.config.editor.hot_exit {
@@ -1711,6 +1721,29 @@ impl Editor {
                 }
                 PromptResult::Done
             }
+            QuickOpenResult::ShowBufferGroup(group_leaf) => {
+                let group_leaf =
+                    crate::model::event::LeafId(crate::model::event::SplitId(group_leaf));
+                // The group tab lives in exactly one split; find it so the
+                // activation targets the same split a click on the tab would.
+                let split_id = self
+                    .windows
+                    .get(&self.active_window)
+                    .and_then(|w| w.buffers.splits())
+                    .map(|(_, vs)| vs)
+                    .and_then(|view_states| {
+                        view_states.iter().find_map(|(split_id, vs)| {
+                            vs.open_buffers
+                                .iter()
+                                .any(|t| *t == crate::view::split::TabTarget::Group(group_leaf))
+                                .then_some(*split_id)
+                        })
+                    });
+                if let Some(split_id) = split_id {
+                    self.activate_group_tab(split_id, group_leaf);
+                }
+                PromptResult::Done
+            }
             QuickOpenResult::GotoLine(target) => {
                 // Large file opened in byte-offset mode: there is no line
                 // index yet, so a `:N` target can't be resolved to a byte
@@ -1718,10 +1751,7 @@ impl Editor {
                 // as Ctrl+G / Go to Line instead of silently clamping to
                 // line 1 and jumping to the wrong place (#2597).
                 if !self.active_buffer_has_line_index() {
-                    self.start_prompt(
-                        t!("goto.scan_confirm_prompt", yes = "y", no = "N").to_string(),
-                        PromptType::GotoLineScanConfirm,
-                    );
+                    self.start_goto_line_scan_confirm();
                     return PromptResult::Done;
                 }
                 let buffer_id = self.active_buffer();
@@ -1808,14 +1838,16 @@ impl Editor {
                 .to_string_lossy(),
             40,
         );
-        self.start_prompt(
-            t!("explorer.paste_conflict_multi", name = &name).to_string(),
+        let confirm = crate::app::confirm_dialog::multi_paste_conflict(&name);
+        self.start_confirm_prompt(
+            confirm.body.clone(),
             PromptType::ConfirmMultiPasteConflict {
                 safe,
                 confirmed,
                 pending,
                 is_cut,
             },
+            confirm,
         );
     }
 }

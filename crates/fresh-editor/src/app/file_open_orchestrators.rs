@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rust_i18n::t;
+use fresh_i18n::t;
 
 use crate::model::event::BufferId;
 use crate::state::EditorState;
@@ -176,6 +176,20 @@ impl Editor {
 
         self.set_active_buffer(buffer_id);
 
+        // Deliberately opening the file that is currently being previewed is
+        // the commitment the preview was waiting for, so the tab stops being
+        // ephemeral here rather than at each gesture that can mean "open".
+        // The File Explorer's double-click promotes explicitly (it wants the
+        // status message either way); this covers everyone else — a finder
+        // confirming a result it was previewing, Quick Open landing on the
+        // same file, a plugin's `openFile`. Without it the tab a search
+        // opened stays marked `(preview)` and the next preview closes the
+        // file the user chose.
+        if kind == OpenKind::Commit {
+            self.active_window_mut()
+                .promote_buffer_from_preview(buffer_id);
+        }
+
         // Opening a file focuses a buffer in the active split. If a
         // *different* split is maximized (most commonly the docked
         // terminal), the renderer shows only the maximized split, so the
@@ -190,13 +204,17 @@ impl Editor {
         // as nothing changed and the extra hook would cause spurious refreshes
         // in plugins like the diagnostics panel.
         if !is_new_buffer && !active_had_path {
-            #[cfg(feature = "plugins")]
-            self.update_plugin_state_snapshot();
+            // The scratch buffer was re-pointed at this file in place: the
+            // buffer id did not change, so the announcer has to be told.
+            self.announce_focus_forced();
 
-            self.plugin_manager.read().unwrap().run_hook(
-                "buffer_activated",
-                crate::services::plugins::hooks::HookArgs::BufferActivated { buffer_id },
-            );
+            // The active *file* changed even though the active *buffer* did
+            // not, so `set_active_buffer` — where the follow-the-active-buffer
+            // sync normally hangs — was a no-op. Run the gate here too, or the
+            // very first file opened into a fresh session's scratch buffer
+            // never moves the explorer. Most visible when something opens that
+            // first file for you: a code tour's opening step left the tree
+            // parked at the root for the rest of the tour (issue #2988).
         }
 
         // Use display_name from metadata for relative path display
@@ -229,8 +247,9 @@ impl Editor {
     /// Restore the split layout when the just-focused buffer would be
     /// hidden behind a maximized split.
     ///
-    /// `SplitManager::get_visible_buffers` renders *only* the maximized
-    /// split. A file open focuses its buffer in the active split, which —
+    /// A maximized split is the only one the frame places
+    /// (`SplitManager::visible_leaves` reports it alone). A file open
+    /// focuses its buffer in the active split, which —
     /// after `redirect_active_split_away_from_dock_if_needed` — is a
     /// regular editor leaf, not the maximized dock. With nothing reset, the
     /// new buffer renders behind the maximized terminal: the user sees no
@@ -369,7 +388,7 @@ impl Editor {
         state
             .margins
             .configure_for_line_numbers(self.config.editor.line_numbers);
-        state.reference_highlight_overlay.enabled = self.config.editor.highlight_occurrences;
+        state.apply_occurrence_highlight(self.config.editor.highlight_occurrences);
 
         self.windows
             .get_mut(&self.active_window)
@@ -559,7 +578,7 @@ impl Editor {
         state
             .margins
             .configure_for_line_numbers(self.config.editor.line_numbers);
-        state.reference_highlight_overlay.enabled = self.config.editor.highlight_occurrences;
+        state.apply_occurrence_highlight(self.config.editor.highlight_occurrences);
 
         self.windows
             .get_mut(&self.active_window)
@@ -803,7 +822,7 @@ impl Editor {
         state
             .margins
             .configure_for_line_numbers(self.config.editor.line_numbers);
-        state.reference_highlight_overlay.enabled = self.config.editor.highlight_occurrences;
+        state.apply_occurrence_highlight(self.config.editor.highlight_occurrences);
 
         let buffer_id = self.alloc_buffer_id();
         self.windows
@@ -982,8 +1001,7 @@ impl crate::app::window::Window {
         state
             .margins
             .configure_for_line_numbers(self.resources.config.editor.line_numbers);
-        state.reference_highlight_overlay.enabled =
-            self.resources.config.editor.highlight_occurrences;
+        state.apply_occurrence_highlight(self.resources.config.editor.highlight_occurrences);
 
         self.buffers.insert(buffer_id, state);
         self.event_logs
@@ -1131,12 +1149,17 @@ impl crate::app::window::Window {
         }
 
         // If the current buffer is empty and unmodified, replace it instead of creating a new one
-        // Note: Don't replace composite buffers (they appear empty but are special views).
+        // Note: Don't replace composite buffers (they appear empty but are special views),
+        // nor a buffer that hosts a widget panel: its rows are the tree's mirror
+        // (`app::pane_mirror`), written on the next frame, so it is empty between its
+        // mount and that frame — and it was the git log's own list buffer that a
+        // `git show` opened from the same tick replaced.
         // Suppressed when `allow_replace_empty` is false — see
         // `open_file_for_preview` for the rationale.
         let replace_current = allow_replace_empty && {
             let current_state = self.buffers.get(&self.active_buffer()).unwrap();
             !current_state.is_composite_buffer
+                && !current_state.interactive_widget_panel
                 && current_state.buffer.is_empty()
                 && !current_state.buffer.is_modified()
                 && current_state.buffer.file_path().is_none()
@@ -1280,7 +1303,11 @@ impl crate::app::window::Window {
     pub(crate) fn run_after_file_open_hook(&self, buffer_id: BufferId, path: std::path::PathBuf) {
         self.resources.plugin_manager.read().unwrap().run_hook(
             "after_file_open",
-            crate::services::plugins::hooks::HookArgs::AfterFileOpen { buffer_id, path },
+            crate::services::plugins::hooks::HookArgs::AfterFileOpen {
+                buffer_id,
+                window_id: self.id.0,
+                path,
+            },
         );
     }
 

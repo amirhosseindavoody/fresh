@@ -40,6 +40,11 @@ pub enum RemoteAttachMode {
     Window {
         label: String,
         command: Option<Vec<String>>,
+        /// Grow this preparing window into the session rather than minting a
+        /// new one, so the user is already standing in the workspace when the
+        /// connect lands — and is already looking at the page that reports it
+        /// if the connect fails. `None` mints a window, as before.
+        adopt: Option<fresh_core::WindowId>,
     },
     /// Reconnect an **existing dormant** session: a remote session restored
     /// from disk (its backend spec known, but its live authority still the
@@ -47,6 +52,11 @@ pub enum RemoteAttachMode {
     /// window's* authority at the freshly-connected backend and park the
     /// keepalive — no new window, no editor restart.
     Reconnect { window_id: fresh_core::WindowId },
+    /// No window: a plugin opened this machine to read it (`editor.openMachine`).
+    /// The connection is registered and handed back as a machine handle. Its
+    /// authority is built under `TrustLevel::Blocked`, so it cannot run commands.
+    #[cfg(feature = "plugins")]
+    Machine,
 }
 
 /// A completed remote-agent attach: the assembled authority plus the
@@ -138,6 +148,22 @@ pub enum AsyncMessage {
         server_name: String,
         /// Capabilities reported by this server
         capabilities: crate::services::lsp::manager::ServerCapabilitySummary,
+    },
+
+    /// A request to an initialized LSP server expired without a reply.
+    ///
+    /// Emitted per timeout so the editor can tell the user that the
+    /// server is not answering, rather than leaving the status bar on
+    /// "ready" while features silently do nothing (issue #2197).
+    LspRequestTimeout {
+        language: String,
+        server_name: String,
+        /// The LSP method that timed out, e.g. `textDocument/hover`.
+        method: String,
+        /// How long the request waited before being cancelled.
+        timeout: std::time::Duration,
+        /// Timeouts on this server since its last answered request.
+        consecutive: u32,
     },
 
     /// LSP server crashed or failed
@@ -559,6 +585,14 @@ pub enum LspServerStatus {
     Starting,
     Initializing,
     Running,
+    /// Initialized and alive, but requests are timing out.
+    ///
+    /// A server can complete `initialize` and then answer nothing — pyright
+    /// 1.1.408 does exactly that (issue #2197) — and the editor used to
+    /// keep reporting "ready" while every hover, definition and diagnostic
+    /// request silently expired after 30s. This status is what makes that
+    /// visible; it reverts to `Running` as soon as a request is answered.
+    Unresponsive,
     Error,
     Shutdown,
 }

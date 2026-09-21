@@ -22,7 +22,7 @@
 //! ## Usage Example
 //!
 //! ```
-//! use fresh::input_history::InputHistory;
+//! use fresh::input::input_history::InputHistory;
 //!
 //! let mut history = InputHistory::new();
 //!
@@ -116,7 +116,7 @@ impl InputHistory {
     ///
     /// # Example
     /// ```
-    /// # use fresh::input_history::InputHistory;
+    /// # use fresh::input::input_history::InputHistory;
     /// let mut history = InputHistory::new();
     /// history.push("first".to_string());
     /// history.push("second".to_string());
@@ -161,7 +161,7 @@ impl InputHistory {
     ///
     /// # Example
     /// ```
-    /// # use fresh::input_history::InputHistory;
+    /// # use fresh::input::input_history::InputHistory;
     /// let mut history = InputHistory::new();
     /// history.push("first".to_string());
     /// history.push("second".to_string());
@@ -211,7 +211,7 @@ impl InputHistory {
     ///
     /// # Example
     /// ```
-    /// # use fresh::input_history::InputHistory;
+    /// # use fresh::input::input_history::InputHistory;
     /// let mut history = InputHistory::new();
     /// history.push("first".to_string());
     /// history.push("second".to_string());
@@ -267,7 +267,7 @@ impl InputHistory {
     ///
     /// # Example
     /// ```
-    /// # use fresh::input_history::InputHistory;
+    /// # use fresh::input::input_history::InputHistory;
     /// let mut history = InputHistory::new();
     /// history.push("last search".to_string());
     /// assert_eq!(history.last(), Some("last search"));
@@ -284,7 +284,7 @@ impl InputHistory {
     ///
     /// # Example
     /// ```
-    /// # use fresh::input_history::InputHistory;
+    /// # use fresh::input::input_history::InputHistory;
     /// let mut history = InputHistory::new();
     /// history.push("first".to_string());
     /// history.push("second".to_string());
@@ -384,15 +384,17 @@ impl InputHistory {
 /// Get the data directory for Fresh editor state
 /// Returns $XDG_DATA_HOME/fresh or ~/.local/share/fresh on Linux
 /// Returns ~/Library/Application Support/fresh on macOS
-pub fn get_data_dir() -> std::io::Result<std::path::PathBuf> {
-    let data_dir = dirs::data_dir().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Could not determine data directory",
-        )
-    })?;
-    Ok(data_dir.join("fresh"))
-}
+// `get_data_dir` lives in `fresh-editor-core` (model::buffer::save needs it
+// for the in-place-write recovery directory); re-exported here so the old
+// path keeps working.
+pub use fresh_editor_core::data_dir::get_data_dir;
+
+/// Test-only hook that redirects [`get_data_dir`] on the calling thread;
+/// re-exported alongside it so integration tests (which cannot name
+/// `fresh_editor_core`) can reach it. See
+/// `fresh_editor_core::data_dir::set_data_dir_override`.
+#[doc(hidden)]
+pub use fresh_editor_core::data_dir::set_data_dir_override;
 
 /// Get the path for search history file
 pub fn get_search_history_path() -> std::io::Result<std::path::PathBuf> {

@@ -110,53 +110,26 @@ enum SpawnDecision {
     CooledDown,
 }
 
-/// Convert a directory path to an LSP `file://` URI without the `url` crate.
-fn path_to_uri(path: &Path) -> Option<Uri> {
+/// Convert a directory path to an LSP `file://` URI.
+///
+/// This routes through the shared, platform-aware converter in
+/// `fresh_core::file_uri`, the same one that builds the per-document
+/// `didOpen` URIs, so the workspace `root_uri` is encoded the same way.
+/// The old hand-rolled encoder here only handled `RootDir` and `Normal`
+/// components and dropped `Component::Prefix`, so it stripped the Windows
+/// drive letter (producing `file:///Users/...` instead of
+/// `file:///C:/Users/...`) and broke root-dependent LSP operations with
+/// "os error 3" (issue #3067).
+pub fn path_to_uri(path: &Path) -> Option<Uri> {
+    // The shared converter returns `None` for relative paths, so keep the
+    // long-standing behavior of resolving them against the working directory
+    // before encoding.
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir().ok()?.join(path)
     };
-    // Percent-encode each path component for RFC 3986 compliance
-    let encoded: String = abs
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::RootDir => None, // handled by leading '/' in Normal
-            std::path::Component::Normal(s) => {
-                let s = s.to_str()?;
-                let mut out = String::with_capacity(s.len() + 1);
-                out.push('/');
-                for b in s.bytes() {
-                    if b.is_ascii_alphanumeric()
-                        || matches!(
-                            b,
-                            b'-' | b'.'
-                                | b'_'
-                                | b'~'
-                                | b'@'
-                                | b'!'
-                                | b'$'
-                                | b'&'
-                                | b'\''
-                                | b'('
-                                | b')'
-                                | b'+'
-                                | b','
-                                | b';'
-                                | b'='
-                        )
-                    {
-                        out.push(b as char);
-                    } else {
-                        out.push_str(&format!("%{:02X}", b));
-                    }
-                }
-                Some(out)
-            }
-            _ => None,
-        })
-        .collect();
-    format!("file://{}", encoded).parse().ok()
+    fresh_core::file_uri::path_to_lsp_uri(&abs)
 }
 
 /// Detect workspace root by walking upward from a file looking for marker files/directories.
@@ -419,7 +392,7 @@ pub struct LspManager {
     per_language_root_uris: HashMap<String, Uri>,
 
     /// Tokio runtime reference
-    runtime: Option<tokio::runtime::Handle>,
+    runtime: Option<crate::services::runtime::LiveRuntime>,
 
     /// Async bridge for communication
     async_bridge: Option<AsyncBridge>,
@@ -821,7 +794,11 @@ impl LspManager {
     /// Set the Tokio runtime and async bridge
     ///
     /// Must be called before spawning any servers
-    pub fn set_runtime(&mut self, runtime: tokio::runtime::Handle, async_bridge: AsyncBridge) {
+    pub fn set_runtime(
+        &mut self,
+        runtime: crate::services::runtime::LiveRuntime,
+        async_bridge: AsyncBridge,
+    ) {
         self.runtime = Some(runtime);
         self.async_bridge = Some(async_bridge);
     }
@@ -984,6 +961,16 @@ impl LspManager {
             .iter()
             .filter(|sh| sh.handle.scope().accepts(language))
             .collect()
+    }
+
+    /// Every running server handle, regardless of the language it serves.
+    pub fn all_handles(&self) -> &[ServerHandle] {
+        &self.handles
+    }
+
+    /// Every running server handle, mutably.
+    pub fn all_handles_mut(&mut self) -> Vec<&mut ServerHandle> {
+        self.handles.iter_mut().collect()
     }
 
     /// Get all mutable handles that accept a language (both language-specific and universal).
@@ -1930,194 +1917,11 @@ impl Drop for LspManager {
     }
 }
 
-/// Helper function to detect language from file path using the config's languages section.
-///
-/// Priority order matches `GrammarRegistry::find_by_path`:
-/// 1. Exact filename match against `filenames` (highest priority)
-/// 2. Glob pattern match against `filenames` entries containing wildcards
-/// 3. File extension match against `extensions` (lowest config-based priority)
-///
-/// Kept separate from `find_by_path` because this returns the user's
-/// config **key** (`[languages.mylang]` → `"mylang"`) rather than the
-/// catalog entry's `language_id`, which is needed for LSP routing when a
-/// user aliases an existing grammar.
-pub fn detect_language(
-    path: &std::path::Path,
-    languages: &std::collections::HashMap<String, crate::config::LanguageConfig>,
-) -> Option<String> {
-    let detected = detect_language_by_config(path, languages);
-
-    // `.h` headers: the default config maps the extension to C, but in C++
-    // projects the header is still C++ and must route to clangd in C++ mode.
-    // If the detected language is `c`, the file is `.h`, and the surrounding
-    // tree smells like C++ (sibling C++ sources or an ancestor
-    // `compile_commands.json`), promote to `cpp` so the LSP binding is right.
-    if detected.as_deref() == Some("c")
-        && path.extension().and_then(|e| e.to_str()) == Some("h")
-        && languages.contains_key("cpp")
-        && header_in_cpp_tree(path)
-    {
-        return Some("cpp".to_string());
-    }
-
-    detected
-}
-
-/// Pure config/path-based language detection without filesystem probing.
-fn detect_language_by_config(
-    path: &std::path::Path,
-    languages: &std::collections::HashMap<String, crate::config::LanguageConfig>,
-) -> Option<String> {
-    use crate::primitives::glob_match::{
-        filename_glob_matches, is_glob_pattern, is_path_pattern, path_glob_matches,
-    };
-
-    if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-        // 1. Exact filename match (highest priority)
-        for (language_name, lang_config) in languages {
-            if lang_config
-                .filenames
-                .iter()
-                .any(|f| !is_glob_pattern(f) && f == filename)
-            {
-                return Some(language_name.clone());
-            }
-        }
-
-        // 2. Glob pattern match
-        // Path patterns (containing `/`) match against the full path;
-        // filename-only patterns match against just the filename.
-        let path_str = path.to_str().unwrap_or("");
-        for (language_name, lang_config) in languages {
-            if lang_config.filenames.iter().any(|f| {
-                if !is_glob_pattern(f) {
-                    return false;
-                }
-                if is_path_pattern(f) {
-                    path_glob_matches(f, path_str)
-                } else {
-                    filename_glob_matches(f, filename)
-                }
-            }) {
-                return Some(language_name.clone());
-            }
-        }
-    }
-
-    // 3. Extension match (lowest priority among config-based detection)
-    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
-        for (language_name, lang_config) in languages {
-            if lang_config.extensions.iter().any(|ext| ext == extension) {
-                return Some(language_name.clone());
-            }
-        }
-    }
-
-    None
-}
-
-/// Filesystem probe: does this header sit inside something that looks like
-/// a C++ project? Two signals, both conservative:
-///
-///   * The file's own directory contains any C++ source or C++-specific
-///     header (`.cc`, `.cpp`, `.cxx`, `.C`, `.c++`, `.hpp`, `.hh`, `.hxx`).
-///     Decisive — if the siblings are C++, the header is too.
-///   * An ancestor up to 10 levels deep contains a `compile_commands.json`
-///     whose content carries a C++ marker. The mere presence of the file
-///     is not enough: CMake emits `compile_commands.json` for pure-C
-///     builds as well, so we peek inside and only promote when the
-///     payload mentions a C++-specific compiler, flag, or source
-///     extension (`c++`, `.cpp`, `.cc`, `.cxx`, `.C` ). This still covers
-///     the fmt / Chromium / LLVM / Qt-style layouts where the header
-///     lives deep under `include/` while sources sit in `src/` at the
-///     project root.
-///
-/// Bounded by depth (10), by a single shallow `read_dir` at the start,
-/// and by a capped 1 MiB read of `compile_commands.json`, so the cost is
-/// a handful of `stat`s plus at most one bounded read on file open.
-/// Silent on any I/O error — if we can't see the filesystem we fall back
-/// to the default config answer (C), which is the pre-fix behavior.
-///
-/// NOTE(remote-fs): Uses `std::fs` directly, matching the pre-existing
-/// `detect_workspace_root` in this module. On SSH sessions the probe
-/// sees the local filesystem, so the promotion silently becomes a no-op
-/// (returns `false`, falls back to `c`). Fixing this requires threading
-/// `&dyn FileSystem` through `detect_language` and
-/// `DetectedLanguage::from_path` — a cross-cutting refactor that should
-/// be done alongside the same fix for `detect_workspace_root`.
-fn header_in_cpp_tree(path: &std::path::Path) -> bool {
-    let Some(start_dir) = path.parent() else {
-        return false;
-    };
-
-    // 1. Sibling scan in the header's own directory.
-    if let Ok(entries) = std::fs::read_dir(start_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
-                continue;
-            };
-            if matches!(
-                ext,
-                "cc" | "cpp" | "cxx" | "C" | "c++" | "hpp" | "hh" | "hxx"
-            ) {
-                return true;
-            }
-        }
-    }
-
-    // 2. Walk ancestors for compile_commands.json, and only promote if
-    //    the file actually carries a C++ marker — CMake emits it for
-    //    pure-C builds too.
-    let mut current = Some(start_dir);
-    let mut depth = 0u32;
-    while let Some(dir) = current {
-        let cc = dir.join("compile_commands.json");
-        if cc.is_file() && compile_commands_has_cpp_marker(&cc) {
-            return true;
-        }
-        if depth >= 10 {
-            break;
-        }
-        depth += 1;
-        current = dir.parent();
-    }
-
-    false
-}
-
-/// Returns true when `compile_commands.json` contains a C++ marker —
-/// either the literal substring `c++` (covers `-std=c++17`, `clang++`,
-/// `g++`, the `c++` compiler name) or a C++ source extension in a
-/// context where it cannot be confused with an adjacent header path
-/// (`.cpp`, `.cc`, `.cxx`). Reads at most 1 MiB so multi-megabyte
-/// compile DBs from large monorepos don't block file open; a valid CMake
-/// entry fits comfortably in that window.
-fn compile_commands_has_cpp_marker(path: &std::path::Path) -> bool {
-    use std::io::Read;
-    const MAX_READ: u64 = 1_048_576;
-
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut buf = Vec::with_capacity(64 * 1024);
-    if file.take(MAX_READ).read_to_end(&mut buf).is_err() {
-        return false;
-    }
-    let Ok(text) = std::str::from_utf8(&buf) else {
-        return false;
-    };
-
-    // Strongest single marker: literal "c++" appears in -std=c++NN,
-    // clang++, g++, and the "c++" compiler name — never in a pure-C
-    // compilation invocation.
-    if text.contains("c++") {
-        return true;
-    }
-    // Secondary markers: any mention of a C++ source extension in the
-    // compile DB implies at least one C++ translation unit in the tree.
-    text.contains(".cpp") || text.contains(".cxx") || text.contains(".cc\"")
-}
+// Language detection by config lives in `fresh-editor-core`: the routing
+// rules read `config::LanguageConfig` and `primitives::detected_language`
+// needs them too, so they sit below both callers. Re-exported here so
+// `services::lsp::manager::detect_language` keeps resolving.
+pub use fresh_editor_core::language_detect::detect_language;
 
 #[cfg(test)]
 mod tests {
@@ -2193,11 +1997,11 @@ mod tests {
 
     #[test]
     fn test_lsp_manager_force_spawn_no_config() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = crate::services::runtime::LiveRuntime::multi_thread("lsp-test", 1).unwrap();
         let mut manager = LspManager::new(fresh_core::WindowId(1), None);
         let async_bridge = AsyncBridge::new();
 
-        manager.set_runtime(rt.handle().clone(), async_bridge);
+        manager.set_runtime(rt.clone(), async_bridge);
 
         // force_spawn should return None for unconfigured language
         let result = manager.force_spawn("rust", None);
@@ -2206,11 +2010,11 @@ mod tests {
 
     #[test]
     fn test_lsp_manager_force_spawn_disabled_language() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = crate::services::runtime::LiveRuntime::multi_thread("lsp-test", 1).unwrap();
         let mut manager = LspManager::new(fresh_core::WindowId(1), None);
         let async_bridge = AsyncBridge::new();
 
-        manager.set_runtime(rt.handle().clone(), async_bridge);
+        manager.set_runtime(rt.clone(), async_bridge);
 
         // Add disabled config (command is optional when disabled)
         manager.set_language_config(
@@ -2243,10 +2047,10 @@ mod tests {
     // every file open.
     #[test]
     fn test_lsp_manager_try_spawn_returns_disabled_when_all_configs_disabled() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = crate::services::runtime::LiveRuntime::multi_thread("lsp-test", 1).unwrap();
         let mut manager = LspManager::new(fresh_core::WindowId(1), None);
         let async_bridge = AsyncBridge::new();
-        manager.set_runtime(rt.handle().clone(), async_bridge);
+        manager.set_runtime(rt.clone(), async_bridge);
 
         manager.set_language_config(
             "rust".to_string(),
@@ -2275,10 +2079,10 @@ mod tests {
     // `Disabled` (callers stay silent), not `Failed`.
     #[test]
     fn test_lsp_manager_try_spawn_returns_disabled_when_globally_disabled() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = crate::services::runtime::LiveRuntime::multi_thread("lsp-test", 1).unwrap();
         let mut manager = LspManager::new(fresh_core::WindowId(1), None);
         let async_bridge = AsyncBridge::new();
-        manager.set_runtime(rt.handle().clone(), async_bridge);
+        manager.set_runtime(rt.clone(), async_bridge);
 
         manager.set_language_config(
             "rust".to_string(),
@@ -2779,16 +2583,47 @@ mod tests {
         assert_eq!(detect_language(&header, &languages), Some("c".to_string()));
     }
 
+    // These two use POSIX-absolute inputs (`/tmp/...`). On Windows such a path
+    // has no drive, so `path_to_uri` resolves it against the current directory
+    // and the encoded URI carries that drive (`file:///D:/tmp/...`). That is a
+    // correct result, but not the literal the assertions below expect, so gate
+    // them to Unix. The Windows drive and space behavior is covered by the
+    // `#[cfg(windows)]` test that follows.
+    #[cfg(unix)]
     #[test]
     fn test_path_to_uri_basic() {
         let uri = path_to_uri(Path::new("/tmp/test")).unwrap();
         assert_eq!(uri.as_str(), "file:///tmp/test");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_path_to_uri_with_spaces() {
         let uri = path_to_uri(Path::new("/tmp/my project/src")).unwrap();
         assert_eq!(uri.as_str(), "file:///tmp/my%20project/src");
+    }
+
+    /// Regression test for issue #3067: on Windows the workspace `root_uri`
+    /// dropped the drive letter (`file:///Users/...` instead of
+    /// `file:///C:/Users/...`), breaking root-dependent LSP operations with
+    /// "os error 3". The old hand-rolled encoder ignored `Component::Prefix`,
+    /// and routing through the shared converter preserves the drive. Runs on
+    /// the Windows CI runner, where a `C:\...` path parses to a `Prefix`
+    /// component.
+    #[cfg(windows)]
+    #[test]
+    fn test_path_to_uri_preserves_windows_drive_letter() {
+        let uri = path_to_uri(Path::new(r"C:\Users\Lance\.config\opencode")).unwrap();
+        assert_eq!(
+            uri.as_str(),
+            "file:///C:/Users/Lance/.config/opencode",
+            "root_uri must keep the Windows drive letter (issue #3067)"
+        );
+
+        // Spaces are still percent-encoded on Windows (the encoding coverage the
+        // Unix `test_path_to_uri_with_spaces` provides on that platform).
+        let spaced = path_to_uri(Path::new(r"C:\my project\src")).unwrap();
+        assert_eq!(spaced.as_str(), "file:///C:/my%20project/src");
     }
 
     #[test]

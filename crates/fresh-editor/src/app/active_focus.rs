@@ -56,15 +56,10 @@ impl Editor {
         // the restored-terminal transition (re-enable editing, drop the
         // stale screen tail, resize the PTY) that only the Editor level can.
         self.complete_terminal_mode_side_effects();
-        // Plugin state snapshot reaches editor-wide state (clipboard,
-        // windows list, config cache) so it stays on Editor. Run it
-        // BEFORE the hook so the handler sees the new active buffer.
-        #[cfg(feature = "plugins")]
-        self.update_plugin_state_snapshot();
-        self.plugin_manager.read().unwrap().run_hook(
-            "buffer_activated",
-            crate::services::plugins::hooks::HookArgs::BufferActivated { buffer_id },
-        );
+        // The snapshot refresh and the `buffer_activated` hook are the
+        // announcer's (`app::focus_announcer`), which fires them off the
+        // change it observes rather than off this call.
+        self.announce_focus();
     }
 
     /// Focus a split and its buffer, handling all side effects including
@@ -167,13 +162,6 @@ impl Window {
         // correctly (issue #2650).
         let tabs_width = self.split_tabs_width(active_split);
         self.ensure_active_tab_visible(active_split, buffer_id, tabs_width);
-
-        if self.file_explorer_visible
-            && self.resources.config.file_explorer.follow_active_buffer
-            && self.key_context != crate::input::keybindings::KeyContext::FileExplorer
-        {
-            self.sync_file_explorer_to_active_file();
-        }
 
         true
     }
@@ -327,6 +315,23 @@ impl Window {
         }
 
         if split_changed {
+            // The tab this split was showing before we point it at
+            // `buffer_id`. Captured before `set_pane_buffer` overwrites it,
+            // and read from *this* split rather than from the editor-wide
+            // active buffer: `focus_history` is a per-split tab LRU, and
+            // `previous_buffer` belongs to the split we are leaving. Pushing
+            // that instead made a buffer that was never a tab here the top
+            // LRU candidate, so the next close in this split adopted it —
+            // which is how closing a file the code tour opened pulled the
+            // dock's tour panel up into the editor split.
+            let previous_target = self
+                .buffers
+                .splits()
+                .expect("active window must have a populated split layout")
+                .1
+                .get(&split_id)
+                .map(|vs| vs.active_target());
+
             // Update split manager to focus this split
             self.split_manager_mut()
                 .expect("active window must have a populated split layout")
@@ -351,7 +356,11 @@ impl Window {
                     .get_mut(&split_id)
                 {
                     view_state.add_buffer(buffer_id);
-                    view_state.push_focus(crate::view::split::TabTarget::Buffer(previous_buffer));
+                    if let Some(previous_target) = previous_target {
+                        if previous_target != crate::view::split::TabTarget::Buffer(buffer_id) {
+                            view_state.push_focus(previous_target);
+                        }
+                    }
                 }
                 // Note: We don't sync file explorer here to avoid flicker during split focus changes.
                 // File explorer syncs when explicitly focused via focus_file_explorer().
