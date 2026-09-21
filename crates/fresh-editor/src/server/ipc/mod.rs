@@ -39,6 +39,18 @@ pub struct SocketPaths {
     pub pid: PathBuf,
 }
 
+/// Whether a session's server is running, as far as *this* process can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerLiveness {
+    /// The server answered, or its process is visibly running.
+    Alive,
+    /// Positively not running: no pid and nothing listening.
+    Dead,
+    /// The socket is present but this process may not reach it — typically a
+    /// sandbox denying `connect(2)`. Says nothing about the server itself.
+    Unreachable,
+}
+
 impl SocketPaths {
     /// Get the socket directory
     pub fn socket_directory() -> io::Result<PathBuf> {
@@ -94,27 +106,47 @@ impl SocketPaths {
 
     /// Check if the server process is still alive
     pub fn is_server_alive(&self) -> bool {
+        matches!(self.probe_server(), ServerLiveness::Alive)
+    }
+
+    /// Liveness of the session's server, keeping "cannot tell" separate from
+    /// "not running".
+    ///
+    /// Both signals can fail for reasons that have nothing to do with the
+    /// editor: a caller in a PID namespace cannot see the editor's pid, and a
+    /// sandboxed caller may be denied `connect(2)` on a socket that lives
+    /// outside its writable roots. Reporting either as "dead" is what makes a
+    /// sandboxed agent chase a phantom stale session — and, worse, invites
+    /// `cleanup_if_stale` to unlink the *live* editor's sockets.
+    pub fn probe_server(&self) -> ServerLiveness {
         use crate::server::daemon::is_process_running;
 
         // Check PID file - this is the reliable method
         if let Ok(Some(pid)) = self.read_pid() {
             if is_process_running(pid) {
-                return true;
+                return ServerLiveness::Alive;
             }
         }
 
         // Platform-specific fallback check
         if self.exists() {
-            return platform::check_server_by_connect(&self.control);
+            return match platform::probe_server_by_connect(&self.control) {
+                platform::ConnectProbe::Alive => ServerLiveness::Alive,
+                platform::ConnectProbe::Blocked => ServerLiveness::Unreachable,
+                platform::ConnectProbe::Refused => ServerLiveness::Dead,
+            };
         }
 
-        false
+        ServerLiveness::Dead
     }
 
     /// Clean up stale daemon files if the daemon is not running
     /// Returns true if files were cleaned up
+    ///
+    /// Only a positive `Dead` verdict may delete anything: an `Unreachable`
+    /// probe means we were denied the answer, not given a negative one.
     pub fn cleanup_if_stale(&self) -> bool {
-        if self.exists() && !self.is_server_alive() {
+        if self.exists() && self.probe_server() == ServerLiveness::Dead {
             // Best-effort cleanup of stale socket files
             #[allow(clippy::let_underscore_must_use)]
             let _ = self.cleanup();
@@ -527,6 +559,21 @@ pub struct ClientConnection {
     pub control: StreamWrapper,
 }
 
+/// Normalize a connect failure, keeping a permission denial distinguishable.
+///
+/// Everything else collapses to `ConnectionRefused`, but `PermissionDenied`
+/// has to survive: it means "not allowed to reach it", which callers must not
+/// conflate with "nothing is listening" — a sandbox that denies `connect(2)`
+/// on the socket produces it while the editor is running perfectly well.
+fn connect_error(e: impl std::fmt::Display + Into<io::Error>) -> io::Error {
+    let err: io::Error = e.into();
+    let kind = match err.kind() {
+        io::ErrorKind::PermissionDenied => io::ErrorKind::PermissionDenied,
+        _ => io::ErrorKind::ConnectionRefused,
+    };
+    io::Error::new(kind, err.to_string())
+}
+
 impl ClientConnection {
     /// Connect to a server at the given socket paths
     pub fn connect(paths: &SocketPaths) -> io::Result<Self> {
@@ -534,11 +581,9 @@ impl ClientConnection {
         let data_name = platform::socket_name_for_path(&paths.data)?;
 
         // Connect control socket first, then data (matching server's accept order)
-        let control = Stream::connect(control_name)
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
+        let control = Stream::connect(control_name).map_err(connect_error)?;
 
-        let data = Stream::connect(data_name)
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
+        let data = Stream::connect(data_name).map_err(connect_error)?;
 
         Ok(Self {
             data: StreamWrapper::new(data),

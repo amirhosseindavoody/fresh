@@ -38,7 +38,7 @@ use crate::common::scenario::layout_scenario::{
     assert_layout_scenario, check_layout_scenario, LayoutScenario,
 };
 use crate::common::scenario::render_snapshot::{RenderSnapshotExpect, RowMatch};
-use crossterm::event::Event as CrosstermEvent;
+use fresh::server::input_parser::Event as InputEvent;
 use fresh::test_api::Action;
 
 /// Build the `Action` sequence that opens the command palette and
@@ -150,7 +150,7 @@ fn same_size_resize_event_requests_full_redraw() {
 
     harness
         .editor_mut()
-        .handle_input_event(CrosstermEvent::Resize(80, 24))
+        .handle_input_event(InputEvent::Resize(80, 24))
         .unwrap();
 
     assert!(
@@ -168,7 +168,7 @@ fn focus_gained_requests_full_redraw() {
 
     harness
         .editor_mut()
-        .handle_input_event(CrosstermEvent::FocusGained)
+        .handle_input_event(InputEvent::FocusGained)
         .unwrap();
 
     assert!(

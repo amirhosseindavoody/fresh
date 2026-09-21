@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::Event;
+use fresh_input_parser::Event;
 use ratatui::Terminal;
 
 use crate::app::Editor;
@@ -47,13 +47,22 @@ pub struct EditorServerConfig {
     pub plugins_enabled: bool,
     /// Whether to auto-load ~/.config/fresh/init.ts (requires `plugins_enabled`).
     pub init_enabled: bool,
+    /// Boot into Orchestrator mode: bring back the workspace that was last
+    /// focused rather than the one matching `working_dir`, and leave the
+    /// launch directory's empty buffer out of the way (see
+    /// `Config::orchestrator_mode`).
+    ///
+    /// Set from the `--orchestrator-mode` flag the bare-`fresh` client
+    /// forwards. The daemon cannot infer it: `working_dir` and the config
+    /// look identical whether the client was `fresh` or `fresh -a`.
+    pub orchestrator_mode: bool,
     /// Authority to install at boot.  `None` means `Authority::local()`,
     /// which is the standard daemon-mode default (principle 6 of
     /// `AUTHORITY_DESIGN.md`).  The CLI `ssh://` / `user@host:path`
     /// forms construct an `Authority::ssh(...)` and pass it here so
     /// the daemon boots already attached to the remote host.  Plugins
     /// can still replace this post-boot via `setAuthority`.
-    pub startup_authority: Option<crate::services::authority::Authority>,
+    pub startup_authority: Option<std::sync::Arc<crate::services::authority::Connection>>,
     /// Workspace Trust handle, created by the caller (`main.rs`) before the
     /// startup authority so the same `Arc` backs both the authority's spawners
     /// and the server. Mandatory: every spawner holds it, so there's no
@@ -105,26 +114,16 @@ pub struct EditorServer {
     /// submitted, so its `ScriptResult` is written when the outcome arrives
     /// rather than at dispatch time.
     pending_commands: std::collections::HashMap<u64, u64>,
-    /// Current authority. Carried across editor rebuilds so plugin-
-    /// installed authorities (e.g. a devcontainer attach) survive the
-    /// restart-based transition: the old editor is dropped, a new one
-    /// is built with this authority in effect, and clients stay
-    /// connected the whole time. Starts as
-    /// `config.startup_authority.unwrap_or_else(Authority::local)`.
-    current_authority: crate::services::authority::Authority,
+    /// The connection the daemon boots its editor on. Moved into the editor
+    /// when it is built; afterwards this holds a local placeholder.
+    current_authority: std::sync::Arc<crate::services::authority::Connection>,
     /// Workspace Trust state, gating process execution. Held here (not on
-    /// the `Editor`) so the chosen level survives editor rebuilds. Shared
-    /// by `Arc` into the authority's guarding spawners on every build via
-    /// `Authority::with_trust`; its root is updated when the working
-    /// directory changes.
+    /// the `Editor`) so the daemon owns the chosen level. Shared by `Arc` into
+    /// the authority's spawners; its root follows the working directory.
     workspace_trust: Arc<crate::services::workspace_trust::WorkspaceTrust>,
-    /// Live env provider, shared into the authority's spawners across rebuilds.
+    /// Live env provider, shared into the authority's spawners.
     env_provider: Arc<crate::services::env_provider::EnvProvider>,
-    /// Keepalive bundle paired with the startup authority — held for
-    /// the server's lifetime so SSH runtimes, reconnect tasks, and
-    /// similar resources outlive the editor rebuilds that happen on
-    /// authority transitions.  Never inspected; dropped only when the
-    /// server is dropped.
+    /// Keepalive paired with the startup authority, held for the server's lifetime.
     #[allow(dead_code)]
     session_keepalive: Option<Box<dyn std::any::Any + Send>>,
     /// The hosted web bridge (`config.web_addr`), bound in `run` once the
@@ -240,10 +239,12 @@ impl EditorServer {
         // A missing startup authority defaults to a local one carrying the
         // same trust + env handles.
         let current_authority = config.startup_authority.take().unwrap_or_else(|| {
-            crate::services::authority::Authority::local(
-                Arc::clone(&workspace_trust),
-                Arc::clone(&env_provider),
-            )
+            std::sync::Arc::new(crate::services::authority::Connection::plain(
+                crate::services::authority::Authority::local(
+                    Arc::clone(&workspace_trust),
+                    Arc::clone(&env_provider),
+                ),
+            ))
         });
         let session_keepalive = config.session_keepalive.take();
 
@@ -292,6 +293,24 @@ impl EditorServer {
     /// Run the editor server main loop
     pub fn run(&mut self) -> io::Result<()> {
         tracing::info!("Editor server starting for {:?}", self.config.working_dir);
+
+        // Bind this process's local control socket, exactly as the TUI
+        // (main.rs), GUI (gui::run) and standalone web (webui::run) paths do.
+        // The daemon hosts embedded terminals of its own, and the spawner
+        // advertises `FRESH_SESSION` to them only when this socket is bound
+        // (`local_control::local_session_id()`). Without it a terminal opened
+        // in a daemon-backed editor — which is *every* terminal once
+        // Orchestrator mode is on, since a bare `fresh` hands the launch to
+        // the shared daemon — got `FRESH_BIN` but no `FRESH_SESSION`, so a
+        // nested `fresh FILE` opened a second editor in the terminal instead
+        // of forwarding to the parent, and `fresh --cmd …` reported "not
+        // inside a Fresh session". Agent terminals were unaffected because
+        // `agent_command_env` calls `start()` itself; plain ones never did.
+        // Best-effort, like every other caller: on failure the daemon still
+        // serves, and nested launches open inline.
+        if let Err(e) = crate::server::local_control::start() {
+            tracing::warn!("Local control socket unavailable: {}", e);
+        }
 
         let mut next_client_id = 1u64;
         let mut needs_render = true;
@@ -416,39 +435,9 @@ impl EditorServer {
                 needs_render = true;
             }
 
-            // Check if editor should quit. `should_quit` is set both
-            // by a genuine user quit and by `request_restart`
-            // (triggered by `change_working_dir` and by
-            // `install_authority`).  Distinguish the two by peeking at
-            // the editor's pending-restart fields: if either carries a
-            // value, rebuild the editor in place and keep clients
-            // attached; otherwise this is a real shutdown.
-            if let Some(ref mut editor) = self.editor {
+            // A quit is a quit; the editor is never rebuilt.
+            if let Some(ref editor) = self.editor {
                 if editor.should_quit() {
-                    let pending_authority = editor.take_pending_authority();
-                    let pending_keepalive = editor.take_pending_keepalive();
-                    let restart_dir = editor.take_restart_dir();
-                    if pending_authority.is_some() || restart_dir.is_some() {
-                        tracing::info!(
-                            "Session rebuild requested (authority={}, dir={})",
-                            pending_authority.is_some(),
-                            restart_dir.is_some()
-                        );
-                        if let Err(e) =
-                            self.rebuild_editor(restart_dir, pending_authority, pending_keepalive)
-                        {
-                            tracing::error!("Session rebuild failed, shutting down: {}", e);
-                            self.shutdown.store(true, Ordering::SeqCst);
-                            continue;
-                        }
-                        // The bridge's clipboard mirror was seeded from the
-                        // editor that just went away; re-seed it so the next
-                        // scene doesn't announce a copy nobody made.
-                        #[cfg(feature = "web")]
-                        self.rebind_web_bridge();
-                        needs_render = true;
-                        continue;
-                    }
                     tracing::info!("Editor requested quit");
                     self.shutdown.store(true, Ordering::SeqCst);
                     continue;
@@ -541,7 +530,7 @@ impl EditorServer {
 
             // Process async messages from editor
             if let Some(ref mut editor) = self.editor {
-                if editor.process_async_messages() {
+                if editor.process_async_messages_budgeted() {
                     needs_render = true;
                 }
                 if editor.process_pending_file_opens() {
@@ -614,7 +603,31 @@ impl EditorServer {
                 // switch paints its first frame and then freezes mid-slide
                 // until the user nudges the terminal. Mirrors the direct
                 // (non-server) loop in `main.rs`.
-                if editor.active_window().animations.is_active() {
+                // Same for a wheel gesture still walking its lines: each
+                // frame hands over the next one, so without this a
+                // multi-line notch would stop part-way through.
+                if editor.active_window().animations.is_active()
+                    || editor.active_window_mut().animations.take_settle_frame()
+                    || editor.has_pending_wheel_scroll()
+                {
+                    needs_render = true;
+                }
+
+                // **Everything else that owes a frame at a time, from the one
+                // place that knows.** The two conditions above are a
+                // hand-copied subset of `next_periodic_redraw_deadline`, which
+                // the TUI (`main.rs`) and the web loop both wait on — so every
+                // other time-driven effect simply did not happen here until
+                // some input forced a frame. The occurrence highlight is how
+                // that showed: its debounce is applied inside a render, the
+                // daemon renders only on events, and so the highlight for the
+                // word under the cursor waited for the next keystroke and
+                // then jumped, which reads as a flicker while typing. The LSP
+                // spinner and the async-paste fallback had the same hole.
+                if editor
+                    .next_periodic_redraw_deadline()
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
                     needs_render = true;
                 }
             }
@@ -673,6 +686,7 @@ impl EditorServer {
             } else {
                 tracing::debug!("Workspaces saved successfully");
             }
+            editor.save_dock_chrome();
         }
 
         // Clean shutdown
@@ -691,6 +705,8 @@ impl EditorServer {
     /// Returns whether the size actually moved (the caller then pushes it into
     /// the capture backend and the editor via `update_terminal_size`).
     fn recompute_term_size(&mut self) -> bool {
+        // `mut` is exercised only by the `web` branch below.
+        #[cfg_attr(not(feature = "web"), allow(unused_mut))]
         let mut fit: Option<TermSize> = self.clients.first().map(|c| c.term_size);
         #[cfg(feature = "web")]
         if let Some((wc, wr)) = self.web.as_ref().and_then(|b| b.wanted_size()) {
@@ -795,19 +811,7 @@ impl EditorServer {
         bridge.push_scene(editor, size.cols, size.rows);
     }
 
-    /// Re-seed the web bridge's clipboard mirror after an in-place editor
-    /// rebuild (authority swap / working-directory change), so the browsers'
-    /// next scene doesn't announce a clipboard change nobody made.
-    #[cfg(feature = "web")]
-    fn rebind_web_bridge(&mut self) {
-        if let (Some(bridge), Some(editor)) = (self.web.as_mut(), self.editor.as_ref()) {
-            bridge.rebound_editor(editor);
-        }
-    }
-
-    /// Build a fresh `Editor` instance using the current configuration
-    /// and stored authority.  Shared between first-boot initialization
-    /// and post-restart rebuild.
+    /// Build the `Editor` from the current configuration and stored authority.
     fn build_editor_instance(&mut self) -> io::Result<(Editor, Terminal<CaptureBackend>)> {
         let backend = CaptureBackend::new(self.term_size.cols, self.term_size.rows);
         let terminal = Terminal::new(backend)
@@ -827,19 +831,18 @@ impl EditorServer {
             self.config.dir_context.clone(),
             self.config.plugins_enabled,
             color_capability,
-            // `Authority` is single-owner (non-`Clone`): move the current one
-            // into the rebuilt editor, leaving a local placeholder behind. A
-            // real authority transition overwrites it just below; otherwise
-            // each window's own backend spec drives restore/reconnect, so the
-            // placeholder only governs the active window until it reconnects.
+            // Move the boot connection into the editor, leaving a local placeholder.
             std::mem::replace(
                 &mut self.current_authority,
-                crate::services::authority::Authority::local(
-                    std::sync::Arc::clone(&self.workspace_trust),
-                    std::sync::Arc::clone(&self.env_provider),
-                ),
+                std::sync::Arc::new(crate::services::authority::Connection::plain(
+                    crate::services::authority::Authority::local(
+                        std::sync::Arc::clone(&self.workspace_trust),
+                        std::sync::Arc::clone(&self.env_provider),
+                    ),
+                )),
             ),
             false,
+            self.config.orchestrator_mode,
         )
         .map_err(|e| io::Error::other(format!("Failed to create editor: {}", e)))?;
 
@@ -878,8 +881,7 @@ impl EditorServer {
     ///
     /// Performs the full first-boot sequence: build editor, restore
     /// workspace, recover buffers from hot exit, start recovery
-    /// session.  Subsequent rebuilds (on authority/working-dir change)
-    /// go through [`rebuild_editor`].
+    /// session.
     pub fn initialize_editor(&mut self) -> io::Result<()> {
         let (mut editor, terminal) = self.build_editor_instance()?;
 
@@ -934,6 +936,26 @@ impl EditorServer {
             );
         }
 
+        // The two startup lifecycle hooks, in the order the in-process path
+        // fires them (main.rs): `plugins_loaded` once the registry and
+        // init.ts are in, then `ready` once the workspace is restored and
+        // the startup files are open.
+        //
+        // The daemon used to fire neither, which is not a small difference:
+        // `ready` is where the Orchestrator opens its dock and the welcome
+        // screen opens itself, so both were simply absent from every
+        // `fresh -a` session while working in a directly-launched one. The
+        // plugins were loaded and their commands worked — only the "we have
+        // finished starting up" signal never came. Orchestrator mode is
+        // daemon-only, so it would have inherited exactly that.
+        //
+        // `queue_file_open` above only queues; draining it here keeps the
+        // in-process path's guarantee that a plugin branching on "is a real
+        // file open?" sees the startup files rather than racing them.
+        editor.fire_plugins_loaded_hook();
+        editor.process_pending_file_opens();
+        editor.fire_ready_hook();
+
         self.terminal = Some(terminal);
         self.editor = Some(editor);
 
@@ -959,131 +981,6 @@ impl EditorServer {
         if let Some(editor) = self.editor.as_mut() {
             editor.maybe_prompt_workspace_trust(cancellable);
         }
-    }
-
-    /// Rebuild the editor in place after an authority transition or a
-    /// working-directory change.
-    ///
-    /// Mirrors the restart loop in `main.rs`: save the workspace so
-    /// open buffers come back, drop the old editor (which cascades
-    /// into shutting down terminals, LSP servers, and plugin state),
-    /// swap in any new authority / working-dir, build a fresh editor,
-    /// and restore the workspace under the new backend.  The TCP
-    /// clients stay connected throughout; each is flagged for a full
-    /// redraw on the next frame so they see the new editor from a
-    /// clean state rather than a mid-transition frame.
-    pub(crate) fn rebuild_editor(
-        &mut self,
-        new_working_dir: Option<PathBuf>,
-        new_authority: Option<crate::services::authority::Authority>,
-        new_keepalive: Option<Box<dyn std::any::Any + Send>>,
-    ) -> io::Result<()> {
-        // Flush buffer saves + workspace before dropping the old editor,
-        // mirroring the standalone exit path.  On failure we log and
-        // continue — rebuild should still succeed.
-        if let Some(ref mut editor) = self.editor {
-            if editor.config().editor.auto_save_enabled {
-                if let Err(e) = editor.save_all_on_exit() {
-                    tracing::warn!("Rebuild: failed to auto-save on exit: {}", e);
-                }
-            }
-            if let Err(e) = editor.end_recovery_session() {
-                tracing::warn!("Rebuild: failed to end recovery session: {}", e);
-            }
-            if let Err(e) = editor.save_all_windows_workspaces() {
-                tracing::warn!("Rebuild: failed to save workspaces: {}", e);
-            }
-        }
-
-        // Non-transition rebuild (working-dir change, config reload): carry the
-        // active workspace's own backend forward by moving it out of the old
-        // editor, so a remote workspace isn't dropped to the local placeholder
-        // `build_editor_instance` leaves behind. A real authority transition
-        // (`new_authority`) overwrites `current_authority` just below.
-        if new_authority.is_none() {
-            if let Some(ref mut editor) = self.editor {
-                self.current_authority = editor.take_active_authority();
-            }
-        }
-
-        // Drop old editor + terminal.  Drop impls shut down PTYs, LSP
-        // servers, and plugin threads.
-        self.editor = None;
-        self.terminal = None;
-
-        // Apply the pending changes before building the next editor.
-        if let Some(dir) = new_working_dir {
-            tracing::info!("Rebuild: switching working dir to {}", dir.display());
-            self.config.working_dir = dir;
-            // Re-anchor trust to the new workspace: move the containment
-            // root and repoint persistence at the new project's trust file,
-            // adopting that project's stored decision.
-            self.workspace_trust
-                .set_root(Some(self.config.working_dir.clone()));
-            self.workspace_trust.set_store(Some(
-                crate::services::workspace_trust::store_for_workspace(
-                    &self.config.dir_context,
-                    self.current_authority.filesystem.as_ref(),
-                    &self.config.working_dir,
-                ),
-            ));
-            // New project ⇒ the old env recipe no longer applies; deactivate
-            // and let the env-manager plugin re-detect for the new workspace.
-            self.env_provider.clear();
-        }
-        if let Some(auth) = new_authority {
-            tracing::info!(
-                "Rebuild: installing authority with label {:?}",
-                auth.display_label
-            );
-            self.current_authority = auth;
-        }
-        // Adopt the keepalive that rode with a connection-backed authority
-        // (remote agent / K8s) so its carrier + reconnect/heartbeat tasks
-        // survive the rebuild; the previous keepalive drops, tearing down
-        // any prior remote backend. A local/docker transition carries
-        // none, leaving the current workspace untouched.
-        if let Some(keepalive) = new_keepalive {
-            self.session_keepalive = Some(keepalive);
-        }
-
-        let (mut editor, terminal) = self.build_editor_instance()?;
-
-        // Bring buffers back under the new backend.  `try_restore_workspace`
-        // reads the workspace file we wrote above and re-opens the
-        // same splits/buffers.
-        match editor.try_restore_workspace() {
-            Ok(true) => tracing::info!("Rebuild: workspace restored"),
-            Ok(false) => tracing::debug!("Rebuild: no workspace to restore"),
-            Err(e) => tracing::warn!("Rebuild: failed to restore workspace: {}", e),
-        }
-
-        if let Err(e) = editor.start_recovery_session() {
-            tracing::warn!("Rebuild: failed to start recovery session: {}", e);
-        }
-
-        self.terminal = Some(terminal);
-        self.editor = Some(editor);
-
-        // A working-dir change lands us in a possibly-undecided project;
-        // re-evaluate the trust prompt. (A rebuild triggered by a trust
-        // decision just recorded one, so this is a no-op there.) This is an
-        // activation on an already-running editor, so the secondary is Cancel
-        // (`cancellable = true`) — dismissing must not quit the server.
-        self.maybe_prompt_workspace_trust(true);
-
-        // Force every attached client to repaint from scratch — the
-        // previous frame described the old editor's screen.
-        for client in &mut self.clients {
-            client.needs_full_render = true;
-        }
-
-        tracing::info!(
-            "Rebuild: complete, {} clients kept attached",
-            self.clients.len()
-        );
-
-        Ok(())
     }
 
     /// Handle a new client connection
@@ -1535,10 +1432,10 @@ impl EditorServer {
         }
 
         match event {
-            Event::Key(key_event) => {
-                if crate::input::is_keystroke(key_event.kind) {
+            Event::Key(press) => {
+                if crate::input::is_keystroke(press.kind) {
                     editor
-                        .handle_key(key_event.code, key_event.modifiers)
+                        .handle_key_press(press)
                         .map_err(|e| io::Error::other(e.to_string()))?;
                     Ok(true)
                 } else {
@@ -1553,7 +1450,15 @@ impl EditorServer {
                 Ok(true)
             }
             Event::Paste(text) => {
-                editor.paste_text(text);
+                // Mirror the local terminal loop (`Ev::Paste` in
+                // app/lifecycle.rs): when a floating modal / dock owns the
+                // keyboard, a client's bracketed paste belongs to its focused
+                // text field, not the buffer underneath. Without this, pasting
+                // into the New-Session dialog in daemon mode dumped the text
+                // into the obscured buffer.
+                if !editor.paste_bracketed_into_focused_panel(&text) {
+                    editor.paste_text(text);
+                }
                 Ok(true)
             }
             _ => Ok(false),
@@ -1692,8 +1597,9 @@ mod wave_dismiss_tests {
     use crate::config::Config;
     use crate::config_io::DirectoryContext;
     use crossterm::event::{
-        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
+    use fresh_input_parser::Event;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1721,6 +1627,7 @@ mod wave_dismiss_tests {
             dir_context: DirectoryContext::for_testing(&temp_dir),
             plugins_enabled: false,
             init_enabled: false,
+            orchestrator_mode: false,
             startup_authority: None,
             workspace_trust: Arc::new(
                 crate::services::workspace_trust::WorkspaceTrust::permissive(),
@@ -1734,6 +1641,107 @@ mod wave_dismiss_tests {
         let mut server = EditorServer::new(config).expect("EditorServer::new");
         server.initialize_editor().expect("initialize_editor");
         server
+    }
+
+    /// A bracketed paste from a client must land in the focused floating-panel
+    /// text field, not in the buffer obscured behind the modal — the same
+    /// routing the local terminal loop applies (`Ev::Paste` in
+    /// app/lifecycle.rs). Regression: the daemon's `handle_event` called
+    /// `paste_text` directly, so pasting into the New-Session dialog in an
+    /// attached client dumped the text into the underlying buffer.
+    #[test]
+    fn bracketed_paste_routes_to_focused_panel_in_daemon_mode() {
+        use std::collections::HashMap;
+
+        let mut server = server_with_editor("paste-panel");
+        let editor = server.editor_mut().expect("editor present");
+
+        // Mount a centered floating panel whose focused widget is a Text
+        // field — the minimal stand-in for the New-Workspace dialog. The
+        // panel renders into its own (here: nonexistent) buffer, NOT the
+        // active one, mirroring production; rendering into the active
+        // buffer would make the leak assertion below see the panel's own
+        // re-render of the pasted value.
+        let panel_key = crate::widgets::PanelKey::new("test-plugin", 1);
+        let buffer_id = crate::model::event::BufferId(9999);
+        let spec = fresh_core::api::WidgetSpec::Text {
+            value: String::new(),
+            cursor_byte: 0,
+            focused: true,
+            label: String::new(),
+            placeholder: None,
+            rows: 1,
+            field_width: 0,
+            max_visible_chars: 0,
+            full_width: true,
+            completions: Vec::new(),
+            completions_visible_rows: 0,
+            block_caret: false,
+            sel_start: -1,
+            sel_end: -1,
+            label_width: 0,
+            read_only: false,
+            markdown: false,
+            key: Some("field".to_string()),
+        };
+        editor.widget_registry.mount(
+            panel_key.clone(),
+            buffer_id,
+            spec,
+            HashMap::new(),
+            "field".to_string(),
+            true,
+            false,
+            false,
+        );
+        editor.floating_widget_panel = Some(crate::app::FloatingWidgetState {
+            panel_key: panel_key.clone(),
+            width_pct: 50,
+            height_pct: 50,
+            placement: crate::app::PanelPlacement::Centered,
+            focused: true,
+            mode: None,
+            scrollbar_zone_hovered: false,
+            scrollbar_flash_until: None,
+            fullscreen: false,
+            focus_marker: false,
+            label_align: Default::default(),
+            title: None,
+            closable: false,
+            hovered_widget_key: String::new(),
+            hovered_item_key: String::new(),
+            hovered_popup_row: String::new(),
+        });
+
+        let consumed = server
+            .handle_event(Event::Paste("SERVER_PASTE".to_string()))
+            .expect("handle_event");
+        assert!(consumed, "a paste should request a re-render");
+
+        let editor = server.editor().expect("editor present");
+        let panel = editor
+            .widget_registry
+            .get(&panel_key)
+            .expect("panel still mounted");
+        match panel.instance_states.get("field") {
+            Some(crate::widgets::WidgetInstanceState::Text { editor: text, .. }) => {
+                assert_eq!(
+                    text.value(),
+                    "SERVER_PASTE",
+                    "the paste must land in the focused Text widget"
+                );
+            }
+            other => panic!(
+                "focused field has no Text instance state: {:?}",
+                other.is_some()
+            ),
+        }
+        let buffer = editor.active_state().buffer.to_string().unwrap_or_default();
+        assert!(
+            !buffer.contains("SERVER_PASTE"),
+            "the paste must not leak into the buffer behind the modal, got: {:?}",
+            buffer
+        );
     }
 
     /// A key press while the wave is running stops it and is consumed — it does
@@ -1750,7 +1758,7 @@ mod wave_dismiss_tests {
         );
 
         let consumed = server
-            .handle_event(Event::Key(KeyEvent::new(
+            .handle_event(Event::key(KeyEvent::new(
                 KeyCode::Char('a'),
                 KeyModifiers::empty(),
             )))

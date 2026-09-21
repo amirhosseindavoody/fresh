@@ -8,7 +8,7 @@
 //! and `present_lsp_status_popup` (pin width + show), orchestrated by
 //! `build_and_show_lsp_status_popup`.
 
-use rust_i18n::t;
+use fresh_i18n::t;
 
 use crate::app::warning_domains::WarningDomain;
 
@@ -420,6 +420,7 @@ impl Editor {
             // start attempt would clearly fail.
             let (icon, label) = match status {
                 Some(LspServerStatus::Running) => ("●", "ready"),
+                Some(LspServerStatus::Unresponsive) => ("◍", "not responding"),
                 Some(LspServerStatus::Error) => ("✗", "error"),
                 Some(LspServerStatus::Starting) => ("◌", "starting"),
                 Some(LspServerStatus::Initializing) => ("◌", "initializing"),
@@ -640,9 +641,7 @@ impl Editor {
         // bar, if we know where it was drawn in the last frame. Falls back to
         // the BottomRight anchor when the LSP segment isn't visible.
         let position = self
-            .active_chrome()
-            .status_bar
-            .clickable_area(crate::view::ui::status_bar::StatusBarClickable::Lsp)
+            .status_bar_clickable_area_now(crate::view::ui::status_bar::StatusBarClickable::Lsp)
             .map(
                 |(status_row, col_start, _)| crate::view::popup::PopupPosition::AboveStatusBarAt {
                     x: col_start,
@@ -960,9 +959,9 @@ impl Editor {
         // from the same cached layout so the popup hugs the status bar
         // even in prompt-auto-hide mode.
         let position = self
-            .active_chrome()
-            .status_bar
-            .clickable_area(crate::view::ui::status_bar::StatusBarClickable::RemoteIndicator)
+            .status_bar_clickable_area_now(
+                crate::view::ui::status_bar::StatusBarClickable::RemoteIndicator,
+            )
             .map(
                 |(status_row, col_start, _)| crate::view::popup::PopupPosition::AboveStatusBarAt {
                     x: col_start,
@@ -1047,9 +1046,9 @@ impl Editor {
         ];
 
         let position = self
-            .active_chrome()
-            .status_bar
-            .clickable_area(crate::view::ui::status_bar::StatusBarClickable::ReadOnly)
+            .status_bar_clickable_area_now(
+                crate::view::ui::status_bar::StatusBarClickable::ReadOnly,
+            )
             .map(
                 |(status_row, col_start, _)| PopupPosition::AboveStatusBarAt {
                     x: col_start,
@@ -1122,19 +1121,110 @@ impl Editor {
     }
 
     /// Show the update-available menu, anchored to the status bar's `{update}`
-    /// segment. Offers to run the update — which opens a **local** terminal
-    /// buffer running `fresh --cmd update --yes` (so package-manager / sudo
-    /// prompts work and the binary that gets updated is the one actually
-    /// running) — or to dismiss. Toggles closed on a second click, mirroring the
-    /// LSP / remote / read-only menus.
+    /// segment. Toggles closed on a second click, mirroring the LSP / remote /
+    /// read-only menus.
+    ///
+    /// Both the body text and the offered row come from the resolved
+    /// [`UpdatePlan`], because confirming means something different per channel:
+    /// an in-place swap, a download plus a root command we leave to the user, a
+    /// per-user install we run, a command we only print, or nothing at all. For
+    /// the offers that end with the user still holding a command, the body says
+    /// so before they confirm rather than after.
+    ///
+    /// Taking the offer opens a **local** terminal buffer running
+    /// `fresh --cmd update --yes` (so package-manager prompts work and the
+    /// binary that gets updated is the one actually running).
+    ///
+    /// [`UpdatePlan`]: fresh_update::UpdatePlan
     pub fn show_update_popup(&mut self, version: &str) {
         use crate::view::popup::PopupListItem;
-        let items = vec![PopupListItem::new(format!(
-            "    {}",
-            t!("update.popup_update", version = version)
-        ))
-        .with_data("update".to_string())];
-        self.push_update_menu(t!("update.available_title").to_string(), items);
+        use fresh_update::{offer_for, UpdateChoice, UpdateOffer};
+
+        let prov = self
+            .get_update_result()
+            .map(|r| r.provenance.clone())
+            .unwrap_or_else(crate::services::release_checker::detect_provenance);
+        let plan = crate::services::release_checker::plan_for(&prov);
+        let channel = prov.channel.label();
+        let offer = offer_for(&plan);
+
+        // The body says exactly how far Fresh will go. Only a self-contained
+        // install ends with the update applied; everywhere else Fresh stops at
+        // the command, because it does not run other package managers.
+        //
+        // `needs_privilege` no longer splits these messages. It used to decide
+        // whether to warn about a password prompt, and there is no prompt now —
+        // where root is needed it simply appears as the `sudo` in the command
+        // we print.
+        let body = match offer {
+            UpdateOffer::SelfContained => t!(
+                "update.body_self_contained",
+                channel = channel,
+                version = version
+            )
+            .to_string(),
+            UpdateOffer::DownloadPackage => t!(
+                "update.body_download_package_verified",
+                channel = channel,
+                version = version
+            )
+            .to_string(),
+            UpdateOffer::RunCommand => t!(
+                "update.body_delegated_command",
+                channel = channel,
+                command = plan.human
+            )
+            .to_string(),
+            UpdateOffer::Manual => t!("update.body_manual", version = version).to_string(),
+        };
+
+        let items = offer
+            .choices()
+            .iter()
+            .map(|choice| {
+                let label = match choice {
+                    UpdateChoice::UpdateNow => {
+                        t!("update.choice_update_now", version = version).to_string()
+                    }
+                    UpdateChoice::DownloadOnly => t!("update.choice_download_only").to_string(),
+                    UpdateChoice::ShowCommand => t!("update.choice_show_command").to_string(),
+                };
+                PopupListItem::new(format!("    {label}"))
+                    .with_data(choice.action_key().to_string())
+            })
+            .collect();
+
+        self.push_update_menu(t!("update.available_title").to_string(), Some(body), items);
+    }
+
+    /// Show the menu for the third terminal state: the update ran cleanly but
+    /// installed nothing, because finishing it needs a command the user runs
+    /// themselves. Offers to jump to the update output where that exact command
+    /// — including the path of the package we already downloaded and verified —
+    /// is printed. Deliberately does not re-offer the update: it has already
+    /// been fetched, and re-running it would just download the same bytes again.
+    pub fn show_update_action_required_popup(&mut self) {
+        use crate::view::popup::PopupListItem;
+        let version = self.latest_version().unwrap_or("").to_string();
+        // "Run it for me after all" has to be offered here. Nothing resets the
+        // phase back to `Idle`, so without this row a user who picked "Show the
+        // command" and then changed their mind had no way back to an update
+        // short of restarting the editor — a dead end reachable in one click
+        // from a choice the popup itself offers.
+        let items = vec![
+            PopupListItem::new(format!("    {}", t!("update.choice_show_pending_command")))
+                .with_data("show_log".to_string()),
+            PopupListItem::new(format!(
+                "    {}",
+                t!("update.choice_update_now", version = version)
+            ))
+            .with_data("update".to_string()),
+        ];
+        self.push_update_menu(
+            t!("update.action_required_title").to_string(),
+            Some(t!("update.body_action_required").to_string()),
+            items,
+        );
     }
 
     /// Show the update-*failed* menu, offered when the indicator is clicked
@@ -1148,17 +1238,19 @@ impl Editor {
             PopupListItem::new(format!("    {}", t!("update.show_log")))
                 .with_data("show_log".to_string()),
         ];
-        self.push_update_menu(t!("update.failed_title").to_string(), items);
+        self.push_update_menu(t!("update.failed_title").to_string(), None, items);
     }
 
-    /// Build + show a status-bar update menu titled `title` with the given
-    /// action rows (a "Dismiss" row is appended automatically). Anchored to the
-    /// `{update}` segment and toggles closed on a repeat click, mirroring the
-    /// LSP / remote / read-only menus. Shared by `show_update_popup` and
-    /// `show_update_failed_popup`.
+    /// Build + show a status-bar update menu titled `title`, with optional body
+    /// text describing what the rows will do, and the given action rows (a
+    /// "Dismiss" row is appended automatically). Anchored to the `{update}`
+    /// segment and toggles closed on a repeat click, mirroring the LSP / remote
+    /// / read-only menus. Shared by the available / action-required / failed
+    /// update menus.
     fn push_update_menu(
         &mut self,
         title: String,
+        body: Option<String>,
         mut items: Vec<crate::view::popup::PopupListItem>,
     ) {
         use crate::view::popup::{
@@ -1197,9 +1289,7 @@ impl Editor {
         );
 
         let position = self
-            .active_chrome()
-            .status_bar
-            .clickable_area(crate::view::ui::status_bar::StatusBarClickable::Update)
+            .status_bar_clickable_area_now(crate::view::ui::status_bar::StatusBarClickable::Update)
             .map(
                 |(status_row, col_start, _)| PopupPosition::AboveStatusBarAt {
                     x: col_start,
@@ -1208,6 +1298,7 @@ impl Editor {
             )
             .unwrap_or(PopupPosition::BottomRight);
 
+        let has_body = body.is_some();
         let popup_width = (items
             .iter()
             .map(|i| unicode_width::UnicodeWidthStr::width(i.text.as_str()))
@@ -1218,12 +1309,19 @@ impl Editor {
         let popup = Popup {
             kind: PopupKind::List,
             title: Some(title),
-            description: None,
+            description: body,
             transient: false,
             content: PopupContent::List { items, selected: 0 },
             position,
-            width: popup_width.clamp(28, 50),
-            max_height: 10,
+            // Body text explains a multi-step outcome, so give it room to wrap
+            // rather than truncating the part that says what the user still has
+            // to do.
+            width: if has_body {
+                popup_width.clamp(46, 64)
+            } else {
+                popup_width.clamp(28, 50)
+            },
+            max_height: if has_body { 16 } else { 10 },
             bordered: true,
             border_style: Style::default().fg(self.theme.read().unwrap().popup_border_fg),
             background_style: Style::default().bg(self.theme.read().unwrap().popup_bg),
@@ -1253,6 +1351,8 @@ impl Editor {
     pub fn handle_update_menu_action(&mut self, action_key: &str) {
         match action_key {
             "update" => self.start_self_update(),
+            "download_only" => self.start_self_update_download_only(),
+            "show_command" => self.start_self_update_print_command(),
             "show_log" => self.show_self_update_output(),
             _ => {}
         }
@@ -1430,7 +1530,6 @@ impl Editor {
         use ratatui::style::Style;
 
         self.workspace_trust_prompt_cancellable = cancellable;
-        self.workspace_trust_scroll = 0;
         self.workspace_trust_markers =
             crate::services::workspace_trust::executable_content_markers(self.working_dir());
 

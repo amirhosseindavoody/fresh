@@ -114,8 +114,11 @@ fn born_attached_session_does_not_wedge_source_window_typing() {
             height_pct: 90,
             as_dock: false,
             focus_marker: false,
+            label_align: Default::default(),
             title: None,
             closable: false,
+            start_blurred: false,
+            mode: None,
         })
         .unwrap();
     harness
@@ -139,10 +142,13 @@ fn born_attached_session_does_not_wedge_source_window_typing() {
             Some(project_root.clone()),
             Some(vec!["sh".into(), "-c".into(), "sleep 60".into()]),
             Some("agent".into()),
-            born_authority,
+            std::sync::Arc::new(fresh::services::authority::Connection::plain(
+                born_authority,
+            )),
             None,
             None,
             false,
+            None,
         )
         .expect("create_window_with_terminal should succeed");
     harness.tick_and_render().unwrap();

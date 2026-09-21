@@ -7,9 +7,9 @@
 //! - Managing per-split view states (cursors, viewport)
 //! - Split size adjustment and maximize
 
-use rust_i18n::t;
+use fresh_i18n::t;
 
-use crate::model::event::{BufferId, ContainerId, LeafId, SplitDirection, SplitId};
+use crate::model::event::{BufferId, LeafId, SplitId};
 use crate::view::folding::CollapsedFoldLineRange;
 use crate::view::split::{SplitViewState, TabTarget};
 
@@ -154,6 +154,7 @@ impl Editor {
                                     .line_start_offset(end_line.saturating_add(1))
                                     .unwrap_or_else(|| state.buffer.len());
                                 buf_state.folds.add(
+                                    &state.buffer,
                                     &mut state.marker_list,
                                     start_byte,
                                     end_byte,
@@ -343,18 +344,23 @@ impl Editor {
         self.active_window_mut()
             .ensure_active_tab_visible(split_id, buffer, tabs_width);
 
-        let buffer_id = self.active_buffer();
-
         // Bring terminal mode in line with the newly focused split: a
         // terminal resumes the live/scrollback mode it remembers, a
         // non-terminal clears terminal mode. Single restore authority.
         self.sync_terminal_mode_to_active_buffer();
 
-        // Emit buffer_activated hook for plugins
-        self.plugin_manager.read().unwrap().run_hook(
-            "buffer_activated",
-            crate::services::plugins::hooks::HookArgs::BufferActivated { buffer_id },
-        );
+        // Refresh the snapshot BEFORE the hook, for the reason
+        // `set_active_buffer` gives: the handler has to see the split that is
+        // active *now*. Focus moving between two splits on the SAME buffer
+        // never reaches `set_active_buffer` (it early-returns when the buffer
+        // does not change), so without this the plugin mirror still answers
+        // with the split focus just left. `markdown_compose` reads
+        // `getBufferInfo().view_mode` here to decide whether to restore
+        // compose, and a mirror one split behind told it "compose" as focus
+        // landed on a *source* pane — which it then composed: gutter hidden,
+        // wrap forced on, view mode flipped. Whether that happened at all came
+        // down to which thread won the race.
+        self.announce_focus();
     }
 
     /// Adjust the size of the active split
@@ -409,32 +415,30 @@ impl Editor {
         }
     }
 
-    /// Get cached separator areas for testing
-    /// Returns (split_id, direction, x, y, length) tuples
-    pub fn get_separator_areas(&self) -> &[(ContainerId, SplitDirection, u16, u16, u16)] {
-        &self.active_layout().separator_areas
+    /// Where the dividers are, read off the tree that placed them: the
+    /// divider nodes' own rectangles (`view::shell::splits::separator_rects`),
+    /// as `(container, direction, x, y, length)`. The e2e drag tests assert
+    /// against this, so they are asserting against the tree.
+    pub fn get_separator_areas(
+        &self,
+    ) -> Vec<(
+        crate::model::event::ContainerId,
+        crate::model::event::SplitDirection,
+        u16,
+        u16,
+        u16,
+    )> {
+        self.separator_rects()
     }
 
-    /// Get cached tab layouts for testing
-    pub fn get_tab_layouts(
-        &self,
-    ) -> &std::collections::HashMap<LeafId, crate::view::ui::tabs::TabLayout> {
-        &self.active_layout().tab_layouts
-    }
-
-    /// Get cached split content areas for testing
-    /// Returns (split_id, buffer_id, content_rect, scrollbar_rect, thumb_start, thumb_end) tuples
-    pub fn get_split_areas(
-        &self,
-    ) -> &[(
-        LeafId,
-        BufferId,
-        ratatui::layout::Rect,
-        ratatui::layout::Rect,
-        usize,
-        usize,
-    )] {
-        &self.active_layout().split_areas
+    /// The panes the frame places, with the buffer each shows, in paint
+    /// order — for tests that address a pane.
+    ///
+    /// The rectangles this used to carry are the tree's
+    /// (`pane_content_rect`, `pane_vscroll_rect`), and so is the thumb now
+    /// (`bar_thumb`); what is left is which panes there are.
+    pub fn get_split_areas(&self) -> Vec<(LeafId, BufferId)> {
+        self.window_panes()
     }
 
     /// Get the ratio of a specific split (for testing).
@@ -638,7 +642,7 @@ impl Editor {
         // in its split (so a window resize never reached it). Refresh visible
         // terminal sizes so its PTY child sees the pane it now occupies —
         // mirrors `set_active_buffer` (issue #1795).
-        self.active_window_mut().resize_visible_terminals();
+        self.resize_visible_terminals();
 
         // Keep the newly active tab scrolled into view within its split,
         // matching `switch_split` and `set_active_buffer`.
@@ -646,14 +650,9 @@ impl Editor {
         self.active_window_mut()
             .ensure_active_tab_visible(next_split, next_buf, tabs_width);
 
-        // Emit the buffer_activated hook for plugins, matching every other
-        // focus-changing command.
-        self.plugin_manager.read().unwrap().run_hook(
-            "buffer_activated",
-            crate::services::plugins::hooks::HookArgs::BufferActivated {
-                buffer_id: next_buf,
-            },
-        );
+        // Snapshot first, then the hook — see the note at the other
+        // split-focus site above.
+        self.announce_focus();
     }
 }
 
@@ -749,25 +748,23 @@ impl Editor {
             .expect("active window must have a populated split layout")
     }
 
-    /// Where a pane currently sits on screen, in editor-area cells.
-    /// `None` once the leaf is gone (closed, or collapsed by its last tab).
+    /// Where a pane currently sits on screen, as the last layout placed it.
+    /// `None` once the leaf is gone (closed, or collapsed by its last tab) or
+    /// hidden behind a maximized sibling.
+    ///
+    /// Read off the window's retained pane rects, which the layout funnel
+    /// refreshes before any caller of this runs (`split_pane_impl` ends in
+    /// `relayout`).
     pub(crate) fn split_rect(
         &self,
         leaf: crate::model::event::LeafId,
     ) -> Option<ratatui::layout::Rect> {
-        let area = self
-            .windows
-            .get(&self.active_window)
-            .map(|w| w.editor_content_area())?;
         self.windows
-            .get(&self.active_window)
-            .and_then(|w| w.buffers.splits())
-            .and_then(|(mgr, _)| {
-                mgr.get_visible_buffers(area)
-                    .into_iter()
-                    .find(|(id, _, _)| *id == leaf)
-                    .map(|(_, _, rect)| rect)
-            })
+            .get(&self.active_window)?
+            .visible_panes()
+            .into_iter()
+            .find(|(id, _, _)| *id == leaf)
+            .map(|(_, _, rect)| rect)
     }
 
     /// Resolve a caller-supplied path against the window's root, so a script
@@ -1060,11 +1057,14 @@ impl Editor {
             .windows
             .get(&self.active_window)
             .and_then(|w| w.buffers.splits())?;
+        // Which leaves show, not where: a labeled leaf hidden behind a
+        // maximized sibling is not a destination.
+        let visible = mgr.visible_leaves();
         mgr.labels()
             .iter()
             .find(|(_, l)| l.as_str() == label)
             .map(|(id, _)| crate::model::event::LeafId(*id))
-            .filter(|leaf| self.split_rect(*leaf).is_some())
+            .filter(|leaf| visible.iter().any(|(id, _)| id == leaf))
     }
 
     /// The pane to open a target in when no label named one: the nearest
@@ -1077,14 +1077,13 @@ impl Editor {
     /// the destination is where a reader would look for it and does not depend
     /// on where focus happened to be.
     #[cfg(feature = "plugins")]
-    fn pane_beside(
+    pub(super) fn pane_beside(
         &self,
         this_one: crate::model::event::LeafId,
     ) -> Option<crate::model::event::LeafId> {
         let window = self.windows.get(&self.active_window)?;
-        let area = window.editor_content_area();
-        let (mgr, _) = window.buffers.splits()?;
-        let panes = mgr.get_visible_buffers(area);
+        // The panes as the last layout placed them, in the tree's order.
+        let panes = window.visible_panes();
         let here = panes.iter().find(|(id, _, _)| *id == this_one)?.2;
 
         let usable: Vec<_> = panes

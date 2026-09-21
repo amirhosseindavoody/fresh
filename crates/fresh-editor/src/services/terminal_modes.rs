@@ -283,11 +283,10 @@ impl TerminalModes {
             tracing::debug!("Disabled focus change events");
         }
 
-        // Reset cursor style to default
+        // Reset cursor style to default. Not the cursor *colour*: the editor
+        // never sets one, so there is nothing of ours to put back and a colour
+        // the user's shell set is theirs to keep.
         let _ = stdout().execute(SetCursorStyle::DefaultUserShape);
-
-        // Reset terminal cursor color
-        crate::view::theme::Theme::reset_terminal_cursor_color();
 
         // Pop keyboard enhancement flags
         if self.keyboard_enhancement {
@@ -388,11 +387,8 @@ pub fn emergency_cleanup() {
     // Disable bracketed paste
     let _ = stdout().execute(DisableBracketedPaste);
 
-    // Reset cursor style to default
+    // Reset cursor style to default (never the colour — see `restore`).
     let _ = stdout().execute(SetCursorStyle::DefaultUserShape);
-
-    // Reset terminal cursor color
-    crate::view::theme::Theme::reset_terminal_cursor_color();
 
     // Pop keyboard enhancement flags
     let _ = stdout().execute(PopKeyboardEnhancementFlags);

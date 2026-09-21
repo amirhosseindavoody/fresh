@@ -17,6 +17,17 @@ fn keys(events: &[Event]) -> Vec<(KeyCode, KeyModifiers)> {
         .collect()
 }
 
+/// Collect the `Key` events of a parse together with their layout characters.
+fn keys_with_layout(events: &[Event]) -> Vec<(KeyCode, KeyModifiers, Option<char>)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Key(press) => Some((press.code, press.modifiers, press.layout_char)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// True if any event is a `Key(Char(_))` — used to prove mouse bytes never
 /// leak into the child as literal characters.
 fn has_char_key(events: &[Event]) -> bool {
@@ -46,6 +57,118 @@ fn control_characters_have_ctrl_modifier() {
     let mut p = InputParser::new();
     let ev = p.parse(&[0x03]); // Ctrl+C
     assert_eq!(keys(&ev), vec![(KeyCode::Char('c'), KeyModifiers::CONTROL)]);
+}
+
+/// 0x1F is the byte a legacy terminal sends for Ctrl+/ — the chord users
+/// actually press — and it must report as Ctrl+/ so a `ctrl+/` binding fires on
+/// xterm/iTerm and not only under the kitty protocol. Reporting it as Ctrl+_
+/// left `ctrl+/` dead on every terminal without CSI-u.
+#[test]
+fn us_byte_is_ctrl_slash() {
+    let mut p = InputParser::new();
+    assert_eq!(
+        keys(&p.parse(&[0x1f])),
+        vec![(KeyCode::Char('/'), KeyModifiers::CONTROL)]
+    );
+}
+
+/// The kitty encoding of the same chord agrees with the legacy byte, so a
+/// binding resolves identically on both kinds of terminal.
+#[test]
+fn ctrl_slash_agrees_across_protocols() {
+    let mut p = InputParser::new();
+    assert_eq!(keys(&p.parse(&[0x1f])), keys(&p.parse(b"\x1b[47;5u")));
+}
+
+/// Characterization test (passes before and after the Ctrl+/ fix): pins the
+/// neighbouring separators so re-canonicalising 0x1F does not drag them along.
+/// Ctrl+\ (0x1C, SIGQUIT), Ctrl+] (0x1D, the telnet/readline escape) and
+/// Ctrl+^ (0x1E) are the keys people press for those bytes, and `ctrl+]` /
+/// `ctrl+\` are live bindings in the default and macOS keymaps.
+#[test]
+fn other_separator_bytes_keep_their_keys() {
+    let mut p = InputParser::new();
+    assert_eq!(
+        keys(&p.parse(&[0x1c, 0x1d, 0x1e])),
+        vec![
+            (KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            (KeyCode::Char(']'), KeyModifiers::CONTROL),
+            (KeyCode::Char('^'), KeyModifiers::CONTROL),
+        ]
+    );
+}
+
+// ---- Keyboard layout (`KeyPress::layout_char`) ----
+
+/// The non-US half of sinelaw/fresh#2933. On a German layout `/` is Shift+7, so
+/// pressing Ctrl+/ reports base 55 (`7`), shifted 47 (`/`), Ctrl+Shift. The
+/// chord keeps its physical spelling — folding the `/` in would collapse
+/// `Ctrl+Shift+A` onto `Ctrl+A` for letters — but the `/` the user meant has to
+/// survive for the keymap to find `ctrl+/`.
+#[test]
+fn a_control_chord_carries_the_character_the_layout_types() {
+    let mut p = InputParser::new();
+    assert_eq!(
+        keys_with_layout(&p.parse(b"\x1b[55:47;6u")),
+        vec![(
+            KeyCode::Char('7'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            Some('/')
+        )]
+    );
+}
+
+/// The same chord on a US layout, where Shift+7 types `&`. The layout character
+/// is still reported — the parser does not know or care which layout is in use
+/// — and it is the keymap that declines to use it, since nothing binds
+/// `ctrl+&`. This is what keeps US `ctrl+shift+7` bindings intact.
+#[test]
+fn the_us_reading_of_that_chord_is_unchanged() {
+    let mut p = InputParser::new();
+    assert_eq!(
+        keys_with_layout(&p.parse(b"\x1b[55:38;6u")),
+        vec![(
+            KeyCode::Char('7'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            Some('&')
+        )]
+    );
+}
+
+/// No layout character when the two readings agree: a plain letter's shifted
+/// codepoint is just its uppercase, which the chord's SHIFT bit already says.
+/// Keeping this `None` is what stops every shifted keystroke from taking the
+/// keymap's second lookup.
+#[test]
+fn agreeing_readings_report_no_layout_char() {
+    let mut p = InputParser::new();
+    // Ctrl+Shift+A: base 97 (`a`), shifted 65 (`A`) — same key, and the chord
+    // is spelled `ctrl+shift+a`, so there is nothing extra to say.
+    assert_eq!(
+        keys_with_layout(&p.parse(b"\x1b[97:65;6u")),
+        vec![(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            None
+        )]
+    );
+    // And a chord with no shifted codepoint reported at all.
+    assert_eq!(
+        keys_with_layout(&p.parse(b"\x1b[47;5u")),
+        vec![(KeyCode::Char('/'), KeyModifiers::CONTROL, None)]
+    );
+}
+
+/// Shift alone still resolves to the character it types, as before — the
+/// shifted reading *is* the chord there, so it is folded in rather than carried
+/// alongside. Guards against the new path stealing plain shifted typing.
+#[test]
+fn shift_without_control_still_folds_the_character_in() {
+    let mut p = InputParser::new();
+    assert_eq!(
+        keys_with_layout(&p.parse(b"\x1b[55:47;2u")),
+        vec![(KeyCode::Char('/'), KeyModifiers::empty(), None)]
+    );
 }
 
 #[test]
@@ -286,12 +409,130 @@ fn csi_u_alternate_keys_subparameters() {
     // Shift+'a' reported as base 97, shifted 65: CSI 97:65 ; 2 u
     assert_eq!(
         keys(&p.parse(b"\x1b[97:65;2u")),
-        vec![(KeyCode::Char('a'), KeyModifiers::SHIFT)]
+        vec![(KeyCode::Char('A'), KeyModifiers::empty())]
     );
     // A modifier field may carry an event-type sub-param: CSI 13 ; 5:1 u
     assert_eq!(
         keys(&p.parse(b"\x1b[13;5:1u")),
         vec![(KeyCode::Enter, KeyModifiers::CONTROL)]
+    );
+    // A base-layout code with no shifted code (`97::29`) is not a shifted key.
+    assert_eq!(
+        keys(&p.parse(b"\x1b[97::29u")),
+        vec![(KeyCode::Char('a'), KeyModifiers::empty())]
+    );
+}
+
+/// With `REPORT_ALL_KEYS_AS_ESCAPE_CODES` every printable key arrives in the
+/// CSI-u form, where the key field is the *base* key and the shift lives in the
+/// modifier field. Reporting the base made every shifted key type its unshifted
+/// character, which read as the shift key being dead (sinelaw/fresh#2880).
+#[test]
+fn csi_u_shifted_keys_report_the_character_they_type() {
+    let mut p = InputParser::new();
+    for (bytes, expected) in [
+        (&b"\x1b[97:65;2u"[..], 'A'),   // Shift+a
+        (&b"\x1b[50:64;2u"[..], '@'),   // Shift+2 on a US layout
+        (&b"\x1b[47:63;2u"[..], '?'),   // Shift+/
+        (&b"\x1b[232:200;2u"[..], 'È'), // Shift+è, non-ASCII
+    ] {
+        assert_eq!(
+            keys(&p.parse(bytes)),
+            vec![(KeyCode::Char(expected), KeyModifiers::empty())],
+            "{:?} should type {expected}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+}
+
+/// Without `REPORT_ALTERNATE_KEYS` the terminal sends no shifted codepoint.
+/// Shift+letter is the letter's uppercase on every Latin layout, so it is
+/// resolved anyway; anything else would be a guess at the layout and keeps its
+/// base key plus the SHIFT modifier.
+#[test]
+fn csi_u_shifted_keys_without_alternate_key_reporting() {
+    let mut p = InputParser::new();
+    assert_eq!(
+        keys(&p.parse(b"\x1b[99;2u")),
+        vec![(KeyCode::Char('C'), KeyModifiers::empty())]
+    );
+    assert_eq!(
+        keys(&p.parse(b"\x1b[50;2u")),
+        vec![(KeyCode::Char('2'), KeyModifiers::SHIFT)]
+    );
+}
+
+/// The shifted character replaces the base key for the modifier combinations
+/// that type text, but never for Ctrl: `Ctrl+Shift+A` has to stay distinct from
+/// `Ctrl+A`, which is what `Char('A')` with the SHIFT bit dropped would
+/// normalize to.
+#[test]
+fn csi_u_shifted_keys_alongside_other_modifiers() {
+    let mut p = InputParser::new();
+    // Alt+Shift+f
+    assert_eq!(
+        keys(&p.parse(b"\x1b[102:70;4u")),
+        vec![(KeyCode::Char('F'), KeyModifiers::ALT)]
+    );
+    // Ctrl+Shift+a
+    assert_eq!(
+        keys(&p.parse(b"\x1b[97:65;6u")),
+        vec![(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )]
+    );
+    // Ctrl+Shift+a with alternate keys off
+    assert_eq!(
+        keys(&p.parse(b"\x1b[97;6u")),
+        vec![(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )]
+    );
+}
+
+/// A shifted key still carries its event type: substituting the character must
+/// not turn a release into a press.
+#[test]
+fn csi_u_shifted_key_keeps_its_event_type() {
+    let mut p = InputParser::new();
+    match &p.parse(b"\x1b[97:65;2:3u")[0] {
+        Event::Key(ke) => {
+            assert_eq!(ke.code, KeyCode::Char('A'));
+            assert_eq!(ke.modifiers, KeyModifiers::empty());
+            assert_eq!(ke.kind, KeyEventKind::Release);
+        }
+        other => panic!("expected key, got {:?}", other),
+    }
+}
+
+/// The full kitty key event is
+/// `CSI unicode-key-code:alternate-key-codes ; modifiers:event-type ; text-as-codepoints u`.
+/// fresh does not request the associated text (that needs `REPORT_ASSOCIATED_TEXT`),
+/// but a terminal that sends the field anyway must not derail the key.
+#[test]
+fn csi_u_ignores_a_trailing_text_parameter() {
+    let mut p = InputParser::new();
+    assert_eq!(
+        keys(&p.parse(b"\x1b[97:65;2;65u")),
+        vec![(KeyCode::Char('A'), KeyModifiers::empty())]
+    );
+}
+
+/// Functional keys have no shifted character. Shift+Tab keeps its own key code
+/// rather than being replaced by whatever the sub-parameter holds.
+#[test]
+fn csi_u_shifted_functional_keys_are_untouched() {
+    let mut p = InputParser::new();
+    assert_eq!(
+        keys(&p.parse(b"\x1b[9;2u")),
+        vec![(KeyCode::Tab, KeyModifiers::SHIFT)]
+    );
+    // Shift+F13, whose PUA codepoint must never become a printable character.
+    assert_eq!(
+        keys(&p.parse(b"\x1b[57376;2u")),
+        vec![(KeyCode::F(13), KeyModifiers::SHIFT)]
     );
 }
 
@@ -383,6 +624,128 @@ fn flush_never_breaks_up_a_partial_sequence() {
         assert!(!p.escape_pending(), "{partial:02x?} is not a lone ESC");
         assert!(p.flush().is_empty(), "flush emitted from {partial:02x?}");
     }
+}
+
+// ---- Lone escape prefixes vs. legacy Alt chords (sinelaw/fresh#2930) ----
+//
+// A terminal without the kitty keyboard protocol transmits Alt+] as `ESC ]`
+// and Alt+[ as `ESC [` — byte-identical to the OSC and CSI introducers. A
+// genuine control sequence always has its payload right behind the introducer
+// (same write burst), while a human Alt chord arrives alone, so a bare
+// introducer with nothing following resolves to the Alt chord on idle flush —
+// exactly the rule that already resolved a bare `ESC` to the Escape key.
+
+#[test]
+fn lone_esc_rbracket_flushes_to_alt_rbracket() {
+    let mut p = InputParser::new();
+    // Legacy Alt+]: `ESC ]` with no continuation.
+    assert!(p.parse(b"\x1b]").is_empty());
+    assert!(p.escape_pending(), "bare OSC introducer must be flushable");
+    assert_eq!(
+        keys(&p.flush()),
+        vec![(KeyCode::Char(']'), KeyModifiers::ALT)]
+    );
+    // Back at ground: flush is spent and typing works normally.
+    assert!(!p.escape_pending());
+    assert!(p.flush().is_empty());
+    assert_eq!(
+        keys(&p.parse(b"a")),
+        vec![(KeyCode::Char('a'), KeyModifiers::empty())]
+    );
+}
+
+#[test]
+fn lone_esc_lbracket_flushes_to_alt_lbracket() {
+    let mut p = InputParser::new();
+    // Legacy Alt+[: `ESC [` with no continuation.
+    assert!(p.parse(b"\x1b[").is_empty());
+    assert!(p.escape_pending(), "bare CSI introducer must be flushable");
+    assert_eq!(
+        keys(&p.flush()),
+        vec![(KeyCode::Char('['), KeyModifiers::ALT)]
+    );
+    // The next typed key stands alone — it must NOT be misread as a CSI
+    // final byte (`A` after a swallowed `ESC [` used to become the Up key).
+    assert!(!p.escape_pending());
+    assert_eq!(
+        keys(&p.parse(b"A")),
+        vec![(KeyCode::Char('A'), KeyModifiers::empty())]
+    );
+}
+
+#[test]
+fn lone_string_introducers_flush_to_alt_chords() {
+    // The other legacy Alt chords that collide with string introducers:
+    // Alt+Shift+P (`ESC P` = DCS), Alt+_ (APC), Alt+^ (PM), Alt+Shift+X (SOS).
+    for (introducer, chr) in [(b'P', 'P'), (b'_', '_'), (b'^', '^'), (b'X', 'X')] {
+        let mut p = InputParser::new();
+        assert!(p.parse(&[0x1b, introducer]).is_empty());
+        assert!(p.escape_pending(), "bare `ESC {chr}` must be flushable");
+        assert_eq!(
+            keys(&p.flush()),
+            vec![(KeyCode::Char(chr), KeyModifiers::ALT)],
+            "flush of `ESC {chr}`"
+        );
+    }
+}
+
+#[test]
+fn osc_with_payload_in_same_burst_is_not_flushable() {
+    // A genuine OSC reply whose terminator hasn't arrived yet: the payload
+    // bytes commit it as a string sequence, so it must keep swallowing —
+    // never resolve to Alt+] plus leaked text.
+    let mut p = InputParser::new();
+    assert!(p.parse(b"\x1b]52;c;SGVs").is_empty());
+    assert!(!p.escape_pending(), "committed OSC must not be flushable");
+    assert!(p.flush().is_empty());
+    // The rest of the reply arrives on a later read and is swallowed whole.
+    assert!(p.parse(b"bG8=\x07").is_empty());
+    assert_eq!(
+        keys(&p.parse(b"a")),
+        vec![(KeyCode::Char('a'), KeyModifiers::empty())]
+    );
+}
+
+#[test]
+fn osc_split_right_after_introducer_still_swallowed_when_payload_follows() {
+    // Read boundary lands exactly after `ESC ]` but the payload follows before
+    // the stream goes idle (so the caller never invokes `flush`): the reply
+    // must still be swallowed whole. This is the split the idle-flush rule
+    // must not break: flushing is the caller's idle-time decision, and mere
+    // parsing of the two prefix bytes must not emit anything by itself.
+    let mut p = InputParser::new();
+    assert!(p.parse(b"\x1b]").is_empty());
+    assert!(p.parse(b"11;rgb:2e2e/3434/3636\x07").is_empty());
+    assert_eq!(
+        keys(&p.parse(b"a")),
+        vec![(KeyCode::Char('a'), KeyModifiers::empty())]
+    );
+}
+
+#[test]
+fn csi_with_params_pending_is_not_flushable() {
+    // `ESC [ 1` could still become F5 (`ESC [ 15 ~`) etc. — a parameter byte
+    // commits the CSI, so flush must stay silent and the sequence completes.
+    let mut p = InputParser::new();
+    assert!(p.parse(b"\x1b[1").is_empty());
+    assert!(!p.escape_pending(), "committed CSI must not be flushable");
+    assert!(p.flush().is_empty());
+    assert_eq!(
+        keys(&p.parse(b"5~")),
+        vec![(KeyCode::F(5), KeyModifiers::empty())]
+    );
+}
+
+#[test]
+fn empty_osc_terminated_in_later_chunk_is_swallowed() {
+    // `ESC ]` then a lone BEL in the next read: a (degenerate but genuine)
+    // empty OSC. As long as no flush happened in between, it is swallowed.
+    let mut p = InputParser::new();
+    assert!(p.parse(b"\x1b]").is_empty());
+    assert!(p.parse(b"\x07").is_empty());
+    // Same for the ST-terminated form.
+    assert!(p.parse(b"\x1b]").is_empty());
+    assert!(p.parse(b"\x1b\\").is_empty());
 }
 
 #[test]
@@ -1301,6 +1664,63 @@ fn ss3_application_keypad_forms() {
         keys(&p.parse(b"\x1bOn")),
         vec![(KeyCode::Char('.'), KeyModifiers::empty())]
     ); // keypad .
+}
+
+/// Every application-keypad byte, not just the six above.
+///
+/// `feed_ss3` names its keys by keysym and takes the code from
+/// `keypad::KEYPAD_KEYS`; a name that stopped resolving would take that byte
+/// silently out of service rather than failing to compile. This is the check
+/// that turns such a typo into a test failure.
+#[test]
+fn ss3_keypad_bytes_all_resolve() {
+    let expected: &[(u8, KeyCode)] = &[
+        (b'M', KeyCode::Enter),
+        (b'E', KeyCode::KeypadBegin),
+        (b'X', KeyCode::Char('=')),
+        (b'j', KeyCode::Char('*')),
+        (b'k', KeyCode::Char('+')),
+        (b'l', KeyCode::Char(',')),
+        (b'm', KeyCode::Char('-')),
+        (b'n', KeyCode::Char('.')),
+        (b'o', KeyCode::Char('/')),
+    ];
+    let mut p = InputParser::new();
+    for (byte, code) in expected {
+        assert_eq!(
+            keys(&p.parse(&[0x1b, b'O', *byte])),
+            vec![(*code, KeyModifiers::empty())],
+            "ESC O {}",
+            *byte as char
+        );
+    }
+    for d in 0..=9u8 {
+        assert_eq!(
+            keys(&p.parse(&[0x1b, b'O', b'p' + d])),
+            vec![(KeyCode::Char((b'0' + d) as char), KeyModifiers::empty())],
+            "keypad digit {d}"
+        );
+    }
+}
+
+/// Every keypad key in the shared table decodes from its kitty codepoint.
+///
+/// `kitty_functional_key` resolves the whole keypad range through
+/// `keypad::KEYPAD_KEYS`; this is the end-to-end check that the delegation
+/// covers the range it claims, including `kp_begin` at its top edge.
+#[test]
+fn kitty_keypad_codepoints_all_decode() {
+    let mut p = InputParser::new();
+    for k in keypad::KEYPAD_KEYS {
+        let seq = format!("\x1b[{};1u", k.kitty_codepoint);
+        assert_eq!(
+            keys(&p.parse(seq.as_bytes())),
+            vec![(k.code, KeyModifiers::empty())],
+            "kitty codepoint {} ({})",
+            k.kitty_codepoint,
+            k.keysym
+        );
+    }
 }
 
 #[test]

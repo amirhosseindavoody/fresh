@@ -9,23 +9,21 @@
 //! accepts the connection but never completes the handshake, so the connect
 //! stays in-flight for the whole test with no network.
 //!
-//! Single test in this binary: the fake-ssh PATH shim and
-//! `isolated_dir_context`'s process-global `XDG_DATA_HOME` must not leak into
-//! other test binaries.
+//! The fake-ssh PATH shim rides a `PathPin` and persistence a thread-local
+//! data-dir pin (`isolated_dir_context`), so neither leaks into a concurrent
+//! test.
 #![cfg(all(target_os = "linux", feature = "plugins"))]
 
-mod common;
-
-use common::dormant_ssh::{ensure_hanging_fake_ssh_on_path, isolated_dir_context};
-use common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness, HarnessOptions};
+use crate::common::dormant_ssh::{hanging_fake_ssh_on_path, isolated_dir_context};
+use crate::common::harness::{copy_plugin, copy_plugin_lib, EditorTestHarness, HarnessOptions};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 #[test]
 fn ssh_submit_is_non_blocking_and_shows_connecting_row() {
-    ensure_hanging_fake_ssh_on_path();
+    let _fake_ssh = hanging_fake_ssh_on_path();
     fresh::i18n::set_locale("en");
     let base = tempfile::tempdir().unwrap();
-    let dir_context = isolated_dir_context(base.path());
+    let (dir_context, _data_dir_pin) = isolated_dir_context(base.path());
     let project = base.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
     let project = project.canonicalize().unwrap();
@@ -66,12 +64,12 @@ fn ssh_submit_is_non_blocking_and_shows_connecting_row() {
     })
     .unwrap();
 
-    // Switch "Run in:" from Local to SSH (Shift+Tab wraps focus onto the
-    // selector, → advances to SSH and swaps the body), then Tab into the SSH
-    // body's first field (Host) and type a host.
+    // Switch the Machine control from Local to `Other host…` (Shift+Tab
+    // lands focus on it, → advances one option and fills the connection
+    // section), then Tab into its first field (Target) and type a host.
     h.send_key(KeyCode::BackTab, KeyModifiers::NONE).unwrap();
     h.send_key(KeyCode::Right, KeyModifiers::NONE).unwrap();
-    h.wait_until(|h| h.screen_to_string().contains("Host  ("))
+    h.wait_until(|h| h.screen_to_string().contains("Target:"))
         .unwrap();
     h.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
     h.type_text("dead-host").unwrap();
@@ -87,8 +85,19 @@ fn ssh_submit_is_non_blocking_and_shows_connecting_row() {
         !s.contains("ORCHESTRATOR :: New Workspace") && !s.contains("press Cancel to abort"),
         "SSH submit must be non-blocking (a dock row, not a modal Cancel dialog). Screen:\n{s}",
     );
+    // Identified by the machine it is connecting to, on the same row as the
+    // status. It used to be asserted as the literal label `ssh:dead-host`,
+    // which was the whole label when the name field was left blank — and that
+    // was the defect: the row named the machine (twice, counting the target
+    // segment beside it) and the workspace never. The form now supplies its
+    // generated default instead, so the row reads `⇅ project-1  dead-host`:
+    // the workspace name, then the machine once, with `⇅` already saying ssh.
+    // Asserted per-line, because "somewhere on this screen" would also accept
+    // a host that had been pushed onto a different row.
     assert!(
-        s.contains("ssh:dead-host"),
-        "the connecting SSH workspace should be listed by its host label. Screen:\n{s}",
+        s.lines()
+            .any(|l| l.contains('⇅') && l.contains("dead-host") && l.contains("Connecting")),
+        "the connecting SSH workspace should be listed, on one row, by the \
+         machine it is reaching and what it is doing. Screen:\n{s}",
     );
 }

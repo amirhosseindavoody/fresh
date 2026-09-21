@@ -65,12 +65,20 @@ impl PluginManager {
                 // values always resolve on the editor host.
                 let local_plugin_fs: Arc<dyn fresh_core::services::PluginFilesystem> =
                     Arc::new(super::bridge::RoutedFilesystem::fixed(local_filesystem));
+                // Editor-owned removal/replacement. Scoped to the config dir
+                // because everything it can touch — staging dirs, installed
+                // packages, plugin state — lives under it.
+                let owned_store = Arc::new(super::owned_store::OwnedStore::new(
+                    dir_context.config_dir.clone(),
+                    dir_context.data_dir.clone(),
+                ));
                 let services = Arc::new(EditorServiceBridge {
                     command_registry: command_registry.clone(),
                     dir_context,
                     theme_cache,
                     local_plugin_fs,
                     window_registry: Arc::clone(&window_registry),
+                    owned_store,
                 });
                 match PluginThreadHandle::spawn(services) {
                     Ok(handle) => {
@@ -396,6 +404,21 @@ impl PluginManager {
         self.inner
             .as_ref()
             .map(|m| m.execute_action_async(action_name, args_json, request_id))
+    }
+
+    /// Typed fast lane for a text-input mode's printable characters —
+    /// see `PluginThread::mode_text_input_async`. FIFO with
+    /// `execute_action_async`.
+    #[cfg(feature = "plugins")]
+    pub fn mode_text_input_async(
+        &self,
+        mode: Option<&str>,
+        text: &str,
+    ) -> Option<anyhow::Result<fresh_plugin_runtime::thread::oneshot::Receiver<anyhow::Result<()>>>>
+    {
+        self.inner
+            .as_ref()
+            .map(|m| m.mode_text_input_async(mode, text))
     }
 
     /// List all loaded plugins.

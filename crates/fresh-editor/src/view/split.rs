@@ -27,10 +27,10 @@ use crate::model::buffer::Buffer;
 use crate::model::cursor::Cursors;
 use crate::model::event::{BufferId, ContainerId, LeafId, SplitDirection, SplitId};
 use crate::model::marker::MarkerList;
+use crate::state::ViewMode;
 use crate::view::folding::FoldManager;
 use crate::view::ui::view_pipeline::Layout;
 use crate::view::viewport::Viewport;
-use crate::{services::plugins::api::ViewTransformPayload, state::ViewMode};
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -167,25 +167,64 @@ pub struct BufferViewState {
 
     /// Explicit per-buffer override for line-number visibility.
     /// `None` = follow the global `editor.line_numbers` default; `Some(v)` =
-    /// the user pinned this buffer via "Toggle Line Numbers (Current Buffer)".
+    /// the user pinned this buffer via "Toggle Line Numbers (Current Buffer)"
+    /// or vi's `:set number` / `:set nonumber`.
     /// Persisted per-file so the choice survives a restart without freezing
     /// untouched buffers at a stale global value (cf. issue #474). `show_line_numbers`
     /// remains the rendered source of truth; this only records intent + drives
     /// persistence and re-application when the global default changes underneath.
     pub line_numbers_override: Option<bool>,
 
+    /// Plugin-supplied line-number default for this (split, buffer), set via
+    /// `setLineNumbersDefault`. `None` = no plugin opinion. Markdown compose
+    /// uses it to drop the gutter from a document preview.
+    ///
+    /// Exactly the arrangement `fold_indicators_plugin_override` uses, and for
+    /// the same reasons: kept apart from the user's own pin so that a mode
+    /// re-entering itself can never overwrite a deliberate choice (issue
+    /// #2931), and deliberately **not** persisted, so a transient opinion
+    /// cannot outlive itself in the saved workspace. It loses to the pin in
+    /// [`BufferViewState::line_numbers_visible`], which is what keeps "Toggle
+    /// Line Numbers (Current Buffer)" — and `:set number` — working while a
+    /// mode is hiding the gutter.
+    pub line_numbers_plugin_override: Option<bool>,
+
     /// Explicit per-buffer override for line wrap (analogue of
     /// `line_numbers_override`). `viewport.line_wrap_enabled` stays the rendered
     /// source of truth.
     pub line_wrap_override: Option<bool>,
 
-    /// Optional view transform payload
-    pub view_transform: Option<ViewTransformPayload>,
-
-    /// True when the buffer was edited since the last view_transform_request hook fired.
-    /// While true, incoming SubmitViewTransform commands are rejected as stale
-    /// (their tokens have source_offsets from before the edit).
-    pub view_transform_stale: bool,
+    /// Explicit per-buffer override for the current-line highlight (analogue of
+    /// `line_numbers_override`). `highlight_current_line` stays the rendered
+    /// source of truth; this records the intent so the editor-wide toggle can
+    /// tell a pinned buffer from one that is merely following the default.
+    pub highlight_current_line_override: Option<bool>,
+    /// Explicit per-(split, buffer) indentation-guide override, set by
+    /// "Toggle Indentation Guides (Current Buffer)". `None` = follow the
+    /// plugin override / language gate / global resolution (see
+    /// [`resolve_indentation_guide_mode`](crate::config::resolve_indentation_guide_mode)).
+    /// Persisted in the per-file workspace state. Distinct from
+    /// `EditorState::indentation_guide_override`, the plugin-facing knob.
+    pub indentation_guide_user_override: Option<bool>,
+    /// Explicit per-(split, buffer) fold-indicator override, set by "Toggle
+    /// Folding Indicators (Current Buffer)". `None` = show them (the default;
+    /// there is no global setting). `Some(false)` hides the gutter fold
+    /// arrows in this split without touching existing folds. Persisted in the
+    /// per-file workspace state.
+    pub fold_indicators_override: Option<bool>,
+    /// Plugin-supplied fold-indicator default for this (split, buffer), set
+    /// via `setFoldIndicators`. `None` = no plugin opinion. Markdown compose
+    /// uses it to drop the gutter arrows from a document preview.
+    ///
+    /// Deliberately separate from `fold_indicators_override` and deliberately
+    /// **not** persisted: it is a mode's transient opinion, not a preference.
+    /// Keeping the two apart means compose can never overwrite a choice the
+    /// user made, can never leak a forced value into the saved workspace, and
+    /// needs no save/restore dance to put things back when it exits — the
+    /// user's setting is still sitting there untouched. It loses to that
+    /// setting in `fold_indicators_visible`, so the toggle action keeps
+    /// working while composing.
+    pub fold_indicators_plugin_override: Option<bool>,
 
     /// Plugin-managed state (arbitrary key-value pairs).
     /// Plugins can store per-buffer-per-split state here via the `setViewState`/`getViewState` API.
@@ -239,9 +278,12 @@ impl BufferViewState {
             show_line_numbers: true,
             highlight_current_line: true,
             line_numbers_override: None,
+            line_numbers_plugin_override: None,
             line_wrap_override: None,
-            view_transform: None,
-            view_transform_stale: false,
+            highlight_current_line_override: None,
+            indentation_guide_user_override: None,
+            fold_indicators_override: None,
+            fold_indicators_plugin_override: None,
             plugin_state: std::collections::HashMap::new(),
             folds: FoldManager::new(),
         }
@@ -253,6 +295,44 @@ impl BufferViewState {
     /// `wrap_column`, and `rulers` from the given config values. Call this after
     /// creating a new `BufferViewState` (via `new()` or `ensure_buffer_state()`)
     /// to ensure the view respects the user's settings.
+    ///
+    /// Explicit per-buffer pins win over the defaults. `ensure_buffer_state`
+    /// returns an *existing* view state when there is one, so several call
+    /// sites reach a buffer the user has already pinned — re-stamping the
+    /// global value there would silently undo "Toggle X (Current Buffer)" the
+    /// next time that buffer was activated. Fields with no override
+    /// (`None`, the case for every freshly created view state) are unaffected.
+    /// Whether the gutter should draw fold arrows in this split.
+    ///
+    /// The user's own toggle wins outright; a plugin (markdown compose)
+    /// supplies the default when they have not expressed one; failing both,
+    /// they show. That ordering is what lets "Toggle Folding Indicators"
+    /// still do something while a mode is hiding them.
+    pub fn fold_indicators_visible(&self) -> bool {
+        self.fold_indicators_override
+            .or(self.fold_indicators_plugin_override)
+            .unwrap_or(true)
+    }
+
+    /// Whether the gutter should draw line numbers in this split, given the
+    /// global `editor.line_numbers` default.
+    ///
+    /// Same precedence as [`Self::fold_indicators_visible`], and for the same
+    /// reason: the user's own pin wins outright, a plugin (markdown compose)
+    /// supplies the default when they have not expressed one, and failing both
+    /// the global setting decides. That ordering is what lets "Toggle Line
+    /// Numbers (Current Buffer)" still do something while a mode is hiding the
+    /// gutter — and what stops the mode from erasing the pin when it re-enters
+    /// itself on the next `buffer_activated` (issue #2931).
+    ///
+    /// `show_line_numbers` stays the rendered source of truth; call this to
+    /// (re)compute it whenever any of the three inputs changes.
+    pub fn line_numbers_visible(&self, default_line_numbers: bool) -> bool {
+        self.line_numbers_override
+            .or(self.line_numbers_plugin_override)
+            .unwrap_or(default_line_numbers)
+    }
+
     pub fn apply_config_defaults(&mut self, defaults: ViewConfigDefaults) {
         let ViewConfigDefaults {
             line_numbers,
@@ -263,9 +343,11 @@ impl BufferViewState {
             rulers,
             scroll_offset,
         } = defaults;
-        self.show_line_numbers = line_numbers;
-        self.highlight_current_line = highlight_current_line;
-        self.viewport.line_wrap_enabled = line_wrap;
+        self.show_line_numbers = self.line_numbers_visible(line_numbers);
+        self.highlight_current_line = self
+            .highlight_current_line_override
+            .unwrap_or(highlight_current_line);
+        self.viewport.line_wrap_enabled = self.line_wrap_override.unwrap_or(line_wrap);
         self.viewport.wrap_indent = wrap_indent;
         self.viewport.wrap_column = wrap_column;
         self.rulers = rulers;
@@ -299,9 +381,17 @@ impl Clone for BufferViewState {
             show_line_numbers: self.show_line_numbers,
             highlight_current_line: self.highlight_current_line,
             line_numbers_override: self.line_numbers_override,
+            // Carried like `view_mode` and the fold-indicator opinion below: a
+            // split cloned from a composing one is composing too, and should
+            // hide its gutter for the same reason.
+            line_numbers_plugin_override: self.line_numbers_plugin_override,
             line_wrap_override: self.line_wrap_override,
-            view_transform: self.view_transform.clone(),
-            view_transform_stale: self.view_transform_stale,
+            highlight_current_line_override: self.highlight_current_line_override,
+            indentation_guide_user_override: self.indentation_guide_user_override,
+            fold_indicators_override: self.fold_indicators_override,
+            // Carried like `view_mode`: a split cloned from a composing one
+            // is composing too, and should hide its arrows for the same reason.
+            fold_indicators_plugin_override: self.fold_indicators_plugin_override,
             plugin_state: self.plugin_state.clone(),
             // Fold markers are per-view; clones start with no folded ranges.
             folds: FoldManager::new(),
@@ -338,7 +428,7 @@ pub struct SplitViewState {
     /// Horizontal scroll offset for the tabs in this split
     pub tab_scroll_offset: usize,
 
-    /// Computed layout for this view (from view_transform or base tokens)
+    /// Computed layout for this view
     /// This is View state - each split has its own Layout
     pub layout: Option<Layout>,
 
@@ -489,7 +579,7 @@ impl SplitViewState {
     /// Returns the Layout - never returns None. Following VSCode's ViewModel pattern.
     ///
     /// # Arguments
-    /// * `tokens` - ViewTokenWire array (from view_transform or built from buffer)
+    /// * `tokens` - ViewTokenWire array built from the buffer
     /// * `source_range` - The byte range this layout covers
     /// * `tab_size` - Tab width for rendering
     pub fn ensure_layout(
@@ -522,9 +612,19 @@ impl SplitViewState {
     }
 
     /// Remove a buffer from this split's tabs and clean up its keyed state
+    ///
+    /// `focus_history` is this split's tab LRU, so it goes with the tab: a
+    /// buffer that is no longer a tab here must not stay a candidate for
+    /// "what should this split show next" (`resolve_close_replacement`).
+    /// Done here rather than at each call site because every one of them —
+    /// a tab closing, a phantom tab being dropped after a panel moves to its
+    /// own split, a buffer migrating to another window — means the same
+    /// thing, and the sites that forgot the second call are what let a dock
+    /// panel get pulled into the editor split.
     pub fn remove_buffer(&mut self, buffer_id: BufferId) {
         self.open_buffers
             .retain(|t| *t != TabTarget::Buffer(buffer_id));
+        self.remove_from_history(buffer_id);
         // Clean up keyed state (but never remove the active buffer's state)
         if buffer_id != self.active_buffer {
             self.keyed_states.remove(&buffer_id);
@@ -797,10 +897,21 @@ impl SplitNode {
 
     /// Get all leaf nodes (buffer views) with their rectangles.
     ///
-    /// Grouped nodes always recurse into their inner layout — the layout's
-    /// leaves get the full rect that would have been given to the Grouped
-    /// node. Visibility (which group is "active") is applied elsewhere.
-    pub fn get_leaves_with_rects(&self, rect: Rect) -> Vec<(LeafId, BufferId, Rect)> {
+    /// Where each leaf of this subtree sits inside `rect`, by the model's own
+    /// walk: recurse over the ratios, reserving a cell per separator. Grouped
+    /// nodes always recurse into their inner layout — the layout's leaves get
+    /// the full rect that would have been given to the Grouped node.
+    /// Visibility (which group is "active") is applied elsewhere.
+    ///
+    /// **The engine the description replaced**, kept as the thing the swap is
+    /// pinned against. `view::shell::splits::grid` is the layout now, and the
+    /// editor reads where the panes are off the tree it laid out
+    /// (`view::shell::geometry::PaneRects`); a replacement is only as
+    /// trustworthy as what it was checked against, so the original walk stays
+    /// here as the oracle of the parity tests in `shell::splits` and
+    /// `shell::geometry`, and nothing else compiles it.
+    #[cfg(test)]
+    pub fn reference_leaves_with_rects(&self, rect: Rect) -> Vec<(LeafId, BufferId, Rect)> {
         match self {
             Self::Leaf {
                 buffer_id,
@@ -820,11 +931,37 @@ impl SplitNode {
             } => {
                 let (first_rect, second_rect) =
                     split_rect_ext(rect, *direction, *ratio, *fixed_first, *fixed_second);
-                let mut leaves = first.get_leaves_with_rects(first_rect);
-                leaves.extend(second.get_leaves_with_rects(second_rect));
+                let mut leaves = first.reference_leaves_with_rects(first_rect);
+                leaves.extend(second.reference_leaves_with_rects(second_rect));
                 leaves
             }
-            Self::Grouped { layout, .. } => layout.get_leaves_with_rects(rect),
+            Self::Grouped { layout, .. } => layout.reference_leaves_with_rects(rect),
+        }
+    }
+
+    /// The leaves this subtree shows, in the tree's order — first child before
+    /// second, so left to right and top to bottom — without their rectangles.
+    ///
+    /// **The model answers which; layout answers where.** This subtree used
+    /// to lay itself out to say where its leaves are, in a scratch `Ui<()>`
+    /// that was a second layout of the grid the frame had already laid out.
+    /// Where a pane is comes off that frame's tree now
+    /// (`view::shell::geometry::PaneRects`, retained per window), and the
+    /// partition never changes which leaves there are — so what the model
+    /// still answers is this.
+    pub fn visible_leaves(&self) -> Vec<(LeafId, BufferId)> {
+        match self {
+            Self::Leaf {
+                buffer_id,
+                split_id,
+                ..
+            } => vec![(*split_id, *buffer_id)],
+            Self::Split { first, second, .. } => {
+                let mut out = first.visible_leaves();
+                out.extend(second.visible_leaves());
+                out
+            }
+            Self::Grouped { layout, .. } => layout.visible_leaves(),
         }
     }
 
@@ -1056,7 +1193,7 @@ fn split_rect(rect: Rect, direction: SplitDirection, ratio: f32) -> (Rect, Rect)
     split_rect_ext(rect, direction, ratio, None, None)
 }
 
-fn split_rect_ext(
+pub(crate) fn split_rect_ext(
     rect: Rect,
     direction: SplitDirection,
     ratio: f32,
@@ -1451,6 +1588,10 @@ impl SplitManager {
                     self.active_split = first_leaf;
                 }
             }
+
+            // A collapse can strand the dock's role on the sole root leaf,
+            // which is now an ordinary editor pane (#2415).
+            self.clear_root_leaf_role();
         }
 
         result
@@ -1508,7 +1649,12 @@ impl SplitManager {
         if self.root.id() == target_id {
             return Err("Cannot remove root Grouped node".to_string());
         }
-        Self::remove_child_static(&mut self.root, target_id)
+        let result = Self::remove_child_static(&mut self.root, target_id);
+        if result.is_ok() {
+            // Same invariant as `close_split` (#2415).
+            self.clear_root_leaf_role();
+        }
+        result
     }
 
     /// Adjust the split ratio of a container
@@ -1537,9 +1683,19 @@ impl SplitManager {
         self.root.parent_container_of(leaf_id.into())
     }
 
-    /// Get all visible buffer views with their rectangles
-    pub fn get_visible_buffers(&self, viewport_rect: Rect) -> Vec<(LeafId, BufferId, Rect)> {
-        // If a split is maximized, only show that split taking up the full viewport
+    /// Which leaves are visible, in the tree's order, without asking where
+    /// they are: only the maximized leaf when one is maximized (and it still
+    /// exists), otherwise every leaf of the tree.
+    ///
+    /// **The set does not depend on the box.** Which leaves show is a fact
+    /// about the tree and the maximized split alone; where they are is the
+    /// layout's answer, read off the shell tree that placed them
+    /// (`view::shell::geometry::PaneRects`, which `Window::visible_panes`
+    /// pairs with this list). The model used to answer both at once by laying
+    /// the grid out again in a box the caller supplied, and a caller that
+    /// wanted only the set had to invent a rectangle to get it — an invented
+    /// input whose value cannot matter is a claim that it might.
+    pub fn visible_leaves(&self) -> Vec<(LeafId, BufferId)> {
         if let Some(maximized_id) = self.maximized_split {
             if let Some(SplitNode::Leaf {
                 buffer_id,
@@ -1547,11 +1703,10 @@ impl SplitManager {
                 ..
             }) = self.root.find(maximized_id)
             {
-                return vec![(*split_id, *buffer_id, viewport_rect)];
+                return vec![(*split_id, *buffer_id)];
             }
-            // Maximized split no longer exists, clear it and fall through
         }
-        self.root.get_leaves_with_rects(viewport_rect)
+        self.root.visible_leaves()
     }
 
     /// Get all split separator positions for rendering borders
@@ -1564,8 +1719,15 @@ impl SplitManager {
         self.root.get_separators(viewport_rect)
     }
 
-    /// Get all split separator positions with their split IDs (for mouse hit testing)
-    /// Returns (container_id, direction, x, y, length) tuples
+    /// Where the separators are, computed from the model.
+    ///
+    /// **Not the editor's answer any more** — the shell tree places the
+    /// dividers and `view::shell::splits::separator_rects` reads them back, so
+    /// this is a second derivation of the same rectangles and using it would
+    /// be the thing goal 5 forbids. It is kept because
+    /// `the_dividers_are_where_the_separators_are` uses it as the oracle the
+    /// tree is checked against, which is the one job a second derivation is
+    /// good for.
     pub fn get_separators_with_ids(
         &self,
         viewport_rect: Rect,
@@ -1684,33 +1846,51 @@ impl SplitManager {
         }
     }
 
-    /// Get all split IDs that display a specific buffer
-    pub fn splits_for_buffer(&self, target_buffer_id: BufferId) -> Vec<LeafId> {
-        self.root
-            .get_leaves_with_rects(Rect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            })
+    /// The buffer group each visible pane is showing, by the pane showing
+    /// it — the shape `view::shell::splits::Splits::groups` takes.
+    ///
+    /// A group's layout lives in `grouped_subtrees`, keyed by the *group's*
+    /// leaf, and a pane names the group it shows through its view state's
+    /// `active_group_tab`. This is the one join of the two; the frame's
+    /// description and the session preview's offscreen layout both take it.
+    pub fn pane_groups(
+        &self,
+        view_states: &HashMap<LeafId, SplitViewState>,
+        grouped_subtrees: &HashMap<LeafId, SplitNode>,
+    ) -> HashMap<LeafId, SplitNode> {
+        self.visible_leaves()
             .into_iter()
-            .filter(|(_, buffer_id, _)| *buffer_id == target_buffer_id)
-            .map(|(split_id, _, _)| split_id)
+            .filter_map(|(leaf, _)| {
+                let group = view_states.get(&leaf)?.active_group_tab?;
+                Some((leaf, grouped_subtrees.get(&group)?.clone()))
+            })
             .collect()
     }
 
-    /// Get the buffer ID for a specific leaf split
+    /// Get all split IDs that display a specific buffer.
+    ///
+    /// A question about the leaf set, answered from the leaf set. It used to
+    /// lay the grid out in a 1×1 probe to get the same list — which put a
+    /// scratch layout on the render path once per pane per frame, through
+    /// `update_menu_context`'s "same buffer in another split" check.
+    pub fn splits_for_buffer(&self, target_buffer_id: BufferId) -> Vec<LeafId> {
+        self.root
+            .visible_leaves()
+            .into_iter()
+            .filter(|(_, buffer_id)| *buffer_id == target_buffer_id)
+            .map(|(split_id, _)| split_id)
+            .collect()
+    }
+
+    /// Get the buffer ID for a specific leaf split. See
+    /// [`Self::splits_for_buffer`] for why this walks the tree rather than
+    /// laying it out.
     pub fn buffer_for_split(&self, target_split_id: LeafId) -> Option<BufferId> {
         self.root
-            .get_leaves_with_rects(Rect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            })
+            .visible_leaves()
             .into_iter()
-            .find(|(split_id, _, _)| *split_id == target_split_id)
-            .map(|(_, buffer_id, _)| buffer_id)
+            .find(|(split_id, _)| *split_id == target_split_id)
+            .map(|(_, buffer_id)| buffer_id)
     }
 
     /// Maximize the active split (hide all other splits temporarily)
@@ -1865,6 +2045,27 @@ impl SplitManager {
         Some(leaf)
     }
 
+    /// Enforce the invariant that the root leaf never carries a role tag.
+    ///
+    /// A role tag (the Utility Dock) only means anything on a leaf *beside*
+    /// editor splits. Once a collapse leaves it as the sole root leaf, a
+    /// stale tag routes every later dock open into it as a full-window tab,
+    /// and workspace persistence makes that permanent (#2415). Returns
+    /// whether a tag was cleared.
+    pub fn clear_root_leaf_role(&mut self) -> bool {
+        if let SplitNode::Leaf { role, .. } = &mut self.root {
+            if role.is_some() {
+                tracing::info!(
+                    "Clearing role {:?} from sole root leaf (a root leaf cannot be a dock)",
+                    role
+                );
+                *role = None;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Find the first leaf split with the given label
     pub fn find_split_by_label(&self, label: &str) -> Option<LeafId> {
         self.root
@@ -1885,6 +2086,42 @@ impl SplitManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two fold-indicator overrides are a precedence, not a single flag:
+    /// a plugin supplies the default, the user's own toggle overrules it, and
+    /// with neither set the arrows show. Getting this backwards would either
+    /// let compose mode silently discard a deliberate setting, or leave
+    /// "Toggle Folding Indicators" doing nothing while composing.
+    #[test]
+    fn test_fold_indicator_precedence() {
+        let mut vs = BufferViewState::new(80, 24);
+        assert!(vs.fold_indicators_visible(), "default is on");
+
+        vs.fold_indicators_plugin_override = Some(false);
+        assert!(
+            !vs.fold_indicators_visible(),
+            "a plugin can hide them when the user has no opinion",
+        );
+
+        vs.fold_indicators_override = Some(true);
+        assert!(
+            vs.fold_indicators_visible(),
+            "the user's own choice overrules the plugin's",
+        );
+
+        vs.fold_indicators_plugin_override = None;
+        assert!(
+            vs.fold_indicators_visible(),
+            "withdrawing the plugin's opinion leaves the user's choice standing",
+        );
+
+        vs.fold_indicators_override = Some(false);
+        vs.fold_indicators_plugin_override = Some(true);
+        assert!(
+            !vs.fold_indicators_visible(),
+            "a user who hid them keeps them hidden whatever the plugin says",
+        );
+    }
 
     #[test]
     fn test_create_split_manager() {
@@ -1965,6 +2202,92 @@ mod tests {
 
         let result = manager.close_split(manager.active_split());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_close_split_clears_role_stranded_on_root_leaf() {
+        // Regression for #2415: closing the editor leaf collapses the tree
+        // onto the dock leaf, which must shed its role.
+        let editor_buffer = BufferId(0);
+        let dock_buffer = BufferId(1);
+
+        let mut manager = SplitManager::new(editor_buffer);
+        let editor_leaf = manager.active_split();
+        let dock_leaf = manager
+            .split_root_positioned(SplitDirection::Horizontal, dock_buffer, 0.7, false)
+            .unwrap();
+        manager.set_leaf_role(dock_leaf, Some(SplitRole::UtilityDock));
+        assert_eq!(
+            manager.find_leaf_by_role(SplitRole::UtilityDock),
+            Some(dock_leaf)
+        );
+
+        manager.close_split(editor_leaf).unwrap();
+
+        assert_eq!(manager.root().count_leaves(), 1);
+        assert_eq!(
+            manager.find_leaf_by_role(SplitRole::UtilityDock),
+            None,
+            "a sole root leaf must not keep the UtilityDock role"
+        );
+        assert_eq!(manager.leaf_role(dock_leaf), None);
+    }
+
+    #[test]
+    fn test_close_split_keeps_dock_role_when_editor_leaves_remain() {
+        // The dock is still a panel beside a surviving editor pane (#2415).
+        let mut manager = SplitManager::new(BufferId(0));
+        let editor_a = manager.active_split();
+        let editor_b = manager
+            .split_active(SplitDirection::Vertical, BufferId(1), 0.5)
+            .unwrap();
+        let dock_leaf = manager
+            .split_root_positioned(SplitDirection::Horizontal, BufferId(2), 0.7, false)
+            .unwrap();
+        manager.set_leaf_role(dock_leaf, Some(SplitRole::UtilityDock));
+
+        manager.close_split(editor_b).unwrap();
+
+        assert!(manager.root().leaf_split_ids().contains(&editor_a));
+        assert_eq!(
+            manager.find_leaf_by_role(SplitRole::UtilityDock),
+            Some(dock_leaf),
+            "the dock role must survive while another editor leaf exists"
+        );
+    }
+
+    #[test]
+    fn test_clear_root_leaf_role_heals_a_restored_poisoned_tree() {
+        // A workspace saved before the collapse invariant existed rebuilds
+        // into exactly this shape, so restore calls the sanitizer directly
+        // rather than re-deriving it from a close (#2415).
+        let mut manager = SplitManager::new(BufferId(0));
+        let sole_leaf = manager.active_split();
+        manager.set_leaf_role(sole_leaf, Some(SplitRole::UtilityDock));
+
+        assert!(manager.clear_root_leaf_role(), "a role was there to clear");
+        assert_eq!(manager.leaf_role(sole_leaf), None);
+        assert!(
+            !manager.clear_root_leaf_role(),
+            "a healthy tree reports nothing to clear"
+        );
+    }
+
+    #[test]
+    fn test_clear_root_leaf_role_leaves_a_real_dock_alone() {
+        // The sanitizer runs unconditionally after restore, so it must be
+        // inert on a tree whose dock sits beside an editor pane.
+        let mut manager = SplitManager::new(BufferId(0));
+        let dock_leaf = manager
+            .split_root_positioned(SplitDirection::Horizontal, BufferId(1), 0.7, false)
+            .unwrap();
+        manager.set_leaf_role(dock_leaf, Some(SplitRole::UtilityDock));
+
+        assert!(!manager.clear_root_leaf_role());
+        assert_eq!(
+            manager.find_leaf_by_role(SplitRole::UtilityDock),
+            Some(dock_leaf)
+        );
     }
 
     #[test]

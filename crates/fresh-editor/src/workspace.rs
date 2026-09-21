@@ -101,6 +101,20 @@ pub struct Workspace {
     /// Timestamp when workspace was saved (Unix epoch seconds)
     pub saved_at: u64,
 
+    /// When this workspace was last the foreground one, in Unix epoch
+    /// milliseconds. Stamped on activation — not on save — so it answers
+    /// "which workspace was I last working in", which `saved_at` cannot:
+    /// every materialized window is written at quit, so their save times
+    /// are all the same instant.
+    ///
+    /// Read at boot by Orchestrator mode, which reopens the highest one
+    /// regardless of the launch directory. `None` in files written before
+    /// this existed; such a workspace simply never wins the comparison,
+    /// which degrades to the launch-directory rule rather than to nothing.
+    /// Milliseconds because two switches inside one second are ordinary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_focused_at: Option<u64>,
+
     /// Display label for this session (orchestrator). Defaults to the
     /// root basename when absent. Since windows.json was dropped, the
     /// per-dir workspace file is the sole session record, so the label
@@ -138,6 +152,19 @@ pub struct Workspace {
     /// duplicate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable_id: Option<String>,
+}
+
+/// Now, in Unix epoch milliseconds — the clock behind
+/// [`Workspace::last_focused_at`].
+///
+/// Milliseconds rather than the seconds `saved_at` uses: switching
+/// workspaces twice inside one second is an ordinary thing to do, and at
+/// second resolution the second switch would not outrank the first.
+pub fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Mint a new durable workspace identity: creation-time nanoseconds plus a
@@ -242,15 +269,17 @@ pub struct SerializedSplitViewState {
     /// Tab scroll offset
     #[serde(default)]
     pub tab_scroll_offset: usize,
-
-    /// View mode
-    #[serde(default)]
-    pub view_mode: SerializedViewMode,
-
-    /// Compose width if in compose mode
-    #[serde(default)]
-    pub compose_width: Option<u16>,
 }
+
+// **A split has no view mode and no compose width.** Both were written here
+// as a copy of whatever buffer happened to be active when the session was
+// saved, and read back onto whatever buffer happened to come up active — so a
+// session saved with a composed page in front handed that page's column to an
+// unrelated buffer, margins and all. They are per-buffer values with exactly
+// one owner each (`SerializedFileState`), and a buffer with no saved state of
+// its own has no view mode and no compose width to restore, rather than
+// inheriting a neighbour's. Old sessions carrying the two fields still load;
+// the fields are simply ignored.
 
 /// Per-file state within a split
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +317,49 @@ pub struct SerializedFileState {
     /// across restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_space: Option<crate::config::VirtualSpaceMode>,
+
+    /// Explicit per-buffer indentation-guide override (`None` = follow the
+    /// global `editor.indentation_guide` mode). Persists the "Toggle
+    /// Indentation Guides (Current Buffer)" choice across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indentation_guide: Option<bool>,
+
+    /// Explicit per-buffer folding-indicator override (`None` = show them).
+    /// Persists the "Toggle Folding Indicators (Current Buffer)" choice across
+    /// restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold_indicators: Option<bool>,
+
+    /// Explicit per-buffer indentation-style override (`None` = follow the
+    /// language default). Persists the "Toggle Indentation: Spaces ↔ Tabs
+    /// (Current Buffer)" choice across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_tabs: Option<bool>,
+
+    /// Explicit per-buffer whitespace-indicator master override (`None` =
+    /// follow config). Persists the "Toggle Whitespace Indicators (Current
+    /// Buffer)" / "Toggle Tab Indicators (Current Buffer)" choice across
+    /// restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whitespace_indicators: Option<bool>,
+
+    /// Explicit per-buffer tab-indicator override, layered on top of
+    /// `whitespace_indicators` (`None` = follow the master/config resolution).
+    /// Persists the "Toggle Tab Indicators (Current Buffer)" choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_indicators: Option<bool>,
+
+    /// Explicit per-buffer current-line-highlight override (`None` = follow the
+    /// global default). Persists the "Toggle Current Line Highlight (Current
+    /// Buffer)" choice across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight_current_line: Option<bool>,
+
+    /// Explicit per-buffer occurrence-highlight override (`None` = follow the
+    /// global default). Persists the "Toggle Occurrence Highlight (Current
+    /// Buffer)" choice across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight_occurrences: Option<bool>,
 
     /// Plugin-managed state (arbitrary key-value pairs, persisted across sessions)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -405,6 +477,11 @@ pub struct FileExplorerState {
     /// Show gitignored files (fixes #569)
     #[serde(default)]
     pub show_gitignored: bool,
+    /// The sidebar's sections, top to bottom. Empty — every workspace
+    /// written before sections existed — restores as exactly one explorer
+    /// section filling the column.
+    #[serde(default)]
+    pub sections: Vec<SectionState>,
 }
 
 impl Default for FileExplorerState {
@@ -417,8 +494,46 @@ impl Default for FileExplorerState {
             scroll_offset: 0,
             show_hidden: false,
             show_gitignored: false,
+            sections: Vec::new(),
         }
     }
+}
+
+/// One sidebar section as the workspace file records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SectionState {
+    pub kind: SectionStateKind,
+    /// `window` (the default, and what every file written before scopes
+    /// existed means) or `editor`. Buffer-scoped sections are not written.
+    #[serde(default)]
+    pub scope: SectionScopeState,
+    /// A plugin section's title, so a section whose plugin has not loaded
+    /// can still show its header.
+    #[serde(default)]
+    pub title: String,
+    /// Requested body rows; `0` shares the remainder.
+    #[serde(default)]
+    pub rows: u16,
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// What a persisted section holds: the explorer, or a plugin panel by its
+/// composite `(plugin, id)` identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SectionStateKind {
+    Explorer,
+    Panel { plugin: String, id: u64 },
+}
+
+/// The persisted half of `app::sidebar::SectionScope`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionScopeState {
+    #[default]
+    Window,
+    Editor,
 }
 
 /// Per-workspace input histories
@@ -511,6 +626,26 @@ pub struct SerializedTerminalWorkspace {
     /// re-derive their name the same way after restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Whether this terminal's child was granted editor control — the
+    /// Orchestrator's `allowScript`, which stamps a `FRESH_CMD_TOKEN`
+    /// capability token into the agent's environment.
+    ///
+    /// Only the *grant* is persisted, never the token: the token table is
+    /// in-memory and process-global, so the string this terminal carried in a
+    /// previous run means nothing to the run that restores it. Restore mints a
+    /// fresh token bound to the restored window (see
+    /// `Window::remint_terminal_script_env`); without this flag a restored
+    /// agent came back unable to drive the editor at all. Absent for plain
+    /// terminals and in workspaces written before this field existed — which
+    /// read back as `false`, i.e. no grant, the safe direction.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub script_access: bool,
+}
+
+/// `skip_serializing_if` helper: keeps the default-`false` capability flag out
+/// of the JSON for the overwhelming majority of terminals that never had it.
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// The saved state of a terminal whose process had quit before the editor did.
@@ -571,6 +706,16 @@ impl PersistedFileState {
     }
 }
 
+/// True when `path` matches one of the `editor.ephemeral_file_patterns`
+/// entries — files rewritten behind the editor's back, git's scratch files
+/// (`.git/COMMIT_EDITMSG`, `MERGE_MSG`, …) by default. Their persisted byte
+/// offsets are stale by the time they would be restored (#2761), so such
+/// files are skipped on save *and* on load; the load side also neutralizes
+/// state written before this gate existed.
+pub fn is_ephemeral_file(path: &Path, patterns: &[String]) -> bool {
+    crate::primitives::glob_match::matches_any_entry(patterns, path)
+}
+
 /// Per-file workspace storage for scroll/cursor positions
 ///
 /// Unlike project workspaces which store file states relative to a working directory,
@@ -599,8 +744,13 @@ impl PersistedFileWorkspace {
         Ok(Self::states_dir()?.join(filename))
     }
 
-    /// Load the state for a file by its absolute path (from disk)
-    pub fn load(path: &Path) -> Option<SerializedFileState> {
+    /// Load the state for a file by its absolute path (from disk).
+    /// `ephemeral_patterns` is `editor.ephemeral_file_patterns`.
+    pub fn load(path: &Path, ephemeral_patterns: &[String]) -> Option<SerializedFileState> {
+        // Never restore state an older build may have persisted (#2761).
+        if is_ephemeral_file(path, ephemeral_patterns) {
+            return None;
+        }
         let state_path = match Self::state_file_path(path) {
             Ok(p) => p,
             Err(_) => return None,
@@ -628,8 +778,12 @@ impl PersistedFileWorkspace {
         Some(persisted.state)
     }
 
-    /// Save the state for a file by its absolute path (to disk, atomic write)
-    pub fn save(path: &Path, state: SerializedFileState) {
+    /// Save the state for a file by its absolute path (to disk, atomic write).
+    /// `ephemeral_patterns` is `editor.ephemeral_file_patterns`.
+    pub fn save(path: &Path, state: SerializedFileState, ephemeral_patterns: &[String]) {
+        if is_ephemeral_file(path, ephemeral_patterns) {
+            return;
+        }
         let state_path = match Self::state_file_path(path) {
             Ok(p) => p,
             Err(e) => {
@@ -683,65 +837,23 @@ pub fn get_workspaces_dir() -> io::Result<PathBuf> {
     Ok(get_data_dir()?.join("workspaces"))
 }
 
-/// Encode a path into a filesystem-safe filename using percent encoding
-///
-/// Keeps alphanumeric chars, `-`, `.`, `_` as-is.
-/// Replaces `/` with `_` for readability.
-/// Percent-encodes other special characters as %XX.
-///
-/// Example: `/home/user/my project` -> `home_user_my%20project`
-pub fn encode_path_for_filename(path: &Path) -> String {
-    let path_str = path.to_string_lossy();
-    let mut result = String::with_capacity(path_str.len() * 2);
-
-    for c in path_str.chars() {
-        match c {
-            // Path separators become underscores for readability
-            '/' | '\\' => result.push('_'),
-            // Safe chars pass through
-            c if c.is_ascii_alphanumeric() => result.push(c),
-            '-' | '.' => result.push(c),
-            // Underscore needs special handling to avoid collision with /
-            '_' => result.push_str("%5F"),
-            // Everything else gets percent-encoded
-            c => {
-                for byte in c.to_string().as_bytes() {
-                    result.push_str(&format!("%{:02X}", byte));
-                }
-            }
-        }
-    }
-
-    // Remove leading underscores (from leading /)
-    let result = result.trim_start_matches('_').to_string();
-
-    // Collapse multiple underscores
-    let mut final_result = String::with_capacity(result.len());
-    let mut last_was_underscore = false;
-    for c in result.chars() {
-        if c == '_' {
-            if !last_was_underscore {
-                final_result.push(c);
-            }
-            last_was_underscore = true;
-        } else {
-            final_result.push(c);
-            last_was_underscore = false;
-        }
-    }
-
-    if final_result.is_empty() {
-        final_result = "root".to_string();
-    }
-
-    final_result
-}
+// The encoder lives in `fresh-editor-core` (`config_io` needs it to name
+// per-workspace config files); re-exported here so the old path resolves.
+pub use fresh_editor_core::path_encode::encode_path_for_filename;
 
 /// Decode a filename back to the original path (for debugging/tooling)
 #[allow(dead_code)]
 pub fn decode_filename_to_path(encoded: &str) -> Option<PathBuf> {
     if encoded == "root" {
         return Some(PathBuf::from("/"));
+    }
+    // A name the encoder had to fold to fit `NAME_MAX` keeps only the head of
+    // the path plus a digest, so there is no path to give back. The encoder
+    // can never emit a literal `~` (a real one becomes `%7E`), which is what
+    // makes its presence a reliable answer rather than a guess. Callers
+    // already handle `None` by falling back to the name itself.
+    if encoded.contains('~') {
+        return None;
     }
 
     let mut result = String::with_capacity(encoded.len() + 1);
@@ -1277,6 +1389,7 @@ impl Workspace {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            last_focused_at: None,
             label: None,
             session_plugin_state: HashMap::new(),
             authority_spec: crate::services::authority::SessionAuthoritySpec::Local,
@@ -1442,6 +1555,13 @@ mod tests {
             line_numbers: None,
             line_wrap: None,
             virtual_space: None,
+            indentation_guide: None,
+            fold_indicators: None,
+            use_tabs: None,
+            whitespace_indicators: None,
+            tab_indicators: None,
+            highlight_current_line: None,
+            highlight_occurrences: None,
             plugin_state: HashMap::new(),
             folds: Vec::new(),
         };
@@ -1543,8 +1663,6 @@ mod tests {
                 active_file_index: 0,
                 file_states: HashMap::new(),
                 tab_scroll_offset: 0,
-                view_mode: SerializedViewMode::Source,
-                compose_width: None,
             },
         );
 
@@ -1666,6 +1784,7 @@ mod tests {
             scroll_offset: 5,
             show_hidden: true,
             show_gitignored: false,
+            sections: Vec::new(),
         };
 
         let json = serde_json::to_string(&state).unwrap();
@@ -1689,6 +1808,7 @@ mod tests {
             scroll_offset: 0,
             show_hidden: false,
             show_gitignored: false,
+            sections: Vec::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: FileExplorerState = serde_json::from_str(&json).unwrap();
@@ -1711,5 +1831,120 @@ mod tests {
         }"#;
         let restored: FileExplorerState = serde_json::from_str(json).unwrap();
         assert_eq!(restored.width, crate::config::ExplorerWidth::Percent(30));
+    }
+
+    /// The shipped default must cover everything under a `.git` directory
+    /// (linked worktrees included) and nothing that merely looks like it.
+    #[test]
+    fn test_default_ephemeral_patterns_match_git_internals_only() {
+        let defaults = crate::config::default_ephemeral_file_patterns();
+        let matches = |p: &str| is_ephemeral_file(Path::new(p), &defaults);
+
+        assert!(matches("/repo/.git/COMMIT_EDITMSG"));
+        assert!(matches(".git/MERGE_MSG"));
+        assert!(matches("/repo/.git/TAG_EDITMSG"));
+        assert!(matches(
+            "/main/.git/worktrees/wt/rebase-merge/git-rebase-todo"
+        ));
+        // Windows separators (CONTRIBUTING §Cross-Platform).
+        assert!(matches("C:\\repo\\.git\\COMMIT_EDITMSG"));
+
+        assert!(!matches("/repo/src/main.rs"));
+        assert!(!matches("COMMIT_EDITMSG"));
+        assert!(!matches("/repo/.github/workflows/ci.yml"));
+        assert!(!matches("/repo/notes/.gitignore"));
+        assert!(!matches("C:\\repo\\.github\\workflows\\ci.yml"));
+    }
+
+    /// The list is data, not a hard-coded git rule: a custom entry excludes
+    /// a non-git file, and replacing the defaults stops excluding git's.
+    #[test]
+    fn test_ephemeral_patterns_are_configurable() {
+        let custom = vec!["*.generated.rs".to_string(), "build/**".to_string()];
+
+        assert!(is_ephemeral_file(
+            Path::new("/repo/src/schema.generated.rs"),
+            &custom
+        ));
+        assert!(is_ephemeral_file(Path::new("build/out/app.js"), &custom));
+        assert!(!is_ephemeral_file(Path::new("/repo/src/main.rs"), &custom));
+        assert!(!is_ephemeral_file(
+            Path::new("/repo/.git/COMMIT_EDITMSG"),
+            &custom
+        ));
+
+        // A literal entry matches the file name exactly, anywhere.
+        let literal = vec!["COMMIT_EDITMSG".to_string()];
+        assert!(is_ephemeral_file(Path::new("COMMIT_EDITMSG"), &literal));
+        assert!(is_ephemeral_file(
+            Path::new("/anywhere/COMMIT_EDITMSG"),
+            &literal
+        ));
+        assert!(!is_ephemeral_file(
+            Path::new("/x/COMMIT_EDITMSG.bak"),
+            &literal
+        ));
+
+        // An empty list disables the exclusion entirely.
+        assert!(!is_ephemeral_file(
+            Path::new("/repo/.git/COMMIT_EDITMSG"),
+            &[]
+        ));
+    }
+
+    /// Regression for #2761: the global per-file store must neither persist
+    /// nor restore state for a path matching the ephemeral patterns.
+    #[test]
+    fn test_persisted_file_workspace_skips_ephemeral_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let git_dir = temp.path().join("repo").join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let msg_path = git_dir.join("COMMIT_EDITMSG");
+        std::fs::write(&msg_path, "First commit message\n").unwrap();
+
+        let state = SerializedFileState {
+            cursor: SerializedCursor {
+                position: 15,
+                anchor: None,
+                sticky_column: 0,
+            },
+            additional_cursors: Vec::new(),
+            scroll: SerializedScroll {
+                top_byte: 0,
+                top_view_line_offset: 0,
+                left_column: 0,
+            },
+            view_mode: Default::default(),
+            compose_width: None,
+            line_numbers: None,
+            line_wrap: None,
+            virtual_space: None,
+            indentation_guide: None,
+            fold_indicators: None,
+            use_tabs: None,
+            whitespace_indicators: None,
+            tab_indicators: None,
+            highlight_current_line: None,
+            highlight_occurrences: None,
+            plugin_state: std::collections::HashMap::new(),
+            folds: Vec::new(),
+        };
+
+        let patterns = crate::config::default_ephemeral_file_patterns();
+        PersistedFileWorkspace::save(&msg_path, state.clone(), &patterns);
+        assert!(
+            PersistedFileWorkspace::load(&msg_path, &patterns).is_none(),
+            "state saved for a .git-internal file must never be restored"
+        );
+
+        // Same store, a non-git file, excluded purely by configuration.
+        let scratch = temp.path().join("codegen.tmp");
+        std::fs::write(&scratch, "generated\n").unwrap();
+        let custom = vec!["*.tmp".to_string()];
+        PersistedFileWorkspace::save(&scratch, state, &custom);
+        assert!(
+            PersistedFileWorkspace::load(&scratch, &custom).is_none(),
+            "a configured pattern must exclude a non-git file from the store"
+        );
     }
 }

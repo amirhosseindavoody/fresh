@@ -22,10 +22,10 @@
 //! Building it is O(M) in the *marker* count; painting is O(track_height).
 //! Neither term is proportional to file size.
 //!
-//! The buckets are cached and rebuilt only when their [`BucketKey`] changes
+//! The buckets are cached and rebuilt only when their [`ProjectionKey`] changes
 //! (marker set, buffer content, geometry, or basis), so a steady-state frame
 //! costs one key comparison. This is the same version-keyed staleness idiom as
-//! [`crate::view::visual_row_index::VisualRowIndex`].
+//! [`crate::view::line_wrap_cache::LineWrapCache`].
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -69,7 +69,7 @@ pub enum MarkerBasis {
 }
 
 impl MarkerBasis {
-    fn total(&self) -> u64 {
+    pub fn total(&self) -> u64 {
         match *self {
             MarkerBasis::VisualRows { total }
             | MarkerBasis::LogicalLines { total }
@@ -126,6 +126,12 @@ impl ScrollbarMarkerManager {
     /// Shift all anchors for a deletion. O(log n).
     pub fn adjust_for_delete(&mut self, position: usize, length: usize) {
         self.markers.adjust_for_delete(position, length);
+    }
+
+    /// Shift all anchors for a whole bulk edit at once.
+    /// See [`MarkerList::adjust_for_bulk_edits`].
+    pub fn adjust_for_bulk_edits(&mut self, edits: &[(usize, usize, usize)]) {
+        self.markers.adjust_for_bulk_edits(edits);
     }
 
     /// Replace a namespace's entire marker set.
@@ -207,13 +213,13 @@ impl ScrollbarMarkerManager {
         let take = resolved.len().min(room);
 
         for m in resolved.into_iter().take(take) {
-            // Start anchors with left affinity so text typed at the marked
-            // position pushes the marker along with its content.
-            let start = self.markers.create(m.start, true);
+            // Right gravity, so text typed at the marked position pushes the
+            // marker along with its content.
+            let start = self.markers.create(m.start);
             let end = m
                 .end
                 .filter(|e| *e > m.start)
-                .map(|e| self.markers.create(e, false));
+                .map(|e| self.markers.create(e));
             entries.push(MarkerEntry {
                 start,
                 end,
@@ -274,25 +280,95 @@ impl ResolvedMarker {
             (None, Some(l)) => line_to_byte(l as usize)?,
             (None, None) => return None,
         };
+        // `end_line` is inclusive, so its *start* byte is the right end
+        // coordinate: the projection maps it to that line's row, which is the
+        // last row the streak should cover. An unresolvable end line degrades
+        // to a point marker rather than dropping the marker entirely.
+        let end = match (marker.end, marker.end_line) {
+            (Some(e), _) => Some(e as usize),
+            (None, Some(l)) => line_to_byte(l as usize),
+            (None, None) => None,
+        };
         Some(Self {
             start,
-            end: marker.end.map(|e| e as usize),
+            end,
             color: marker.color.clone(),
             priority: marker.priority.unwrap_or(0),
         })
     }
 }
 
-/// Cache key for a projected bucket column.
+/// Marks the editor contributes itself, alongside the plugin-owned ones.
+///
+/// Today that is the unsaved-change diff (`Buffer::diff_since_saved`): the
+/// same byte ranges that draw the gutter's blue bar, in the same colour, so a
+/// change reads identically on both surfaces. Unlike plugin markers these are
+/// not anchored — they are derived from the buffer's own save snapshot and
+/// recomputed whenever [`ProjectionKey::core_version`] moves, so there is
+/// nothing to keep glued through edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreMarks {
+    /// Half-open byte ranges in the current buffer.
+    pub ranges: Vec<std::ops::Range<usize>>,
+    pub color: OverlayColorSpec,
+    pub priority: i32,
+}
+
+impl CoreMarks {
+    /// The exact `(start, last covered byte)` pairs the projection looks up.
+    ///
+    /// A range is half-open, so its last covered byte is `end - 1`; projecting
+    /// `end` itself would spill the streak onto the row after the change
+    /// whenever a range stops on a row boundary.
+    ///
+    /// Callers that must pre-resolve coordinates — the logical-line basis
+    /// builds a byte→line map before projecting — have to seed that map from
+    /// *these* bytes. Deriving them in one place is what keeps the two sides
+    /// from disagreeing: a lookup miss would answer row 0 and pile marks at
+    /// the top of the track.
+    pub fn endpoints(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.ranges
+            .iter()
+            .map(|r| (r.start, r.end.saturating_sub(1).max(r.start)))
+    }
+}
+
+/// Cache key for the marks resolved to rows.
+///
+/// Public so a caller can probe [`ScrollbarMarkerBuckets::cached_rows`]
+/// *before* computing the inputs a rebuild needs — gathering [`CoreMarks`]
+/// costs a whole-buffer diff, which must not happen on a steady-state frame.
+/// The track is not part of the key: rows do not depend on one, and a resize
+/// costs no rebuild.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BucketKey {
+pub struct ProjectionKey {
     marker_version: u64,
     /// Buffer/decoration pipeline version — anchors move when the buffer
     /// changes even if the marker set itself did not.
     content_version: u64,
-    track_height: u16,
+    /// Version of the editor-contributed marks. Separate from
+    /// `content_version` because a save changes what they cover without
+    /// changing the content.
+    core_version: u64,
     basis_tag: u8,
     basis_total: u64,
+}
+
+impl ProjectionKey {
+    pub fn new(
+        manager: &ScrollbarMarkerManager,
+        content_version: u64,
+        core_version: u64,
+        basis: MarkerBasis,
+    ) -> Self {
+        Self {
+            marker_version: manager.version(),
+            content_version,
+            core_version,
+            basis_tag: basis.tag(),
+            basis_total: basis.total(),
+        }
+    }
 }
 
 /// One track cell's winning marker.
@@ -302,128 +378,184 @@ pub struct MarkerCell {
     pub priority: i32,
 }
 
-/// Projected marker column for one scrollbar geometry.
+/// This buffer's marks resolved to rows, kept for the frames in which nothing
+/// that affects them changed, with what resolving has cost so far.
 ///
-/// Holds a small FIFO of recently used projections so two splits of the same
-/// buffer at different heights don't thrash a single slot (the
-/// `LineWrapCache` pattern in miniature).
+/// The half of a projection that needs the buffer. The other half — dividing
+/// the rows onto a track — is arithmetic the bar's leaf does per paint
+/// ([`bucket`]), so two splits of one buffer at different heights share one
+/// resolution and no track is remembered here.
 #[derive(Debug, Default)]
 pub struct ScrollbarMarkerBuckets {
-    entries: Vec<(BucketKey, Vec<Option<MarkerCell>>)>,
+    stats: ProjectionStats,
+    /// The marks resolved to rows, by the key they were resolved under.
+    rows: Option<(ProjectionKey, std::rc::Rc<[RowMark]>)>,
 }
 
-/// How many distinct scrollbar geometries to keep projected at once.
-const MAX_CACHED_PROJECTIONS: usize = 4;
+/// How much resolving has actually cost this buffer.
+///
+/// A rebuild — resolving the marks to rows — walks every stored marker, so
+/// `markers_walked / marker count` is
+/// how many times the whole set has been re-projected — the number that
+/// separates "projected once, then cached" from "re-projected on every frame
+/// of a scroll". Kept per-buckets rather than in a process-wide counter so
+/// concurrent tests (and split panes) observe only their own work.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectionStats {
+    pub rebuilds: u64,
+    pub markers_walked: u64,
+}
 
 impl ScrollbarMarkerBuckets {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn clear(&mut self) {
-        self.entries.clear();
+    /// Resolution work done for this buffer so far. See [`ProjectionStats`].
+    pub fn stats(&self) -> ProjectionStats {
+        self.stats
     }
 
-    fn lookup(&self, key: &BucketKey) -> Option<usize> {
-        self.entries.iter().position(|(k, _)| k == key)
-    }
-
-    /// Most recently projected column for a track of this height, if one is
-    /// cached.
+    /// The resolved rows for `key`, when the last resolution was under it.
     ///
-    /// Read-only companion to [`project`], for consumers that run after the
-    /// render pass has already projected (the web UI builds its scene from
-    /// data rather than from painted cells, so it needs the same column the
-    /// terminal just painted — without re-deriving the basis).
-    pub fn latest_for_height(&self, track_height: usize) -> Option<&[Option<MarkerCell>]> {
-        let h = track_height.min(u16::MAX as usize) as u16;
-        self.entries
-            .iter()
-            .rev()
-            .find(|(k, _)| k.track_height == h)
-            .map(|(_, cells)| cells.as_slice())
+    /// Lets a caller skip gathering the rebuild's inputs on a hit — see
+    /// [`CoreMarks`].
+    pub fn cached_rows(&self, key: &ProjectionKey) -> Option<std::rc::Rc<[RowMark]>> {
+        self.rows
+            .as_ref()
+            .filter(|(k, _)| k == key)
+            .map(|(_, r)| r.clone())
+    }
+
+    pub fn cache_rows(&mut self, key: ProjectionKey, rows: std::rc::Rc<[RowMark]>) {
+        self.rows = Some((key, rows));
+    }
+
+    /// Count one rebuild that walked `markers` marks — a row resolution
+    /// (`resolve_scrollbar_marks`) as much as a track projection.
+    pub fn note_rebuild(&mut self, markers: u64) {
+        self.stats.rebuilds += 1;
+        self.stats.markers_walked += markers;
     }
 }
 
-/// Project markers onto a track column, reusing the cached projection when
-/// nothing that affects it has changed.
+/// One mark in the basis's own coordinates — a row span with what decides
+/// which mark owns a contended track cell — ready to be bucketed onto any
+/// track height.
 ///
-/// `row_of_byte` maps a byte offset to a coordinate in `basis`'s space; the
-/// caller supplies the regime-appropriate lookup (identity for bytes,
-/// `get_line_number` for lines, the visual-row index for wrapped rows).
-///
-/// # Geometry
-///
-/// A marker at coordinate `c` is painted at row `c * H / total`. That is not
-/// an approximation of the thumb's mapping — it is the same mapping. With
-/// thumb size `ts = V/T * H` (`V` = viewport height, `T` = total), the thumb
-/// top for a viewport starting at `c` is
-///
-/// ```text
-/// c * (H - ts) / (T - V) = c * H * (1 - V/T) / (T - V) = c * H / T
-/// ```
-///
-/// so a marker sits exactly on the thumb's top row when its content is
-/// scrolled to the top of the viewport, and the thumb's span covers exactly
-/// the markers whose content is on screen. They diverge only where the
-/// renderer clamps thumb size (minimum 1 row, maximum 80% of track), which is
-/// sub-cell at realistic sizes.
-pub fn project<'a>(
-    manager: &ScrollbarMarkerManager,
-    buckets: &'a mut ScrollbarMarkerBuckets,
-    basis: MarkerBasis,
-    track_height: usize,
-    content_version: u64,
-    row_of_byte: impl FnMut(usize) -> u64,
-) -> &'a [Option<MarkerCell>] {
-    let key = BucketKey {
-        marker_version: manager.version(),
-        content_version,
-        track_height: track_height.min(u16::MAX as usize) as u16,
-        basis_tag: basis.tag(),
-        basis_total: basis.total(),
-    };
-
-    if let Some(idx) = buckets.lookup(&key) {
-        return &buckets.entries[idx].1;
-    }
-
-    let cells = build_cells(manager, basis, track_height, row_of_byte);
-
-    if buckets.entries.len() >= MAX_CACHED_PROJECTIONS {
-        buckets.entries.remove(0);
-    }
-    buckets.entries.push((key, cells));
-    let last = buckets.entries.len() - 1;
-    &buckets.entries[last].1
+/// **The half of a projection that needs the buffer, kept apart from the
+/// half that needs the track.** Resolving a byte to a row asks the buffer
+/// (`get_line_number`, the wrap index); dividing rows onto a track is
+/// arithmetic. The pane's scrollbar is a leaf that learns its track from
+/// layout, so the editor resolves the rows once per change and the leaf
+/// buckets them onto whatever track it is given (`bucket`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowMark {
+    pub start: u64,
+    pub end: Option<u64>,
+    pub color: OverlayColorSpec,
+    pub priority: i32,
+    /// `SOURCE_CORE` or `SOURCE_PLUGIN`: a plugin marker of *equal* priority
+    /// beats a core mark, the precedence the gutter applies too.
+    source: u8,
+    /// The mark's start byte: the last tie-breaker, so a contended cell's
+    /// colour never depends on paint order.
+    tie: usize,
 }
 
-fn build_cells(
+impl RowMark {
+    /// A plugin-sourced mark at `start..end` rows, for tests of the bar.
+    #[cfg(test)]
+    pub(crate) fn test(start: u64, end: Option<u64>, priority: i32) -> RowMark {
+        RowMark {
+            start,
+            end,
+            color: OverlayColorSpec::Rgb(0, 0, 0),
+            priority,
+            source: SOURCE_PLUGIN,
+            tie: start as usize,
+        }
+    }
+}
+
+/// Resolve every mark — the plugin markers and the editor's own unsaved
+/// change ranges — to rows in `basis`'s space.
+pub fn resolve_rows(
     manager: &ScrollbarMarkerManager,
+    core: Option<&CoreMarks>,
     basis: MarkerBasis,
-    track_height: usize,
     mut row_of_byte: impl FnMut(usize) -> u64,
-) -> Vec<Option<MarkerCell>> {
+) -> Vec<RowMark> {
+    let total = basis.total().max(1);
+    let mut at = |byte: usize| row_of_byte(byte).min(total.saturating_sub(1));
+    let mut out = Vec::with_capacity(manager.len() + core.map_or(0, |c| c.ranges.len()));
+    // Core ranges project through `endpoints()` — the same pairs any caller
+    // that pre-resolves coordinates seeded its map from. (Plugin markers keep
+    // their documented exclusive-`end` projection: their ends are
+    // line-relative, where the difference is sub-cell.)
+    if let Some(c) = core {
+        for (s, e) in c.endpoints() {
+            // A one-byte range is one coordinate lookup, not two.
+            let start = at(s);
+            let end = (e > s).then(|| at(e));
+            out.push(RowMark {
+                start,
+                end,
+                color: c.color.clone(),
+                priority: c.priority,
+                source: SOURCE_CORE,
+                tie: s,
+            });
+        }
+    }
+    for m in manager.resolved() {
+        out.push(RowMark {
+            start: at(m.start),
+            end: m.end.map(&mut at),
+            color: m.color,
+            priority: m.priority,
+            source: SOURCE_PLUGIN,
+            tie: m.start,
+        });
+    }
+    out
+}
+
+/// Bucket resolved marks onto a `track_height`-tall column.
+///
+/// A mark at row `c` of `total` lands at cell `c * H / total` — the thumb's
+/// own mapping, so a mark sits on the thumb's top cell when its content is
+/// scrolled to the top of the viewport. Which mark owns a contended cell is
+/// decided by a total order over the marks themselves — priority, then
+/// source, then position — never by the order they are walked in.
+pub fn bucket(rows: &[RowMark], total: u64, track_height: usize) -> Vec<Option<MarkerCell>> {
     let mut cells: Vec<Option<MarkerCell>> = vec![None; track_height];
     if track_height == 0 {
         return cells;
     }
-    let total = basis.total().max(1);
+    let total = total.max(1);
     let h = track_height as u64;
-
-    for m in manager.resolved() {
-        let start_row = (row_of_byte(m.start).min(total.saturating_sub(1)) * h / total) as usize;
+    let mut best: Vec<Option<CellRank>> = vec![None; track_height];
+    for m in rows {
+        let start_row = (m.start.min(total - 1) * h / total) as usize;
         let end_row = match m.end {
-            Some(e) if e > m.start => {
-                (row_of_byte(e).min(total.saturating_sub(1)) * h / total) as usize
-            }
+            Some(e) if e > m.start => (e.min(total - 1) * h / total) as usize,
             _ => start_row,
         };
-
-        let last = end_row.min(track_height - 1);
-        for cell in cells[start_row..=last].iter_mut() {
-            let better = match cell {
-                Some(existing) => m.priority >= existing.priority,
+        // `max(start_row)` is a guard, not arithmetic: a resolution that
+        // answered non-monotonically would otherwise index a backwards range
+        // and panic — in the render path, where a wrong mark is survivable
+        // and a crash is not.
+        let last = end_row.max(start_row).min(track_height - 1);
+        let candidate = CellRank {
+            priority: m.priority,
+            source: m.source,
+            start: m.tie,
+        };
+        let span = start_row.min(last)..=last;
+        for (cell, held) in cells[span.clone()].iter_mut().zip(best[span].iter_mut()) {
+            let better = match held {
+                Some(existing) => candidate.beats(existing),
                 None => true,
             };
             if better {
@@ -431,11 +563,38 @@ fn build_cells(
                     color: m.color.clone(),
                     priority: m.priority,
                 });
+                *held = Some(candidate);
             }
         }
     }
-
     cells
+}
+
+const SOURCE_CORE: u8 = 0;
+const SOURCE_PLUGIN: u8 = 1;
+
+/// The ranking key that decides a contended cell, highest wins.
+///
+/// Every field is a property of the marker, so the winner is the same however
+/// the marker set was assembled — and, for a set that grows as the user
+/// explores the document, a cell keeps the colour it had once a
+/// higher-ranking marker for it exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellRank {
+    priority: i32,
+    source: u8,
+    /// Earlier position wins an otherwise exact tie, so two markers of the
+    /// same priority and source resolve by document order rather than by
+    /// whichever was published last.
+    start: usize,
+}
+
+impl CellRank {
+    fn beats(&self, other: &CellRank) -> bool {
+        (self.priority, self.source) > (other.priority, other.source)
+            || ((self.priority, self.source) == (other.priority, other.source)
+                && self.start < other.start)
+    }
 }
 
 #[cfg(test)]
@@ -539,6 +698,7 @@ mod tests {
             position: None,
             line: Some(42),
             end: None,
+            end_line: None,
             color: red(),
             priority: None,
         };
@@ -551,12 +711,44 @@ mod tests {
         );
     }
 
+    /// A line-coordinate producer (a `git diff` parser) can span a hunk with
+    /// one marker instead of one per line.
+    #[test]
+    fn from_api_resolves_an_inclusive_end_line() {
+        let m = ScrollbarMarker {
+            position: None,
+            line: Some(10),
+            end: None,
+            end_line: Some(14),
+            color: red(),
+            priority: None,
+        };
+        let r = ResolvedMarker::from_api(&m, |l| Some(l * 10)).unwrap();
+        assert_eq!((r.start, r.end), (100, Some(140)));
+    }
+
+    /// An explicit byte `end` wins, matching how `position` beats `line`.
+    #[test]
+    fn from_api_prefers_byte_end_over_end_line() {
+        let m = ScrollbarMarker {
+            position: Some(0),
+            line: None,
+            end: Some(55),
+            end_line: Some(14),
+            color: red(),
+            priority: None,
+        };
+        let r = ResolvedMarker::from_api(&m, |l| Some(l * 10)).unwrap();
+        assert_eq!(r.end, Some(55));
+    }
+
     #[test]
     fn from_api_prefers_byte_position_over_line() {
         let m = ScrollbarMarker {
             position: Some(7),
             line: Some(42),
             end: None,
+            end_line: None,
             color: red(),
             priority: None,
         };
@@ -573,16 +765,17 @@ mod tests {
         total: u64,
         track: usize,
     ) -> Vec<Option<MarkerCell>> {
-        let mut buckets = ScrollbarMarkerBuckets::new();
-        project(
-            mgr,
-            &mut buckets,
-            MarkerBasis::Bytes { total },
-            track,
-            0,
-            |b| b as u64,
-        )
-        .to_vec()
+        project_bytes_with(mgr, None, total, track)
+    }
+
+    fn project_bytes_with(
+        mgr: &ScrollbarMarkerManager,
+        core: Option<&CoreMarks>,
+        total: u64,
+        track: usize,
+    ) -> Vec<Option<MarkerCell>> {
+        let basis = MarkerBasis::Bytes { total };
+        bucket(&resolve_rows(mgr, core, basis, |b| b as u64), total, track)
     }
 
     #[test]
@@ -653,91 +846,110 @@ mod tests {
         assert_eq!(cells[5].as_ref().unwrap().color, red());
     }
 
+    /// A contended cell must not depend on the order its markers were
+    /// published in. Markers for a namespace that publishes viewport by
+    /// viewport (markdown headings) arrive in the reader's scroll order, so
+    /// ranking on paint order made the cell change colour under them.
     #[test]
-    fn projection_is_cached_until_markers_change() {
-        let mut mgr = ScrollbarMarkerManager::new();
-        mgr.set_markers("ns", vec![point(500, 0, red())]);
-        let mut buckets = ScrollbarMarkerBuckets::new();
-
-        let mut calls = 0usize;
-        for _ in 0..5 {
-            project(
-                &mgr,
-                &mut buckets,
-                MarkerBasis::Bytes { total: 1000 },
-                10,
-                0,
-                |b| {
-                    calls += 1;
-                    b as u64
-                },
-            );
-        }
-        assert_eq!(calls, 1, "steady-state frames must not re-project");
-
-        mgr.set_markers("ns", vec![point(600, 0, red())]);
-        project(
-            &mgr,
-            &mut buckets,
-            MarkerBasis::Bytes { total: 1000 },
-            10,
-            0,
-            |b| {
-                calls += 1;
-                b as u64
-            },
-        );
-        assert_eq!(calls, 2, "a marker change must invalidate the projection");
-    }
-
-    #[test]
-    fn projection_reruns_when_content_version_changes() {
-        let mgr = {
-            let mut m = ScrollbarMarkerManager::new();
-            m.set_markers("ns", vec![point(500, 0, red())]);
-            m
+    fn shared_cell_ignores_publication_order() {
+        // Same two markers, same cell, opposite publication order.
+        let deep_first = {
+            let mut mgr = ScrollbarMarkerManager::new();
+            mgr.set_markers_in_range("md", 500, 510, vec![point(505, 1, blue())]);
+            mgr.set_markers_in_range("md", 495, 500, vec![point(497, 5, red())]);
+            project_bytes(&mgr, 1000, 10)
         };
-        let mut buckets = ScrollbarMarkerBuckets::new();
-        let mut calls = 0usize;
-        for v in [0u64, 0, 1] {
-            project(
-                &mgr,
-                &mut buckets,
-                MarkerBasis::Bytes { total: 1000 },
-                10,
-                v,
-                |b| {
-                    calls += 1;
-                    b as u64
-                },
-            );
-        }
-        assert_eq!(calls, 2);
+        let shallow_first = {
+            let mut mgr = ScrollbarMarkerManager::new();
+            mgr.set_markers_in_range("md", 495, 500, vec![point(497, 5, red())]);
+            mgr.set_markers_in_range("md", 500, 510, vec![point(505, 1, blue())]);
+            project_bytes(&mgr, 1000, 10)
+        };
+
+        assert_eq!(
+            deep_first[4].as_ref().unwrap().color,
+            red(),
+            "the higher-priority marker owns the cell however it was published"
+        );
+        assert_eq!(
+            deep_first[4].as_ref().map(|c| &c.color),
+            shallow_first[4].as_ref().map(|c| &c.color),
+            "publication order must not change the winner"
+        );
     }
 
+    /// With priority and source equal there is still a stable answer: the
+    /// marker earlier in the document.
     #[test]
-    fn distinct_track_heights_both_stay_cached() {
+    fn exact_tie_resolves_by_document_order() {
+        let earlier_last = {
+            let mut mgr = ScrollbarMarkerManager::new();
+            mgr.set_markers_in_range("md", 505, 510, vec![point(505, 3, blue())]);
+            mgr.set_markers_in_range("md", 500, 505, vec![point(501, 3, red())]);
+            project_bytes(&mgr, 1000, 10)
+        };
+        let earlier_first = {
+            let mut mgr = ScrollbarMarkerManager::new();
+            mgr.set_markers_in_range("md", 500, 505, vec![point(501, 3, red())]);
+            mgr.set_markers_in_range("md", 505, 510, vec![point(505, 3, blue())]);
+            project_bytes(&mgr, 1000, 10)
+        };
+
+        assert_eq!(earlier_last[5].as_ref().unwrap().color, red());
+        assert_eq!(earlier_first[5].as_ref().unwrap().color, red());
+    }
+
+    /// The rows a resolution produced are kept under the key it ran under —
+    /// the marker set, the content and the core marks' versions, the basis —
+    /// and a change to any of them is a miss. The track is not in the key:
+    /// the same rows serve every height.
+    #[test]
+    fn resolved_rows_are_kept_until_their_inputs_change() {
         let mut mgr = ScrollbarMarkerManager::new();
         mgr.set_markers("ns", vec![point(500, 0, red())]);
+        let basis = MarkerBasis::Bytes { total: 1000 };
+        let rows: std::rc::Rc<[RowMark]> =
+            std::rc::Rc::from(resolve_rows(&mgr, None, basis, |b| b as u64));
+
         let mut buckets = ScrollbarMarkerBuckets::new();
-        let mut calls = 0usize;
-        // Two splits at different heights, alternating frames.
-        for _ in 0..4 {
-            for h in [10usize, 25] {
-                project(
-                    &mgr,
-                    &mut buckets,
-                    MarkerBasis::Bytes { total: 1000 },
-                    h,
-                    0,
-                    |b| {
-                        calls += 1;
-                        b as u64
-                    },
-                );
-            }
+        let key = ProjectionKey::new(&mgr, 0, 0, basis);
+        assert!(buckets.cached_rows(&key).is_none(), "nothing resolved yet");
+        buckets.cache_rows(key, rows.clone());
+        buckets.note_rebuild(mgr.len() as u64);
+        assert!(
+            buckets
+                .cached_rows(&ProjectionKey::new(&mgr, 0, 0, basis))
+                .is_some(),
+            "the same inputs hit"
+        );
+        assert_eq!(buckets.stats().rebuilds, 1);
+
+        assert!(
+            buckets
+                .cached_rows(&ProjectionKey::new(&mgr, 1, 0, basis))
+                .is_none(),
+            "a content change misses"
+        );
+        assert!(
+            buckets
+                .cached_rows(&ProjectionKey::new(&mgr, 0, 1, basis))
+                .is_none(),
+            "a save (the core marks' version) misses"
+        );
+        mgr.set_markers("ns", vec![point(600, 0, red())]);
+        assert!(
+            buckets
+                .cached_rows(&ProjectionKey::new(&mgr, 0, 0, basis))
+                .is_none(),
+            "a marker change misses"
+        );
+
+        // And the rows bucket onto any track without another resolution.
+        for h in [10usize, 25] {
+            let cells = bucket(&rows, 1000, h);
+            assert_eq!(cells.len(), h);
+            assert!(cells.iter().any(Option::is_some));
         }
-        assert_eq!(calls, 2, "each geometry projects once, then stays cached");
     }
 
     #[test]
@@ -754,5 +966,66 @@ mod tests {
         mgr.set_markers("ns", vec![point(10_000, 0, red())]);
         let cells = project_bytes(&mgr, 1000, 10);
         assert!(cells[9].is_some());
+    }
+
+    // --- editor-contributed marks ---
+
+    fn core(ranges: &[std::ops::Range<usize>], priority: i32) -> CoreMarks {
+        CoreMarks {
+            ranges: ranges.to_vec(),
+            color: blue(),
+            priority,
+        }
+    }
+
+    fn core_one(start: usize, end: usize, priority: i32) -> CoreMarks {
+        core(std::slice::from_ref(&(start..end)), priority)
+    }
+
+    /// The unsaved-change case: no plugin has set anything, and the editor's
+    /// own ranges still reach the track.
+    #[test]
+    fn core_marks_paint_with_no_plugin_markers_at_all() {
+        let mgr = ScrollbarMarkerManager::new();
+        let cells = project_bytes_with(&mgr, Some(&core_one(500, 510, 5)), 1000, 10);
+        assert_eq!(cells[5].as_ref().unwrap().color, blue());
+        assert!(cells[0].is_none() && cells[9].is_none());
+    }
+
+    /// A range spanning a chunk of the file paints a proportional streak, not
+    /// a dot — a big unsaved edit should read as a big mark.
+    #[test]
+    fn core_range_paints_every_row_it_spans() {
+        let mgr = ScrollbarMarkerManager::new();
+        let cells = project_bytes_with(&mgr, Some(&core_one(200, 600, 5)), 1000, 10);
+        let painted: Vec<usize> = cells
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        // Bytes 200..=599 of 1000 over a 10-row track: rows 2 through 5. Row 6
+        // belongs to byte 600, which the half-open range does not cover.
+        assert_eq!(painted, vec![2, 3, 4, 5]);
+    }
+
+    /// Precedence mirrors the gutter: a plugin marker of equal-or-higher
+    /// priority takes the cell, so a git hunk (10) is never hidden by the
+    /// unsaved-change mark (5) they both land on.
+    #[test]
+    fn plugin_marker_outranks_a_core_mark_on_the_same_cell() {
+        let mut mgr = ScrollbarMarkerManager::new();
+        mgr.set_markers("ns", vec![point(500, 10, red())]);
+        let cells = project_bytes_with(&mgr, Some(&core_one(500, 501, 5)), 1000, 10);
+        assert_eq!(cells[5].as_ref().unwrap().color, red());
+    }
+
+    /// ...and a lower-priority plugin marker does not displace a core mark.
+    #[test]
+    fn core_mark_holds_its_cell_against_a_lower_priority_marker() {
+        let mut mgr = ScrollbarMarkerManager::new();
+        mgr.set_markers("ns", vec![point(500, 1, red())]);
+        let cells = project_bytes_with(&mgr, Some(&core_one(500, 501, 5)), 1000, 10);
+        assert_eq!(cells[5].as_ref().unwrap().color, blue());
     }
 }

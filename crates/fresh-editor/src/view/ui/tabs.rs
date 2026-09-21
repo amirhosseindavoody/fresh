@@ -1,19 +1,20 @@
-//! Tab bar rendering for multiple buffers
+//! The tab strip's model: which name a tab shows (`resolve_tab_names`), how
+//! it is elided, and the scroll offset that keeps the active tab in view
+//! (`calculate_tab_widths`, `scroll_to_show_tab`).
+//!
+//! **The strips are the tree's** (`view::shell::tabs`): each tab is a node
+//! that answers its own press and reports its own hover, the web reads their
+//! rectangles back by key, and an embedded window's strips are the same nodes
+//! in the embed's own tree (`shell_host::paint_embed`). Nothing here paints.
 
-use crate::app::types::CellThemeRecorder;
 use crate::app::BufferMetadata;
 use crate::model::event::{BufferId, LeafId};
 use crate::primitives::display_width::{char_width, str_width};
 use crate::state::EditorState;
 use crate::view::split::TabTarget;
-use crate::view::ui::layout::point_in_rect;
-use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Widget;
-use ratatui::widgets::{Block, Paragraph};
-use rust_i18n::t;
+use fresh_i18n::t;
 use std::collections::HashMap;
+use std::path::{Component, Path, MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
 
 /// Returns true iff `t` is the editor's single preview tab. `preview_buffer`
 /// is `window.preview`'s buffer id (the source of truth); groups are never
@@ -32,144 +33,7 @@ fn preview_suffix(t: &TabTarget, preview_buffer: Option<BufferId>) -> String {
     }
 }
 
-/// Hit area for a single tab
-#[derive(Debug, Clone)]
-pub struct TabHitArea {
-    /// The tab target this tab represents (buffer or group)
-    pub target: TabTarget,
-    /// The resolved, disambiguated display label (the filename for file
-    /// buffers, the group name for groups) — the *same* string the TUI draws
-    /// and the tab width was computed from. Non-cell frontends (the web) render
-    /// this directly so they can't diverge from the terminal on tab text.
-    pub label: String,
-    /// The area covering the tab name (clickable to switch to the target)
-    pub tab_area: Rect,
-    /// The area covering the close button
-    pub close_area: Rect,
-}
-
-impl TabHitArea {
-    /// Backwards-compatible access: returns the buffer id if this is a buffer tab.
-    pub fn buffer_id(&self) -> Option<BufferId> {
-        self.target.as_buffer()
-    }
-}
-
-/// Layout information for hit testing tab interactions
-///
-/// Returned by `TabsRenderer::render_for_split()` to enable mouse hit testing
-/// without duplicating position calculations.
-#[derive(Debug, Clone, Default)]
-pub struct TabLayout {
-    /// Hit areas for each visible tab
-    pub tabs: Vec<TabHitArea>,
-    /// The full tab bar area
-    pub bar_area: Rect,
-    /// Hit area for the left scroll button (if shown)
-    pub left_scroll_area: Option<Rect>,
-    /// Hit area for the right scroll button (if shown)
-    pub right_scroll_area: Option<Rect>,
-    /// Hit area for the trailing "+" new-tab button (if visible)
-    pub new_tab_area: Option<Rect>,
-    /// Whether the tabs overflow the right edge of the bar (later tabs are
-    /// scrolled off). When the split-control cluster is drawn externally (see
-    /// [`render_for_split`]'s `external_controls`), the `>` glyph is painted by
-    /// the orchestration layer, not here, so it consults this flag to decide
-    /// whether to draw a right-scroll indicator in the cluster.
-    pub right_overflow: bool,
-}
-
-/// Hit test result for tab interactions
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TabHit {
-    /// Hit the tab name area (click to switch to this target)
-    TabName(TabTarget),
-    /// Hit the close button area
-    CloseButton(TabTarget),
-    /// Hit the tab bar background
-    BarBackground,
-    /// Hit the left scroll button
-    ScrollLeft,
-    /// Hit the right scroll button
-    ScrollRight,
-    /// Hit the trailing "+" new-tab button
-    NewTabButton,
-}
-
-impl TabLayout {
-    /// Create a new empty layout
-    pub fn new(bar_area: Rect) -> Self {
-        Self {
-            tabs: Vec::new(),
-            bar_area,
-            left_scroll_area: None,
-            right_scroll_area: None,
-            new_tab_area: None,
-            right_overflow: false,
-        }
-    }
-
-    /// Perform a hit test to determine what element is at the given position
-    pub fn hit_test(&self, x: u16, y: u16) -> Option<TabHit> {
-        // Check scroll buttons first (they're at the edges)
-        if let Some(left_area) = self.left_scroll_area {
-            tracing::debug!(
-                "Tab hit_test: checking left_scroll_area {:?} against ({}, {})",
-                left_area,
-                x,
-                y
-            );
-            if point_in_rect(left_area, x, y) {
-                tracing::debug!("Tab hit_test: HIT ScrollLeft");
-                return Some(TabHit::ScrollLeft);
-            }
-        }
-        if let Some(right_area) = self.right_scroll_area {
-            tracing::debug!(
-                "Tab hit_test: checking right_scroll_area {:?} against ({}, {})",
-                right_area,
-                x,
-                y
-            );
-            if point_in_rect(right_area, x, y) {
-                tracing::debug!("Tab hit_test: HIT ScrollRight");
-                return Some(TabHit::ScrollRight);
-            }
-        }
-
-        for tab in &self.tabs {
-            // Check close button first (it's inside the tab area)
-            if point_in_rect(tab.close_area, x, y) {
-                return Some(TabHit::CloseButton(tab.target));
-            }
-            // Check tab area
-            if point_in_rect(tab.tab_area, x, y) {
-                return Some(TabHit::TabName(tab.target));
-            }
-        }
-
-        // Check the trailing "+" new-tab button
-        if let Some(new_tab_area) = self.new_tab_area {
-            if point_in_rect(new_tab_area, x, y) {
-                return Some(TabHit::NewTabButton);
-            }
-        }
-
-        // Check bar background
-        if point_in_rect(self.bar_area, x, y) {
-            return Some(TabHit::BarBackground);
-        }
-
-        None
-    }
-}
-
-/// Renders the tab bar showing open buffers
-pub struct TabsRenderer;
-
-/// The trailing "+" new-tab button cell text.
-const NEW_TAB_BUTTON_TEXT: &str = " + ";
-/// Display width (columns) of [`NEW_TAB_BUTTON_TEXT`].
+/// Display width (columns) of the trailing ` + ` new-tab button.
 pub const NEW_TAB_BUTTON_WIDTH: usize = 3;
 
 /// Columns reserved at the right edge of a split's tab row for the
@@ -185,15 +49,15 @@ pub const NEW_TAB_BUTTON_WIDTH: usize = 3;
 /// when `show_close`, and the `>` right-overflow slot is always reserved (the
 /// glyph is drawn only when the tabs actually overflow, but the column is held
 /// so the layout doesn't jump as you scroll). The `+` new-buffer button is
-/// *not* part of this cluster: it is drawn inline by `render_for_split` right
-/// after the last (visible) tab, exactly as in a single split (fresh#2768
+/// *not* part of this cluster: it sits inline right after the last (visible)
+/// tab, exactly as in a single split (fresh#2768
 /// follow-up). The tab bar lays out — and the tab-scroll math measures against
 /// — the pane width *minus* this reserve, so the scrolling tabs, the inline
 /// `+`, and the `<` left-overflow indicator never end up underneath the
 /// cluster.
 ///
 /// A pane with no control buttons (a single, unmaximized split) reserves
-/// nothing: there is no cluster, and `render_for_split` draws its own inline /
+/// nothing: there is no cluster, and the strip places its own inline /
 /// pinned `+` and `<`/`>` indicators exactly as an unsplit editor does.
 pub fn split_control_reserve(show_maximize: bool, show_close: bool) -> u16 {
     if !show_maximize && !show_close {
@@ -202,13 +66,6 @@ pub fn split_control_reserve(show_maximize: bool, show_close: bool) -> u16 {
     // gap(1) + right-overflow slot(1) + maximize + close + trailing blank(1).
     1 + 1 + show_maximize as u16 + show_close as u16 + 1
 }
-
-/// Glyph drawn at the left edge when earlier tabs are scrolled off.
-const SCROLL_INDICATOR_LEFT: &str = "<";
-/// Glyph drawn at the right edge when later tabs are scrolled off.
-const SCROLL_INDICATOR_RIGHT: &str = ">";
-/// Column width of either scroll indicator.
-const SCROLL_INDICATOR_WIDTH: usize = 1;
 
 /// Width available for laying out / scrolling the real tabs, given the total
 /// width of all tabs (including inter-tab separators) and the full tab-bar
@@ -309,7 +166,42 @@ const TAB_NAME_ELLIPSIS: &str = "…";
 /// button are budgeted separately, so this caps only the filename/group name.
 /// Without a cap a single very long name (e.g. 151 chars) consumes the whole
 /// strip and hides every other tab (issue #2650).
-const TAB_NAME_MAX_COLS: usize = 25;
+pub const TAB_NAME_MAX_COLS: usize = 25;
+
+/// Shorten a path-shaped label (`src/model/main.rs`) from the *front*, keeping
+/// the file name and as many trailing directories as fit behind a leading
+/// `…{sep}` marker — e.g. `…/model/main.rs`.
+///
+/// A tab whose name was disambiguated by path (see [`resolve_tab_names`])
+/// carries its identity in the last component, so the generic
+/// keep-the-leading-characters truncation would throw away exactly the part the
+/// user is looking for. Returns `None` when `name` has no separator, or when
+/// not even `…{sep}` plus the last component fits in `max_cols` — the caller
+/// then falls back to plain truncation.
+fn elide_path_label(name: &str, max_cols: usize) -> Option<String> {
+    let parts: Vec<&str> = name.split(MAIN_SEPARATOR).collect();
+    let (file, dirs) = parts.split_last()?;
+    if dirs.is_empty() {
+        return None;
+    }
+    let marker = format!("{TAB_NAME_ELLIPSIS}{MAIN_SEPARATOR}");
+    let mut width = str_width(&marker) + str_width(file);
+    if width > max_cols {
+        return None;
+    }
+    // Grow rightwards-first: prepend whole directories while they fit.
+    let mut kept: Vec<&str> = vec![file];
+    for dir in dirs.iter().rev() {
+        let extra = str_width(dir) + str_width(MAIN_SEPARATOR_STR);
+        if width + extra > max_cols {
+            break;
+        }
+        width += extra;
+        kept.push(dir);
+    }
+    kept.reverse();
+    Some(format!("{marker}{}", kept.join(MAIN_SEPARATOR_STR)))
+}
 
 /// Elide `name` to at most `max_cols` display columns, keeping the leading
 /// characters and appending a single `…` when it is truncated. Width is
@@ -317,12 +209,18 @@ const TAB_NAME_MAX_COLS: usize = 25;
 /// emoji names are truncated on whole characters and never split mid-codepoint.
 /// Returns `name` unchanged when it already fits.
 ///
-/// Both label builders — [`build_tab_spans`] and [`calculate_tab_widths`] — run
+/// Path-shaped labels are shortened from the front instead (see
+/// [`elide_path_label`]) so the file name survives.
+///
+/// The label builder ([`calculate_tab_widths`]) and the strip's nodes run
 /// the resolved name through this so their computed widths stay in lockstep; a
 /// mismatch would drift hit-testing and the scroll math.
-fn elided_tab_name(name: &str, max_cols: usize) -> String {
+pub fn elided_tab_name(name: &str, max_cols: usize) -> String {
     if str_width(name) <= max_cols {
         return name.to_string();
+    }
+    if let Some(elided) = elide_path_label(name, max_cols) {
+        return elided;
     }
     let budget = max_cols.saturating_sub(str_width(TAB_NAME_ELLIPSIS));
     let mut width = 0;
@@ -378,7 +276,7 @@ fn full_tab_label_width(
 /// overflow — the bar is "full" — is each name capped at [`TAB_NAME_MAX_COLS`]
 /// so one long filename can't hide every other tab (issue #2650).
 ///
-/// Both label builders ([`build_tab_spans`] and [`calculate_tab_widths`]) derive
+/// The label builder ([`calculate_tab_widths`]) and the strip derive
 /// their cap from this with the same `available_width`, so their computed widths
 /// stay in lockstep.
 fn tab_name_cap(
@@ -418,19 +316,70 @@ fn tab_name_cap(
     }
 }
 
-/// Resolve display names for tab targets, disambiguating duplicates by appending a number.
-/// For example, if there are three unnamed buffers, they become "[No Name]", "[No Name] 2", "[No Name] 3".
-/// Similarly, duplicate filenames get numbered: "main.rs", "main.rs 2".
+/// Display components of `path`, outermost first.
+///
+/// Only `Normal` components are kept: a root (`/`) or Windows drive prefix
+/// never helps tell two same-named files apart, and re-joining it would double
+/// the separator. Non-UTF-8 components are shown lossily rather than dropped,
+/// so a tab for such a file is still distinguishable.
+fn label_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The last `depth` components of `parts`, joined with the platform separator.
+/// A `depth` past the start of `parts` yields the whole path.
+fn path_tail(parts: &[String], depth: usize) -> String {
+    let start = parts.len().saturating_sub(depth);
+    parts[start..].join(MAIN_SEPARATOR_STR)
+}
+
+/// The shortest trailing path fragment of `parts` that none of `others` shares
+/// — `src/main.rs` when the collision is with `tests/main.rs`, `a/b/main.rs`
+/// when it takes two directories to separate them.
+///
+/// Depth 1 is the file name, which every member of a same-name group shares by
+/// construction, so the search starts at 2. Returns `None` when the paths stay
+/// identical all the way up (or the file has no parent directory at all), which
+/// leaves the caller to fall back to numbering.
+fn shortest_unique_tail(parts: &[String], others: &[&[String]]) -> Option<String> {
+    (2..=parts.len()).find_map(|depth| {
+        let tail = path_tail(parts, depth);
+        others
+            .iter()
+            .all(|other| path_tail(other, depth) != tail)
+            .then_some(tail)
+    })
+}
+
+/// Resolve display names for tab targets, disambiguating duplicates.
+///
+/// A tab is normally just the file's name. When several open tabs share that
+/// name — the common case in a workspace full of `mod.rs` / `index.ts` — each
+/// one is instead labelled with the shortest trailing path fragment that tells
+/// it apart from the others (`model/mod.rs` vs `view/mod.rs`), so the tab bar
+/// says which file it is without the user hovering or switching (issue #2851).
+///
+/// Tabs with no file path behind them (unnamed buffers, terminals, composite
+/// buffers, groups) can't be separated that way, so those — and any file whose
+/// path is identical to another's all the way up — keep the older numeric
+/// suffix: three unnamed buffers become "[No Name] 1", "[No Name] 2",
+/// "[No Name] 3".
 ///
 /// `group_names` provides the display name for each group tab (`TabTarget::Group`).
-fn resolve_tab_names(
+pub(crate) fn resolve_tab_names(
     tab_targets: &[TabTarget],
     buffers: &HashMap<BufferId, EditorState>,
     buffer_metadata: &HashMap<BufferId, BufferMetadata>,
     composite_buffers: &HashMap<BufferId, crate::model::composite_buffer::CompositeBuffer>,
     group_names: &HashMap<LeafId, String>,
 ) -> HashMap<TabTarget, String> {
-    let mut names: Vec<(TabTarget, String)> = Vec::new();
+    // (target, base name, path components when the tab is backed by a file).
+    let mut names: Vec<(TabTarget, String, Option<Vec<String>>)> = Vec::new();
 
     for t in tab_targets.iter() {
         match t {
@@ -452,25 +401,34 @@ fn resolve_tab_names(
                     .map(|mode| mode == "terminal")
                     .unwrap_or(false);
 
-                let name = if is_composite_buffer {
-                    meta.map(|m| m.display_name.as_str())
-                } else if is_terminal {
+                // Only real file buffers carry a path we can disambiguate by;
+                // terminals and composite buffers are named by their metadata.
+                let file_path = (!is_composite_buffer && !is_terminal)
+                    .then(|| buffers.get(id).and_then(|state| state.buffer.file_path()))
+                    .flatten();
+
+                let name = if is_composite_buffer || is_terminal {
                     meta.map(|m| m.display_name.as_str())
                 } else {
-                    buffers
-                        .get(id)
-                        .and_then(|state| state.buffer.file_path())
+                    file_path
                         .and_then(|p| p.file_name())
                         .and_then(|n| n.to_str())
                         .or_else(|| meta.map(|m| m.display_name.as_str()))
                 }
                 .unwrap_or("[No Name]");
 
-                names.push((*t, name.to_string()));
+                // Keep the path only when the label really is the file's name;
+                // a buffer falling back to its display name isn't described by
+                // its path, so a path fragment there would mislead.
+                let parts = file_path
+                    .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some(name))
+                    .map(label_components);
+
+                names.push((*t, name.to_string(), parts));
             }
             TabTarget::Group(leaf_id) => {
                 if let Some(name) = group_names.get(leaf_id) {
-                    names.push((*t, name.clone()));
+                    names.push((*t, name.clone(), None));
                 }
             }
         }
@@ -478,20 +436,51 @@ fn resolve_tab_names(
 
     // Count occurrences of each name
     let mut name_counts: HashMap<&str, usize> = HashMap::new();
-    for (_, name) in &names {
+    for (_, name, _) in &names {
         *name_counts.entry(name.as_str()).or_insert(0) += 1;
     }
 
-    // Assign disambiguated names — all duplicates get a number, including the first
+    // Duplicates first try a path fragment; whatever that can't separate
+    // (pathless buffers, or paths identical all the way up) is numbered below,
+    // per base name, exactly as before.
     let mut result = HashMap::new();
-    let mut name_indices: HashMap<String, usize> = HashMap::new();
-    for (t, name) in &names {
-        if name_counts.get(name.as_str()).copied().unwrap_or(0) > 1 {
-            let idx = name_indices.entry(name.clone()).or_insert(0);
-            *idx += 1;
-            result.insert(*t, format!("{} {}", name, idx));
-        } else {
+    let mut numbered: Vec<(TabTarget, &str)> = Vec::new();
+    for (t, name, parts) in &names {
+        if name_counts.get(name.as_str()).copied().unwrap_or(0) <= 1 {
             result.insert(*t, name.clone());
+            continue;
+        }
+        // The other tabs sharing this base name that we could compare against.
+        let others: Vec<&[String]> = names
+            .iter()
+            .filter(|(other_t, other_name, _)| other_t != t && other_name == name)
+            .filter_map(|(_, _, other_parts)| other_parts.as_deref())
+            .collect();
+        match parts
+            .as_deref()
+            .and_then(|p| shortest_unique_tail(p, &others))
+        {
+            Some(tail) => {
+                result.insert(*t, tail);
+            }
+            None => numbered.push((*t, name.as_str())),
+        }
+    }
+
+    // A tab left over on its own is already unambiguous — only number a base
+    // name that still has several claimants.
+    let mut leftover_counts: HashMap<&str, usize> = HashMap::new();
+    for (_, name) in &numbered {
+        *leftover_counts.entry(*name).or_insert(0) += 1;
+    }
+    let mut name_indices: HashMap<&str, usize> = HashMap::new();
+    for (t, name) in numbered {
+        if leftover_counts.get(name).copied().unwrap_or(0) > 1 {
+            let idx = name_indices.entry(name).or_insert(0);
+            *idx += 1;
+            result.insert(t, format!("{} {}", name, idx));
+        } else {
+            result.insert(t, name.to_string());
         }
     }
 
@@ -500,7 +489,7 @@ fn resolve_tab_names(
 
 /// Calculate tab widths for scroll offset calculations.
 /// Returns (tab_widths, rendered_targets) where tab_widths includes separators.
-/// This uses the same logic as render_for_split to ensure consistency.
+/// The strip's nodes (`view::shell::tabs`) measure the same way.
 pub fn calculate_tab_widths(
     tab_targets: &[TabTarget],
     buffers: &HashMap<BufferId, EditorState>,
@@ -521,7 +510,7 @@ pub fn calculate_tab_widths(
     );
 
     // Full names when they all fit, otherwise cap each at TAB_NAME_MAX_COLS.
-    // Must mirror `build_tab_spans` exactly (same cap) or widths drift.
+    // The strip's nodes apply the same cap, or widths drift.
     let name_cap = tab_name_cap(
         tab_targets,
         &resolved_names,
@@ -570,7 +559,7 @@ pub fn calculate_tab_widths(
 
         let preview_indicator = preview_suffix(t, preview_buffer);
 
-        // Same format as render_for_split: " {name}{modified}{preview_indicator}{binary_indicator} " + "× "
+        // The strip's format: " {name}{modified}{preview_indicator}{binary_indicator} " + "× "
         let tab_name_text = format!(" {name}{modified}{preview_indicator}{binary_indicator} ");
         let close_text = "× ";
         let tab_width = str_width(&tab_name_text) + str_width(close_text);
@@ -585,648 +574,6 @@ pub fn calculate_tab_widths(
     }
 
     (tab_widths, rendered_targets)
-}
-
-/// Compute the (name, close-button) styles for one tab from its state flags.
-///
-/// For the inactive split's active tab we keep BOLD to show which tab is
-/// active inside that split, but use `tab_inactive_fg` instead of
-/// `tab_active_fg`: pairing `tab_active_fg` with `tab_inactive_bg` assumes
-/// `active_fg` was chosen against `active_bg`, which breaks on themes (e.g.
-/// high-contrast) where `active_fg == inactive_bg` and the label disappears.
-fn tab_styles(
-    is_active: bool,
-    is_active_split: bool,
-    is_hovered_name: bool,
-    is_hovered_close: bool,
-    is_preview: bool,
-    theme: &crate::view::theme::Theme,
-) -> (Style, Style) {
-    let mut base_style = if is_active {
-        let fg = if is_active_split {
-            theme.tab_active_fg
-        } else {
-            theme.tab_inactive_fg
-        };
-        let bg = if is_active_split {
-            theme.tab_active_bg
-        } else {
-            theme.tab_inactive_bg
-        };
-        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
-    } else if is_hovered_name {
-        // Non-active tab with name hovered - use hover background
-        Style::default()
-            .fg(theme.tab_inactive_fg)
-            .bg(theme.tab_hover_bg)
-    } else {
-        Style::default()
-            .fg(theme.tab_inactive_fg)
-            .bg(theme.tab_inactive_bg)
-    };
-    if is_preview {
-        base_style = base_style.add_modifier(Modifier::ITALIC);
-    }
-
-    let close_style = if is_hovered_close {
-        base_style.fg(theme.tab_close_hover_fg)
-    } else {
-        base_style
-    };
-    (base_style, close_style)
-}
-
-/// Output of [`build_tab_spans`]: `(spans, ranges, rendered_targets)`. See the
-/// function's own docs for the per-field meaning.
-type TabSpanLayout = (
-    Vec<(Span<'static>, usize)>,
-    Vec<(usize, usize, usize)>,
-    Vec<TabTarget>,
-);
-
-/// Build the styled `(name, close-button)` spans for every resolvable tab.
-///
-/// Returns `(spans, ranges, rendered_targets)` where `spans` holds two entries
-/// per tab (name then close button) as `(span, display_width)`, `ranges[i]` is
-/// the `(start, end, close_start)` logical columns of rendered tab `i`, and
-/// `rendered_targets[i]` is its target. Targets that don't resolve (hidden
-/// buffers, missing groups) are skipped, so the returned vectors index by
-/// *rendered* position, not by input position.
-#[allow(clippy::too_many_arguments)]
-fn build_tab_spans(
-    tab_targets: &[TabTarget],
-    resolved_names: &HashMap<TabTarget, String>,
-    buffers: &HashMap<BufferId, EditorState>,
-    buffer_metadata: &HashMap<BufferId, BufferMetadata>,
-    composite_buffers: &HashMap<BufferId, crate::model::composite_buffer::CompositeBuffer>,
-    active_target: TabTarget,
-    hovered_tab: Option<(TabTarget, bool)>,
-    preview_buffer: Option<BufferId>,
-    is_active_split: bool,
-    theme: &crate::view::theme::Theme,
-    name_cap: usize,
-) -> TabSpanLayout {
-    let mut all_tab_spans: Vec<(Span<'static>, usize)> = Vec::new();
-    let mut tab_ranges: Vec<(usize, usize, usize)> = Vec::new();
-    let mut rendered_targets: Vec<TabTarget> = Vec::new();
-
-    for t in tab_targets.iter() {
-        // Skip targets we couldn't resolve (hidden buffers, missing groups).
-        let Some(name_owned) = resolved_names.get(t).cloned() else {
-            continue;
-        };
-        // Elide with the caller's shared cap. Must mirror `calculate_tab_widths`
-        // exactly (same cap) or widths drift and hit-testing/scroll positions
-        // diverge from what's painted.
-        let name = elided_tab_name(&name_owned, name_cap);
-        let name = name.as_str();
-        rendered_targets.push(*t);
-
-        // Composite buffers and groups never show as modified.
-        let modified = match t {
-            TabTarget::Buffer(id) if !composite_buffers.contains_key(id) => buffers
-                .get(id)
-                .filter(|state| state.buffer.is_modified())
-                .map(|_| "*")
-                .unwrap_or(""),
-            _ => "",
-        };
-        let binary_indicator = match t {
-            TabTarget::Buffer(id) if buffer_metadata.get(id).map(|m| m.binary).unwrap_or(false) => {
-                " [BIN]"
-            }
-            _ => "",
-        };
-
-        // Preview (ephemeral) tabs render in italic and carry a translated
-        // suffix (e.g. " (preview)") so the user knows the tab will be
-        // replaced by the next single-click open.
-        let is_preview = is_preview_tab(t, preview_buffer);
-        let preview_indicator = preview_suffix(t, preview_buffer);
-        let is_active = *t == active_target;
-        let (is_hovered_name, is_hovered_close) = match hovered_tab {
-            Some((hover_target, is_close)) if hover_target == *t => (!is_close, is_close),
-            _ => (false, false),
-        };
-
-        let (base_style, close_style) = tab_styles(
-            is_active,
-            is_active_split,
-            is_hovered_name,
-            is_hovered_close,
-            is_preview,
-            theme,
-        );
-
-        // Tab content: " {name}{modified}{preview_indicator}{binary_indicator} ".
-        let tab_name_text = format!(" {name}{modified}{preview_indicator}{binary_indicator} ");
-        let tab_name_width = str_width(&tab_name_text);
-        let close_text = "× ";
-        let close_width = str_width(close_text);
-
-        let start_pos: usize = all_tab_spans.iter().map(|(_, w)| w).sum();
-        let close_start_pos = start_pos + tab_name_width;
-        let end_pos = start_pos + tab_name_width + close_width;
-        tab_ranges.push((start_pos, end_pos, close_start_pos));
-
-        all_tab_spans.push((Span::styled(tab_name_text, base_style), tab_name_width));
-        all_tab_spans.push((
-            Span::styled(close_text.to_string(), close_style),
-            close_width,
-        ));
-    }
-
-    (all_tab_spans, tab_ranges, rendered_targets)
-}
-
-/// Clip the full tab-span list to the horizontally-scrolled viewport.
-///
-/// Produces the spans actually painted on the bar — left indicator, the
-/// visible slice of tabs (truncating the boundary tab), right indicator and a
-/// trailing fill out to `max_width` — plus the screen-x where the right scroll
-/// indicator was drawn (if any), which the caller needs for its hit area.
-fn build_visible_line(
-    all_tab_spans: Vec<(Span<'static>, usize)>,
-    area: Rect,
-    offset: usize,
-    max_width: usize,
-    show_left: bool,
-    show_right: bool,
-    theme: &crate::view::theme::Theme,
-) -> (Vec<Span<'static>>, Option<u16>) {
-    let mut current_spans: Vec<Span<'static>> = Vec::new();
-    let mut rendered_width = 0;
-    let mut skip_chars_count = offset;
-
-    if show_left {
-        current_spans.push(Span::styled(
-            SCROLL_INDICATOR_LEFT,
-            Style::default().bg(theme.tab_separator_bg),
-        ));
-        rendered_width += SCROLL_INDICATOR_WIDTH;
-    }
-
-    let right_reserve = if show_right {
-        SCROLL_INDICATOR_WIDTH
-    } else {
-        0
-    };
-    for (mut span, width) in all_tab_spans.into_iter() {
-        if skip_chars_count >= width {
-            skip_chars_count -= width;
-            continue;
-        }
-
-        let visible_chars_in_span = width - skip_chars_count;
-        if rendered_width + visible_chars_in_span > max_width.saturating_sub(right_reserve) {
-            let remaining_width = max_width
-                .saturating_sub(rendered_width)
-                .saturating_sub(right_reserve);
-            let truncated_content = span
-                .content
-                .chars()
-                .skip(skip_chars_count)
-                .take(remaining_width)
-                .collect::<String>();
-            span.content = std::borrow::Cow::Owned(truncated_content);
-            current_spans.push(span);
-            rendered_width += remaining_width;
-            break;
-        }
-
-        let visible_content = span
-            .content
-            .chars()
-            .skip(skip_chars_count)
-            .collect::<String>();
-        span.content = std::borrow::Cow::Owned(visible_content);
-        current_spans.push(span);
-        rendered_width += visible_chars_in_span;
-        skip_chars_count = 0;
-    }
-
-    // Position of the right indicator (recorded before it's pushed) for hit
-    // testing.
-    let right_indicator_x = if show_right && rendered_width < max_width {
-        Some(area.x + rendered_width as u16)
-    } else {
-        None
-    };
-    if show_right && rendered_width < max_width {
-        current_spans.push(Span::styled(
-            SCROLL_INDICATOR_RIGHT,
-            Style::default().bg(theme.tab_separator_bg),
-        ));
-        rendered_width += SCROLL_INDICATOR_WIDTH;
-    }
-    if rendered_width < max_width {
-        current_spans.push(Span::styled(
-            " ".repeat(max_width.saturating_sub(rendered_width)),
-            Style::default().bg(theme.tab_separator_bg),
-        ));
-    }
-
-    (current_spans, right_indicator_x)
-}
-
-/// Map each rendered tab's logical column range to its on-screen hit areas
-/// (tab body + close button), pushing them into `layout` and recording the
-/// active/inactive theme cells. Tabs scrolled fully out of view are skipped.
-#[allow(clippy::too_many_arguments)]
-fn map_tab_hit_areas(
-    layout: &mut TabLayout,
-    rendered_targets: &[TabTarget],
-    resolved_names: &HashMap<TabTarget, String>,
-    tab_ranges: &[(usize, usize, usize)],
-    area: Rect,
-    offset: usize,
-    available: usize,
-    left_indicator_offset: usize,
-    active_target: TabTarget,
-    is_active_split: bool,
-    name_cap: usize,
-    mut rec: Option<&mut CellThemeRecorder>,
-) {
-    let visible_start = offset;
-    let visible_end = offset + available;
-    let base_x = area.x + left_indicator_offset as u16;
-
-    for (idx, target) in rendered_targets.iter().enumerate() {
-        let (logical_start, logical_end, logical_close_start) = tab_ranges[idx];
-
-        // Skip tabs completely scrolled out of view.
-        if logical_end <= visible_start || logical_start >= visible_end {
-            continue;
-        }
-
-        let screen_start = if logical_start >= visible_start {
-            base_x + (logical_start - visible_start) as u16
-        } else {
-            base_x
-        };
-        let screen_end = if logical_end <= visible_end {
-            base_x + (logical_end - visible_start) as u16
-        } else {
-            base_x + available as u16
-        };
-        let screen_close_start =
-            if logical_close_start >= visible_start && logical_close_start < visible_end {
-                base_x + (logical_close_start - visible_start) as u16
-            } else if logical_close_start < visible_start {
-                // Close button scrolled off the left - clamp to the tab start.
-                screen_start
-            } else {
-                // Close button scrolled off the right.
-                screen_end
-            };
-
-        let tab_width = screen_end.saturating_sub(screen_start);
-        let close_width = screen_end.saturating_sub(screen_close_start);
-
-        // Record this tab's visible cells with its actual keys: the active tab
-        // of the active split wears the active palette, every other tab the
-        // inactive one (hover bg / close-hover fg are transient, not recorded).
-        if let Some(r) = rec.as_deref_mut() {
-            let (fg, bg) = if *target == active_target && is_active_split {
-                ("ui.tab_active_fg", "ui.tab_active_bg")
-            } else {
-                ("ui.tab_inactive_fg", "ui.tab_inactive_bg")
-            };
-            r.run(
-                screen_start,
-                area.y,
-                tab_width,
-                Some(fg),
-                Some(bg),
-                "Tab Bar",
-            );
-        }
-
-        layout.tabs.push(TabHitArea {
-            target: *target,
-            // Store the *elided* label so the web frontend and mouse
-            // hit-testing match the string the TUI actually draws.
-            label: resolved_names
-                .get(target)
-                .map(|n| elided_tab_name(n, name_cap))
-                .unwrap_or_default(),
-            tab_area: Rect::new(screen_start, area.y, tab_width, 1),
-            close_area: Rect::new(screen_close_start, area.y, close_width, 1),
-        });
-    }
-}
-
-impl TabsRenderer {
-    /// Render the tab bar for a specific split showing only its open buffers
-    ///
-    /// # Arguments
-    /// * `frame` - The ratatui frame to render to
-    /// * `area` - The rectangular area to render the tabs in
-    /// * `split_buffers` - List of buffer IDs open in this split (in order)
-    /// * `buffers` - All open buffers (for accessing state/metadata)
-    /// * `buffer_metadata` - Metadata for buffers (contains display names for virtual buffers)
-    /// * `active_buffer` - The currently active buffer ID for this split
-    /// * `theme` - The active theme for colors
-    /// * `is_active_split` - Whether this split is the active one
-    /// * `hovered_tab` - Optional (buffer_id, is_close_button) if a tab is being hovered
-    ///
-    /// # Returns
-    /// `TabLayout` containing hit areas for mouse interaction.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_for_split(
-        buf: &mut ratatui::buffer::Buffer,
-        area: Rect,
-        tab_targets: &[TabTarget],
-        buffers: &HashMap<BufferId, EditorState>,
-        buffer_metadata: &HashMap<BufferId, BufferMetadata>,
-        composite_buffers: &HashMap<BufferId, crate::model::composite_buffer::CompositeBuffer>,
-        active_target: TabTarget,
-        theme: &crate::view::theme::Theme,
-        is_active_split: bool,
-        tab_scroll_offset: usize,
-        hovered_tab: Option<(TabTarget, bool)>, // (target, is_close_button)
-        group_names: &HashMap<LeafId, String>,
-        preview_buffer: Option<BufferId>,
-        mut rec: Option<&mut CellThemeRecorder>,
-        // When false, compute + return the TabLayout (tab rects) but paint no
-        // cells — the web renders the tab bar natively from `tab_bar_view`. The
-        // TUI always passes `true`.
-        draw: bool,
-        // When true the split-control cluster (`> □ ×`) is owned by the
-        // orchestration layer, so this renderer skips only its own
-        // right-overflow `>` (the orchestration draws it in the reserved cluster
-        // instead) and reports overflow via `TabLayout::right_overflow`. The
-        // trailing `+` new-buffer button is *still* drawn here — inline after
-        // the last tab (or pinned to the right edge of this reduced area when
-        // the tabs overflow) — exactly as a single split does. It also still
-        // draws the `<` left indicator and the scrolling tabs.
-        external_controls: bool,
-    ) -> TabLayout {
-        let mut layout = TabLayout::new(area);
-        // Seed the whole bar with the separator surface (the block bg); each
-        // visible tab / "+" overwrites its own cells below.
-        if let Some(r) = rec.as_deref_mut() {
-            r.run(
-                area.x,
-                area.y,
-                area.width,
-                None,
-                Some("ui.tab_separator_bg"),
-                "Tab Bar",
-            );
-        }
-        let resolved_names = resolve_tab_names(
-            tab_targets,
-            buffers,
-            buffer_metadata,
-            composite_buffers,
-            group_names,
-        );
-
-        // Full names when they all fit in this split's tab-bar width, otherwise
-        // cap each at TAB_NAME_MAX_COLS. Computed once here and threaded into the
-        // span builder and hit-area mapper so every consumer uses one cap.
-        let name_cap = tab_name_cap(
-            tab_targets,
-            &resolved_names,
-            buffers,
-            buffer_metadata,
-            composite_buffers,
-            preview_buffer,
-            area.width as usize,
-        );
-
-        // Phase 1: build each tab's styled name + close spans and logical
-        // column ranges (unresolvable targets are skipped, so the vectors
-        // index by rendered position).
-        let (all_tab_spans, mut tab_ranges, rendered_targets) = build_tab_spans(
-            tab_targets,
-            &resolved_names,
-            buffers,
-            buffer_metadata,
-            composite_buffers,
-            active_target,
-            hovered_tab,
-            preview_buffer,
-            is_active_split,
-            theme,
-            name_cap,
-        );
-
-        // Phase 2: add separators between tabs (we do this after the loop to handle hidden buffers correctly)
-        // We'll rebuild all_tab_spans with separators inserted, and fix up tab_ranges
-        // to account for the separator widths
-        let mut final_spans: Vec<(Span<'static>, usize)> = Vec::new();
-        let mut separator_offset = 0usize;
-        let spans_per_tab = 2; // name + close button
-        for (tab_idx, chunk) in all_tab_spans.chunks(spans_per_tab).enumerate() {
-            // Adjust tab_ranges for this tab to account for separators before it
-            if separator_offset > 0 {
-                let (start, end, close_start) = tab_ranges[tab_idx];
-                tab_ranges[tab_idx] = (
-                    start + separator_offset,
-                    end + separator_offset,
-                    close_start + separator_offset,
-                );
-            }
-
-            for span in chunk {
-                final_spans.push(span.clone());
-            }
-            // Add separator if not the last tab
-            if tab_idx < rendered_targets.len().saturating_sub(1) {
-                final_spans.push((
-                    Span::styled(" ", Style::default().bg(theme.tab_separator_bg)),
-                    1,
-                ));
-                separator_offset += 1;
-            }
-        }
-        // Decide where the trailing "+" new-tab button goes. When the tabs
-        // plus an inline "+" fit, the "+" is appended into the scroll flow and
-        // sits right after the last tab. When they overflow, the "+" is pinned
-        // to the right edge of this area (`tabs_render_width` reserves its
-        // column) and drawn on top after the main paragraph render below.
-        //
-        // With `external_controls` the orchestration layer owns the `> □ ×`
-        // cluster (reserved out of `area` by the caller), but the `+` still
-        // belongs to the tab row here — inline or pinned — so it renders right
-        // after the last (visible) tab rather than in the fixed right cluster.
-        let tabs_total: usize = final_spans.iter().map(|(_, w)| w).sum();
-        let max_width = tabs_render_width(tabs_total, area.width as usize);
-        let pin_plus = max_width < area.width as usize;
-
-        let mut inline_plus_range: Option<(usize, usize)> = None;
-        if !pin_plus {
-            let plus_start = if !rendered_targets.is_empty() {
-                // Separator between the last real tab and the "+" button
-                final_spans.push((
-                    Span::styled(" ", Style::default().bg(theme.tab_separator_bg)),
-                    1,
-                ));
-                tabs_total + 1
-            } else {
-                tabs_total
-            };
-            final_spans.push((
-                Span::styled(
-                    NEW_TAB_BUTTON_TEXT.to_string(),
-                    Style::default()
-                        .fg(theme.tab_inactive_fg)
-                        .bg(theme.tab_inactive_bg),
-                ),
-                NEW_TAB_BUTTON_WIDTH,
-            ));
-            inline_plus_range = Some((plus_start, plus_start + NEW_TAB_BUTTON_WIDTH));
-        }
-
-        // Phase 3: horizontal scroll geometry. Use the scroll offset directly
-        // (ensure_active_tab_visible drives it); only clamp to avoid extremes.
-        let total_width: usize = final_spans.iter().map(|(_, w)| w).sum();
-        let max_offset = total_width.saturating_sub(max_width);
-        let offset = tab_scroll_offset.min(total_width);
-        tracing::trace!(
-            "render_for_split: tab_scroll_offset={}, max_offset={}, offset={}, total={}, max_width={}",
-            tab_scroll_offset, max_offset, offset, total_width, max_width
-        );
-        // Indicators reserve space based on scroll position. The `<` left
-        // indicator is always drawn here. The `>` right indicator is drawn here
-        // only when this renderer owns the cluster; with `external_controls`
-        // the orchestration draws `>` in the reserved cluster instead, so we
-        // don't reserve a column for it — we only record that the tabs overflow
-        // (`right_overflow`) so the orchestration knows whether to draw it.
-        let show_left = offset > 0;
-        let overflow_right = total_width.saturating_sub(offset) > max_width;
-        layout.right_overflow = overflow_right;
-        let draw_right_indicator = overflow_right && !external_controls;
-        let available = max_width
-            .saturating_sub((show_left as usize) * SCROLL_INDICATOR_WIDTH)
-            .saturating_sub((draw_right_indicator as usize) * SCROLL_INDICATOR_WIDTH);
-
-        // Phase 4: clip the spans to the viewport and paint the bar.
-        let (current_spans, right_indicator_x) = build_visible_line(
-            final_spans,
-            area,
-            offset,
-            max_width,
-            show_left,
-            draw_right_indicator,
-            theme,
-        );
-
-        let line = Line::from(current_spans);
-        let block = Block::default().style(Style::default().bg(theme.tab_separator_bg));
-        let paragraph = Paragraph::new(line).block(block);
-        if draw {
-            paragraph.render(area, buf);
-        }
-
-        // Pinned "+" button: when the tabs overflow, draw the button on top of
-        // the bar at the right edge. The main paragraph above filled the
-        // reserved columns with the separator background; overwrite them with
-        // the button cell here so it stays visible regardless of scroll.
-        if pin_plus {
-            let plus_w = NEW_TAB_BUTTON_WIDTH as u16;
-            let plus_x = area.x + area.width.saturating_sub(plus_w);
-            let plus_rect = Rect::new(plus_x, area.y, plus_w, 1);
-            let plus_para = Paragraph::new(Line::from(vec![Span::styled(
-                NEW_TAB_BUTTON_TEXT.to_string(),
-                Style::default()
-                    .fg(theme.tab_inactive_fg)
-                    .bg(theme.tab_inactive_bg),
-            )]));
-            if draw {
-                plus_para.render(plus_rect, buf);
-            }
-            layout.new_tab_area = Some(plus_rect);
-        }
-
-        // Compute and return hit areas for mouse interaction
-        // We need to map the logical tab positions to screen positions accounting for:
-        // 1. The scroll offset
-        // 2. The left scroll indicator (if shown)
-        // 3. The base area.x position
-        let left_indicator_offset = if show_left { SCROLL_INDICATOR_WIDTH } else { 0 };
-
-        // Set scroll button areas if shown
-        if show_left {
-            layout.left_scroll_area =
-                Some(Rect::new(area.x, area.y, SCROLL_INDICATOR_WIDTH as u16, 1));
-        }
-        if let Some(right_x) = right_indicator_x {
-            // Right scroll button is at the position where it was actually rendered
-            layout.right_scroll_area =
-                Some(Rect::new(right_x, area.y, SCROLL_INDICATOR_WIDTH as u16, 1));
-        }
-
-        // Phase 5: per-tab hit areas (and recorded theme cells).
-        map_tab_hit_areas(
-            &mut layout,
-            &rendered_targets,
-            &resolved_names,
-            &tab_ranges,
-            area,
-            offset,
-            available,
-            left_indicator_offset,
-            active_target,
-            is_active_split,
-            name_cap,
-            rec.as_deref_mut(),
-        );
-
-        // Map the inline "+" button's logical range to a screen rect using the
-        // same visibility/clamping logic as the per-tab mapping above. (The
-        // pinned variant set `new_tab_area` directly after the render.)
-        if let Some((plus_logical_start, plus_logical_end)) = inline_plus_range {
-            let visible_start = offset;
-            let visible_end = offset + available;
-            if plus_logical_end > visible_start && plus_logical_start < visible_end {
-                let screen_start = if plus_logical_start >= visible_start {
-                    area.x
-                        + left_indicator_offset as u16
-                        + (plus_logical_start - visible_start) as u16
-                } else {
-                    area.x + left_indicator_offset as u16
-                };
-                let screen_end = if plus_logical_end <= visible_end {
-                    area.x
-                        + left_indicator_offset as u16
-                        + (plus_logical_end - visible_start) as u16
-                } else {
-                    area.x + left_indicator_offset as u16 + available as u16
-                };
-                let width = screen_end.saturating_sub(screen_start);
-                if width > 0 {
-                    layout.new_tab_area = Some(Rect::new(screen_start, area.y, width, 1));
-                    if let Some(r) = rec.as_deref_mut() {
-                        r.run(
-                            screen_start,
-                            area.y,
-                            width,
-                            Some("ui.tab_inactive_fg"),
-                            Some("ui.tab_inactive_bg"),
-                            "Tab Bar",
-                        );
-                    }
-                }
-            }
-        }
-
-        // Pinned "+" cells (drawn on top at the right edge when tabs overflow).
-        if let (Some(plus_rect), Some(r)) = (layout.new_tab_area.filter(|_| pin_plus), rec) {
-            r.run(
-                plus_rect.x,
-                area.y,
-                plus_rect.width,
-                Some("ui.tab_inactive_fg"),
-                Some("ui.tab_inactive_bg"),
-                "Tab Bar",
-            );
-        }
-
-        layout
-    }
 }
 
 #[cfg(test)]
@@ -1421,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn long_tab_name_bounded_and_builders_stay_in_sync() {
+    fn long_tab_name_is_bounded_by_the_cap() {
         let long = "a".repeat(151);
         let (targets, group_names) = build_group_inputs(&[long.as_str()]);
         let buffers = HashMap::new();
@@ -1441,23 +788,6 @@ mod tests {
             "tab width {} exceeds cap {} + indicators",
             widths[0],
             TAB_NAME_MAX_COLS
-        );
-
-        // build_tab_spans must compute the identical width for the same input,
-        // or hit-testing/scroll drift. Same cap decision as calculate_tab_widths.
-        let resolved = resolve_tab_names(&targets, &buffers, &meta, &comp, &group_names);
-        let cap = tab_name_cap(&targets, &resolved, &buffers, &meta, &comp, None, bar);
-        let theme =
-            crate::view::theme::Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
-        let (_spans, ranges, rendered2) = build_tab_spans(
-            &targets, &resolved, &buffers, &meta, &comp, targets[0], None, None, true, &theme, cap,
-        );
-        assert_eq!(rendered2.len(), 1);
-        let span_width = ranges[0].1 - ranges[0].0;
-        assert_eq!(
-            span_width, widths[0],
-            "build_tab_spans width ({}) must match calculate_tab_widths ({})",
-            span_width, widths[0]
         );
     }
 
@@ -1552,228 +882,201 @@ mod tests {
         );
     }
 
-    /// Paint `render_for_split` into a fresh buffer and return row-0 as a
-    /// string plus the resulting `TabLayout`.
-    fn render_row0_ext(
-        area: Rect,
-        targets: &[TabTarget],
-        group_names: &HashMap<LeafId, String>,
-        active: TabTarget,
-        offset: usize,
-        external_controls: bool,
-    ) -> (String, TabLayout) {
-        let buffers = HashMap::new();
-        let meta = HashMap::new();
-        let comp = HashMap::new();
-        let theme =
-            crate::view::theme::Theme::load_builtin(crate::view::theme::THEME_DARK).unwrap();
-        let mut buf = ratatui::buffer::Buffer::empty(area);
-        let layout = TabsRenderer::render_for_split(
-            &mut buf,
-            area,
-            targets,
+    // --- Path disambiguation of same-named tabs (issue #2851) -----------
+
+    /// Build buffer inputs for `resolve_tab_names`: one file buffer per path,
+    /// keyed by ascending `BufferId`.
+    fn build_file_inputs(paths: &[&str]) -> (Vec<TabTarget>, HashMap<BufferId, EditorState>) {
+        use crate::config::LARGE_FILE_THRESHOLD_BYTES;
+        use crate::model::filesystem::StdFileSystem;
+
+        let mut buffers = HashMap::new();
+        let mut targets = Vec::new();
+        for (i, p) in paths.iter().enumerate() {
+            let id = BufferId(i);
+            let mut state = EditorState::new(
+                80,
+                24,
+                LARGE_FILE_THRESHOLD_BYTES as usize,
+                std::sync::Arc::new(StdFileSystem),
+            );
+            state.buffer.set_file_path(std::path::PathBuf::from(p));
+            buffers.insert(id, state);
+            targets.push(TabTarget::Buffer(id));
+        }
+        (targets, buffers)
+    }
+
+    /// Resolve names for a set of file paths, returned in the input order.
+    fn resolved_for(paths: &[&str]) -> Vec<String> {
+        let (targets, buffers) = build_file_inputs(paths);
+        let resolved = resolve_tab_names(
+            &targets,
             &buffers,
-            &meta,
-            &comp,
-            active,
-            &theme,
-            true,
-            offset,
-            None,
-            group_names,
-            None,
-            None,
-            true,
-            external_controls,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
         );
-        let row = (0..area.width)
-            .map(|x| buf[(area.x + x, area.y)].symbol().to_string())
-            .collect();
-        (row, layout)
+        targets
+            .iter()
+            .map(|t| resolved.get(t).cloned().unwrap_or_default())
+            .collect()
     }
 
-    /// Paint `render_for_split` into a fresh buffer and return row-0 as a string.
-    fn render_row0(
-        area: Rect,
-        targets: &[TabTarget],
-        group_names: &HashMap<LeafId, String>,
-        active: TabTarget,
-        offset: usize,
-    ) -> String {
-        render_row0_ext(area, targets, group_names, active, offset, false).0
+    /// Join components with the platform separator, so the expectations below
+    /// read the same on Windows as on Unix.
+    fn p(parts: &[&str]) -> String {
+        parts.join(MAIN_SEPARATOR_STR)
     }
 
     #[test]
-    fn right_indicator_renders_when_scrolled_off_right() {
-        // Enough same-width tabs to overflow a narrow bar several times over.
-        let names = [
-            "alpha.rs",
-            "bravo.rs",
-            "charlie.rs",
-            "delta.rs",
-            "echo.rs",
-            "foxtrot.rs",
-        ];
-        let (targets, group_names) = build_group_inputs(&names);
-        let area = Rect::new(0, 0, 24, 1);
-
-        // Scroll so earlier tabs are off the left AND later tabs off the right.
-        let row = render_row0(area, &targets, &group_names, targets[2], 14);
-        assert!(
-            row.contains('<'),
-            "expected left overflow indicator, got {row:?}"
-        );
-        assert!(
-            row.contains('>'),
-            "expected right overflow indicator when tabs are scrolled off the right, got {row:?}"
+    fn unique_file_names_stay_bare() {
+        assert_eq!(
+            resolved_for(&["/w/src/main.rs", "/w/src/lib.rs"]),
+            vec!["main.rs".to_string(), "lib.rs".to_string()]
         );
     }
 
     #[test]
-    fn no_right_indicator_at_the_right_end() {
-        let names = [
-            "alpha.rs",
-            "bravo.rs",
-            "charlie.rs",
-            "delta.rs",
-            "echo.rs",
-            "foxtrot.rs",
-        ];
-        let (targets, group_names) = build_group_inputs(&names);
-        let area = Rect::new(0, 0, 24, 1);
-        // A large offset parks the bar at its right end: `<` shows, `>` must not.
-        let (widths, _) = calculate_tab_widths(
+    fn duplicate_file_names_get_their_distinguishing_directory() {
+        // The old behaviour numbered these ("mod.rs 1" / "mod.rs 2"), which
+        // says nothing about which file is which.
+        assert_eq!(
+            resolved_for(&["/w/src/model/mod.rs", "/w/src/view/mod.rs"]),
+            vec![p(&["model", "mod.rs"]), p(&["view", "mod.rs"])]
+        );
+    }
+
+    #[test]
+    fn disambiguation_walks_up_until_the_paths_differ() {
+        // The parent directory is shared, so one level isn't enough: each label
+        // grows only until it is unique, and no further.
+        assert_eq!(
+            resolved_for(&[
+                "/w/crates/a/src/lib.rs",
+                "/w/crates/b/src/lib.rs",
+                "/w/vendor/lib.rs",
+            ]),
+            vec![
+                p(&["a", "src", "lib.rs"]),
+                p(&["b", "src", "lib.rs"]),
+                p(&["vendor", "lib.rs"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_colliding_names_grow_a_path() {
+        // `unique.rs` shares its name with nobody, so it stays bare while the
+        // `mod.rs` pair is disambiguated.
+        assert_eq!(
+            resolved_for(&["/w/a/mod.rs", "/w/b/mod.rs", "/w/a/unique.rs"]),
+            vec![
+                p(&["a", "mod.rs"]),
+                p(&["b", "mod.rs"]),
+                "unique.rs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn pathless_duplicates_still_fall_back_to_numbering() {
+        // Unnamed buffers have no path to disambiguate by, so they keep the
+        // numeric suffix.
+        use crate::config::LARGE_FILE_THRESHOLD_BYTES;
+        use crate::model::filesystem::StdFileSystem;
+
+        let mut buffers = HashMap::new();
+        let mut targets = Vec::new();
+        for i in 0..3 {
+            let id = BufferId(i);
+            buffers.insert(
+                id,
+                EditorState::new(
+                    80,
+                    24,
+                    LARGE_FILE_THRESHOLD_BYTES as usize,
+                    std::sync::Arc::new(StdFileSystem),
+                ),
+            );
+            targets.push(TabTarget::Buffer(id));
+        }
+        let resolved = resolve_tab_names(
+            &targets,
+            &buffers,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let mut labels: Vec<String> = targets
+            .iter()
+            .map(|t| resolved[t].clone())
+            .collect::<Vec<_>>();
+        labels.sort();
+        assert_eq!(labels, vec!["[No Name] 1", "[No Name] 2", "[No Name] 3"]);
+    }
+
+    #[test]
+    fn a_file_at_the_filesystem_root_falls_back_to_numbering() {
+        // `/main.rs` has no directory above it to name, so the pair can't be
+        // told apart by path and keeps the numeric suffix.
+        let labels = resolved_for(&["/main.rs", "/main.rs"]);
+        assert_eq!(labels, vec!["main.rs 1", "main.rs 2"]);
+    }
+
+    #[test]
+    fn duplicate_group_names_still_number() {
+        // Groups carry no path at all.
+        let (targets, group_names) = build_group_inputs(&["scratch", "scratch"]);
+        let resolved = resolve_tab_names(
             &targets,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &group_names,
-            None,
-            area.width as usize,
         );
-        let total: usize = widths.iter().sum();
-        let row = render_row0(
-            area,
-            &targets,
-            &group_names,
-            *targets.last().unwrap(),
-            total,
+        let mut labels: Vec<String> = targets.iter().map(|t| resolved[t].clone()).collect();
+        labels.sort();
+        assert_eq!(labels, vec!["scratch 1", "scratch 2"]);
+    }
+
+    // --- Path-aware elision ---------------------------------------------
+
+    #[test]
+    fn elision_of_a_path_label_keeps_the_file_name() {
+        let label = p(&["crates", "fresh-editor", "src", "view", "ui", "tabs.rs"]);
+        let out = elided_tab_name(&label, TAB_NAME_MAX_COLS);
+        assert!(
+            str_width(&out) <= TAB_NAME_MAX_COLS,
+            "elided width {} exceeds cap {TAB_NAME_MAX_COLS}: {out:?}",
+            str_width(&out)
         );
         assert!(
-            row.contains('<'),
-            "expected left indicator at the right end"
+            out.ends_with("tabs.rs"),
+            "the file name must survive elision, got {out:?}"
         );
         assert!(
-            !row.contains('>'),
-            "no right indicator once fully scrolled right, got {row:?}"
+            out.starts_with('…'),
+            "the dropped leading directories must be marked, got {out:?}"
         );
     }
 
     #[test]
-    fn external_controls_suppress_right_indicator_but_keep_plus() {
-        // With `external_controls`, the orchestration layer owns the `> □ ×`
-        // cluster, so the tab renderer suppresses only the `>` right-overflow
-        // glyph (reporting overflow via `right_overflow` instead). The `+`
-        // new-buffer button still belongs to the tab row and is drawn inline /
-        // pinned right after the last visible tab.
-        let names = [
-            "alpha.rs",
-            "bravo.rs",
-            "charlie.rs",
-            "delta.rs",
-            "echo.rs",
-            "foxtrot.rs",
-        ];
-        let (targets, group_names) = build_group_inputs(&names);
-        let area = Rect::new(0, 0, 24, 1);
-
-        let (row, layout) = render_row0_ext(area, &targets, &group_names, targets[2], 14, true);
-        // Overflow is reported so the caller can draw `>` in its cluster.
-        assert!(layout.right_overflow, "expected overflow to be reported");
-        // This renderer painted no `>` (the cluster owns it) ...
-        assert!(
-            !row.contains('>'),
-            "external controls must not draw the `>` indicator here, got {row:?}"
-        );
-        assert!(
-            layout.right_scroll_area.is_none(),
-            "no `>` hit area in external mode (the cluster owns it)"
-        );
-        // ... but the `+` button IS drawn (pinned to the right edge of the
-        // reduced tab area when overflowing) and its hit area recorded.
-        assert!(
-            row.contains('+'),
-            "external controls keep the inline/pinned `+` button, got {row:?}"
-        );
-        assert!(
-            layout.new_tab_area.is_some(),
-            "the `+` hit area must be recorded in external mode"
-        );
-        // The `<` left indicator is still owned by the tab renderer.
-        assert!(
-            row.contains('<'),
-            "left indicator stays with the tab renderer, got {row:?}"
-        );
+    fn elision_keeps_as_many_directories_as_fit() {
+        let label = p(&["aaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "view", "ui", "tabs.rs"]);
+        let out = elided_tab_name(&label, TAB_NAME_MAX_COLS);
+        assert_eq!(out, format!("…{}", p(&["", "view", "ui", "tabs.rs"])));
     }
 
     #[test]
-    fn external_controls_plus_inline_after_last_tab_when_fitting() {
-        // A couple of short tabs in a wide bar with `external_controls`: the `+`
-        // sits inline right after the last tab (not pinned to the far right, and
-        // not in the reserved cluster which the caller draws separately).
-        let (targets, group_names) = build_group_inputs(&["a.rs", "b.rs"]);
-        let area = Rect::new(0, 0, 40, 1);
-        let (row, layout) = render_row0_ext(area, &targets, &group_names, targets[0], 0, true);
-        assert!(!layout.right_overflow, "tabs fit, so no overflow");
-        let plus = layout.new_tab_area.expect("inline `+` must be present");
-        // The `+` glyph sits right after the last tab's close button, well left
-        // of the bar's right edge (there is trailing empty space after it).
-        let last_tab = layout.tabs.last().expect("at least one tab");
-        let last_tab_right = last_tab.tab_area.x + last_tab.tab_area.width;
-        assert!(
-            plus.x >= last_tab_right && plus.x < area.width - 3,
-            "`+` at x={} should follow the last tab (ends at {}) and not hug the right edge",
-            plus.x,
-            last_tab_right
-        );
-        assert!(row.contains('+'), "`+` glyph painted, got {row:?}");
-    }
-
-    #[test]
-    fn external_controls_report_no_overflow_when_tabs_fit() {
-        // A single short tab in a wide bar: no overflow, so `right_overflow` is
-        // false and the cluster won't draw a `>`.
-        let (targets, group_names) = build_group_inputs(&["only.rs"]);
-        let area = Rect::new(0, 0, 40, 1);
-        let (_row, layout) = render_row0_ext(area, &targets, &group_names, targets[0], 0, true);
-        assert!(!layout.right_overflow, "no overflow expected when tabs fit");
-    }
-
-    #[test]
-    fn test_tab_layout_hit_test() {
-        let bar_area = Rect::new(0, 0, 80, 1);
-        let mut layout = TabLayout::new(bar_area);
-
-        let buf1 = BufferId(1);
-        let target1 = TabTarget::Buffer(buf1);
-
-        layout.tabs.push(TabHitArea {
-            target: target1,
-            label: "buf1".to_string(),
-            tab_area: Rect::new(0, 0, 16, 1),
-            close_area: Rect::new(12, 0, 4, 1),
-        });
-
-        // Hit tab name
-        assert_eq!(layout.hit_test(5, 0), Some(TabHit::TabName(target1)));
-
-        // Hit close button
-        assert_eq!(layout.hit_test(13, 0), Some(TabHit::CloseButton(target1)));
-
-        // Hit bar background
-        assert_eq!(layout.hit_test(50, 0), Some(TabHit::BarBackground));
-
-        // Outside everything
-        assert_eq!(layout.hit_test(50, 5), None);
+    fn a_file_name_too_long_for_the_cap_is_truncated_from_the_end() {
+        // Not even "…/" plus the file name fits, so the whole label falls back
+        // to leading-character truncation rather than rendering a bare marker.
+        let long_file = format!("{}.rs", "n".repeat(60));
+        let label = p(&["src", &long_file]);
+        let out = elided_tab_name(&label, TAB_NAME_MAX_COLS);
+        assert!(str_width(&out) <= TAB_NAME_MAX_COLS);
+        assert!(out.ends_with('…'), "got {out:?}");
+        assert!(out.starts_with("src"), "got {out:?}");
     }
 }

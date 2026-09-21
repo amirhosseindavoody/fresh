@@ -19,13 +19,14 @@ use fresh_core::api::{
     BufferGroupResult, BufferInfo, BufferSavedDiff, CompositeHunk, CompositeLayoutConfig,
     CompositePaneStyle, CompositeSourceConfig, CreateCompositeBufferOptions, CreateTerminalOptions,
     CreateVirtualBufferInExistingSplitOptions, CreateVirtualBufferInSplitOptions,
-    CreateVirtualBufferOptions, CursorInfo, DirEntry, FormatterPackConfig, GrammarInfoSnapshot,
-    GrepMatch, JsDiagnostic, JsPosition, JsRange, JsTextPropertyEntry, KeyEventPayload,
-    LanguagePackConfig, LayoutHints, LspServerPackConfig, OverlayColorSpec, OverlayOptions,
-    PluginAnimationEdge, PluginAnimationKind, ProcessLimitsPackConfig, RemoteBackendInfo,
-    ReplaceResult, ScreenSize, ScrollbarMarker, SearchTakeResult, SpawnResult, SplitSnapshot,
-    TerminalResult, TextPropertiesAtCursor, TokenColor, TsHighlightSpan, ViewTokenStyle,
-    ViewTokenWire, ViewTokenWireKind, ViewportInfo, VirtualBufferResult, WindowInfo,
+    CreateVirtualBufferOptions, CursorInfo, DiffBaselineResult, DirEntry, FormatterPackConfig,
+    GrammarInfoSnapshot, GrepMatch, JsDiagnostic, JsPosition, JsRange, JsTextPropertyEntry,
+    KeyEventPayload, LanguagePackConfig, LayoutHints, LineDiffHunk, LspServerPackConfig,
+    OverlayColorSpec, OverlayOptions, PluginAnimationEdge, PluginAnimationKind,
+    ProcessLimitsPackConfig, RemoteBackendInfo, ReplaceResult, ScreenSize, ScrollbarMarker,
+    SearchTakeResult, SpawnResult, SplitSnapshot, TerminalResult, TextPropertiesAtCursor,
+    TokenColor, TsHighlightSpan, ViewTokenStyle, ViewTokenWire, ViewTokenWireKind, ViewportInfo,
+    VirtualBufferResult, WindowInfo,
 };
 use fresh_core::command::Suggestion;
 use fresh_core::file_explorer::{
@@ -66,6 +67,8 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "WorkspaceDescription" => Some(fresh_core::api::WorkspaceDescription::decl(&cfg)),
         "ActionSpec" => Some(ActionSpec::decl(&cfg)),
         "BufferSavedDiff" => Some(BufferSavedDiff::decl(&cfg)),
+        "LineDiffHunk" => Some(LineDiffHunk::decl(&cfg)),
+        "DiffBaselineResult" => Some(DiffBaselineResult::decl(&cfg)),
         "LayoutHints" => Some(LayoutHints::decl(&cfg)),
 
         // Process types
@@ -91,6 +94,10 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         "SessionWithTerminalResult" => {
             Some(fresh_core::api::SessionWithTerminalResult::decl(&cfg))
         }
+        "CreatePreparingWindowOptions" => {
+            Some(fresh_core::api::CreatePreparingWindowOptions::decl(&cfg))
+        }
+        "PreparingWindowResult" => Some(fresh_core::api::PreparingWindowResult::decl(&cfg)),
 
         // Composite buffer types (ts-rs renames these with Ts prefix)
         "TsCompositeLayoutConfig" | "CompositeLayoutConfig" => {
@@ -101,6 +108,7 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         }
         "TsCompositePaneStyle" | "CompositePaneStyle" => Some(CompositePaneStyle::decl(&cfg)),
         "TsCompositeHunk" | "CompositeHunk" => Some(CompositeHunk::decl(&cfg)),
+        "TsSyntaxRegion" | "SyntaxRegion" => Some(fresh_core::api::SyntaxRegion::decl(&cfg)),
         "TsCreateCompositeBufferOptions" | "CreateCompositeBufferOptions" => {
             Some(CreateCompositeBufferOptions::decl(&cfg))
         }
@@ -114,6 +122,7 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         // UI types (ts-rs renames these with Ts prefix)
         "TsActionPopupAction" | "ActionPopupAction" => Some(ActionPopupAction::decl(&cfg)),
         "ActionPopupOptions" => Some(ActionPopupOptions::decl(&cfg)),
+        "AddMenuItemOptions" => Some(fresh_core::api::AddMenuItemOptions::decl(&cfg)),
         "TsLspMenuItem" | "LspMenuItem" => Some(fresh_core::api::LspMenuItem::decl(&cfg)),
         "TsHighlightSpan" => Some(TsHighlightSpan::decl(&cfg)),
         "FileExplorerDecoration" => Some(FileExplorerDecoration::decl(&cfg)),
@@ -165,11 +174,16 @@ fn get_type_decl(type_name: &str) -> Option<String> {
         // Widget library types — declarative plugin UI.
         // See docs/internal/plugin-widget-library-design.md.
         "WidgetSpec" => Some(fresh_core::api::WidgetSpec::decl(&cfg)),
+        "WidgetPanelOptions" => Some(fresh_core::api::WidgetPanelOptions::decl(&cfg)),
+        "ScrollAlign" => Some(fresh_core::api::ScrollAlign::decl(&cfg)),
         "HintEntry" => Some(fresh_core::api::HintEntry::decl(&cfg)),
         "ButtonKind" => Some(fresh_core::api::ButtonKind::decl(&cfg)),
+        "LabelAlign" => Some(fresh_core::api::LabelAlign::decl(&cfg)),
+        "Elide" => Some(fresh_core::api::Elide::decl(&cfg)),
         "WidgetAction" => Some(fresh_core::api::WidgetAction::decl(&cfg)),
         "WidgetMutation" => Some(fresh_core::api::WidgetMutation::decl(&cfg)),
         "TreeNode" => Some(fresh_core::api::TreeNode::decl(&cfg)),
+        "TextWindowAnchor" => Some(fresh_core::api::TextWindowAnchor::decl(&cfg)),
 
         // Authority — payload schema for `editor.setAuthority(...)`.
         // Hand-written because the authoritative struct lives in
@@ -304,15 +318,25 @@ type RemoteAgentSpec = {
   base_env?: [string, string][];
   /**
   * When true, attach as a NEW window (born-attached, coexisting with the
-  * existing windows) instead of the default global restart that replaces the
-  * whole editor's authority. The Orchestrator sets this so a cloud session is
-  * a real session row beside local ones.
+  * existing windows) rather than re-pointing the window showing the current
+  * project. The Orchestrator sets this so a cloud session is a real session
+  * row beside local ones.
   */
   window?: boolean;
   /** Window label (window mode only). Omit to use the transport's display. */
   label?: string;
   /** Optional agent argv for the new window's seed terminal (window mode). */
   command?: string[];
+  /**
+   * Grow this *preparing* window (from `createPreparingWindow`) into the
+   * session instead of minting a new one — window mode only. The
+   * Orchestrator opens a placeholder the user lands in while the connect
+   * runs, so a remote workspace is somewhere to be from the moment it is
+   * asked for, and a connect that fails reports on that page rather than
+   * only in the dock. Ignored if the window is gone by the time the connect
+   * lands.
+   */
+  adopt_window?: number;
 };"#;
 
 /// Hand-written declaration for `RemoteIndicatorStatePayload`. Keep in
@@ -335,6 +359,7 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "TsCompositeSourceConfig",         // Used in createCompositeBuffer opts.sources
     "TsCompositePaneStyle",            // Used in TsCompositeSourceConfig.style
     "TsCompositeHunk",                 // Used in createCompositeBuffer opts.hunks
+    "TsSyntaxRegion",                  // Used by setSyntaxRegions
     "TsCreateCompositeBufferOptions",  // Options for createCompositeBuffer
     "ViewportInfo",                    // Used by plugins for viewport queries
     "ScreenSize",                      // Used by editor.getScreenSize()
@@ -363,6 +388,7 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "ActionSpec",                      // Used by executeActions
     "TsActionPopupAction",             // Used by ActionPopupOptions.actions
     "ActionPopupOptions",              // Used by showActionPopup
+    "AddMenuItemOptions",              // Used by addMenuItem
     "TsLspMenuItem",                   // Used by setLspMenuContributions
     "FileExplorerDecoration",          // Used by setFileExplorerDecorations
     "FileExplorerSlotEntry",           // Used by setFileExplorerSlots
@@ -374,6 +400,8 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "TerminalResult",                  // Used by createTerminal return type
     "CreateWindowWithTerminalOptions", // Used by createWindowWithTerminal opts
     "SessionWithTerminalResult",       // Used by createWindowWithTerminal return type
+    "CreatePreparingWindowOptions",    // Used by createPreparingWindow opts
+    "PreparingWindowResult",           // Used by createPreparingWindow return type
     "CreateTerminalOptions",           // Used by createTerminal opts parameter
     "CursorInfo",                      // Used by getPrimaryCursor, getAllCursors
     "OverlayOptions",                  // Used by TextPropertyEntry.style and InlineOverlay
@@ -386,12 +414,17 @@ const DEPENDENCY_TYPES: &[&str] = &[
     "PluginAnimationEdge",             // Used by PluginAnimationKind
     "PluginAnimationKind",             // Used by animateArea/animateVirtualBuffer
     // Widget library types (see docs/internal/plugin-widget-library-design.md)
-    "HintEntry",      // Used by WidgetSpec::HintBar
-    "ButtonKind",     // Used by WidgetSpec::Button.intent
-    "TreeNode",       // Used by WidgetSpec::Tree.nodes
-    "WidgetSpec",     // Used by mountWidgetPanel/updateWidgetPanel
-    "WidgetAction",   // Used by widgetCommand
-    "WidgetMutation", // Used by widgetMutate
+    "HintEntry",          // Used by WidgetSpec::HintBar
+    "ButtonKind",         // Used by WidgetSpec::Button.intent
+    "LabelAlign",         // Used by mountFloatingWidget's labelAlign option
+    "Elide",              // Used by WidgetSpec::Label.elide
+    "TreeNode",           // Used by WidgetSpec::Tree.nodes
+    "TextWindowAnchor",   // Used by TreeNode::windowAnchor
+    "WidgetSpec",         // Used by mountWidgetPanel/updateWidgetPanel
+    "WidgetPanelOptions", // Used by mountWidgetPanel
+    "ScrollAlign",        // Used by scrollToWidget
+    "WidgetAction",       // Used by widgetCommand
+    "WidgetMutation",     // Used by widgetMutate
     // Streaming-search pull handle (referenced via ts_raw on beginSearch)
     "SearchTakeResult",
     "SearchHandle",
@@ -497,6 +530,84 @@ pub fn write_fresh_dts() -> Result<(), String> {
     // macro output is the fallback.
     let plugin_api_trailer = r#"
 
+/** A machine opened with `editor.openMachine`. Closed on `close()` or plugin unload. */
+interface FreshMachine {
+  id: number;
+  /** "linux" | "macos" | "windows" | "other", as the machine reports. */
+  platform: string;
+  home: string;
+  /** The authority's own label, empty for a plain local one. */
+  label: string;
+  walkTree(root: string, options?: WalkTreeOptions): Promise<WalkTreeResult>;
+  readFilePrefixes(requests: { path: string; maxBytes: number }[]): Promise<FilePrefix[]>;
+  run(program: string, args?: string[], cwd?: string): Promise<CommandResult>;
+  /** Environment variables, for the names that are set. A remote machine is
+   *  asked with `printenv`; never this computer's values for another machine. */
+  env(names: string[]): Promise<Record<string, string>>;
+  /** Idempotent: closing twice is not an error. */
+  close(): Promise<boolean>;
+}
+
+interface WalkTreeOptions {
+  /** Directory basenames skipped at every depth. */
+  skipDirs?: string[];
+  includeHidden?: boolean;
+  includeDirs?: boolean;
+  /** Depth below the root; 1 is a direct child. Omitted means unbounded. */
+  maxDepth?: number;
+  maxEntries?: number;
+}
+
+interface WalkTreeEntry {
+  path: string;
+  /** Path relative to the walk root, "/"-separated on every platform. */
+  rel: string;
+  kind: "file" | "dir" | "symlink";
+  /** Unix timestamp. */
+  mtime: number;
+  size: number;
+}
+
+interface WalkTreeResult {
+  entries: WalkTreeEntry[];
+  /** True when `maxEntries` stopped the walk early. */
+  truncated: boolean;
+}
+
+/** One result from `readFilePrefixes`: `text` on success, else `error`. */
+interface FilePrefix {
+  path: string;
+  text?: string;
+  error?: string;
+}
+
+/** A non-zero `code` resolves rather than rejecting. */
+interface CommandResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+/** Bare shapes bound to machine 0, the active window's own authority. */
+interface EditorAPI {
+  /** Open a machine to read without attaching it to a window.
+   *  `{ kind: "window", window?: number }` borrows a window's own authority.
+   *  `{ kind: "ssh" | "kubectl-exec", ... }` connects to a machine nothing is
+   *  attached to; it is read-only, so `run` rejects. Anything else is an
+   *  `AuthorityPayload`, as `setAuthority` takes. */
+  openMachine(
+    spec:
+      | { kind: "window"; window?: number }
+      | RemoteAgentTransport
+      | AuthorityPayload,
+  ): Promise<FreshMachine>;
+  walkTree(root: string, options?: WalkTreeOptions): Promise<WalkTreeResult>;
+  readFilePrefixes(requests: { path: string; maxBytes: number }[]): Promise<FilePrefix[]>;
+  /** Unlike `spawnHostProcess`, a remote authority runs the command there. */
+  runOnTarget(program: string, args?: string[], cwd?: string): Promise<CommandResult>;
+  machineEnv(names: string[]): Promise<Record<string, string>>;
+}
+
 /**
  * Typed overload of `editor.getPluginApi`. When the caller passes a
  * key that some loaded plugin declared in `FreshPluginRegistry`, the
@@ -569,15 +680,24 @@ interface HookEventMap {
   config_changed: Record<string, never>;
 
   // ── buffer lifecycle ─────────────────────────────────────────────────────
-  buffer_activated: { buffer_id: number };
-  buffer_deactivated: { buffer_id: number };
-  buffer_closed: { buffer_id: number };
+  buffer_activated: { buffer_id: number; window_id: number };
+  buffer_deactivated: { buffer_id: number; window_id: number };
+  buffer_closed: { buffer_id: number; window_id: number };
 
   // ── file I/O ─────────────────────────────────────────────────────────────
   before_file_open: { path: string };
-  after_file_open: { path: string; buffer_id: number };
-  before_file_save: { path: string; buffer_id: number };
-  after_file_save: { path: string; buffer_id: number };
+  after_file_open: { path: string; buffer_id: number; window_id: number };
+  before_file_save: { path: string; buffer_id: number; window_id: number };
+  after_file_save: { path: string; buffer_id: number; window_id: number };
+  /**
+   * Fired after a buffer is reloaded from disk: auto-revert picked up an
+   * external change (e.g. `git checkout <ref> -- <file>` in another
+   * terminal), or the user ran an explicit revert. Reloads don't fire
+   * `after_file_save`, so plugins that surface disk-derived state
+   * (git gutter, etc.) should subscribe to this too or their decorations
+   * go stale on every external reset.
+   */
+  after_file_revert: { path: string; buffer_id: number };
   /**
    * Fired by the file explorer after a paste/duplicate/etc. mutates
    * the filesystem without going through a buffer save. Plugins that
@@ -588,9 +708,10 @@ interface HookEventMap {
   after_file_explorer_change: { path: string };
 
   // ── text edits ───────────────────────────────────────────────────────────
-  before_insert: { buffer_id: number; position: number; text: string };
+  before_insert: { buffer_id: number; window_id: number; position: number; text: string };
   after_insert: {
     buffer_id: number;
+    window_id: number;
     position: number;
     text: string;
     affected_start: number;
@@ -599,9 +720,10 @@ interface HookEventMap {
     end_line: number;
     lines_added: number;
   };
-  before_delete: { buffer_id: number; start: number; end: number };
+  before_delete: { buffer_id: number; window_id: number; start: number; end: number };
   after_delete: {
     buffer_id: number;
+    window_id: number;
     start: number;
     end: number;
     deleted_text: string;
@@ -615,6 +737,7 @@ interface HookEventMap {
   // ── cursor & viewport ────────────────────────────────────────────────────
   cursor_moved: {
     buffer_id: number;
+    window_id: number;
     cursor_id: number;
     old_position: number;
     new_position: number;
@@ -624,6 +747,7 @@ interface HookEventMap {
   viewport_changed: {
     split_id: number;
     buffer_id: number;
+    window_id: number;
     top_byte: number;
     top_line: number | null;
     width: number;
@@ -641,18 +765,59 @@ interface HookEventMap {
   };
   lines_changed: {
     buffer_id: number;
-    lines: { line_number: number; byte_start: number; byte_end: number; content: string }[];
+    lines: {
+      line_number: number;
+      byte_start: number;
+      byte_end: number;
+      content: string;
+      /** This line's role in an embedded-language region — a Markdown fenced
+       * code block, a Vue `<script>`/`<style>` block — as the highlighting
+       * engine classifies it while parsing. `"open"` and `"close"` are the
+       * delimiter lines; `"body"` is content strictly inside.
+       *
+       * Absent for ordinary lines AND when the region state could not be
+       * resolved (a >1MiB buffer whose viewport has no parse checkpoint before
+       * it yet). Treat absence as *unknown*, never as "outside a region": the
+       * point of this field is that a bare ``` opens or closes depending on
+       * every fence above it, so there is nothing to fall back on. */
+      region?: "open" | "body" | "close";
+      /** Where this line sits in a table the buffer's grammar recognizes.
+       * `role` is the line's kind (`"header"` is the column-name row,
+       * `"delimiter"` the `|---|---|` row, `"row"` a data row); `first_row`
+       * marks the data row directly below the delimiter; `last` marks the
+       * table's final line.
+       *
+       * Companion to `region`, and recoverable where that is not: "is this a
+       * table row" *is* derivable from a line's own text, so a consumer may
+       * fall back to its own rule when this is absent. What it cannot derive
+       * is where the table starts and ends — that needs the neighbouring
+       * lines, and an edit-sized batch does not contain them.
+       *
+       * `last` is false rather than unknown when the engine could not see the
+       * line below the table, so a consumer drawing a closing edge from it
+       * draws none instead of one in the wrong place. */
+      table?: {
+        role: "header" | "delimiter" | "row";
+        first_row: boolean;
+        last: boolean;
+      };
+    }[];
     /** Buffer version these byte ranges were captured at. Pass back to
      * coordinate-mapping APIs to repair stale offsets from this batch. */
     epoch: number;
-  };
-  view_transform_request: {
-    buffer_id: number;
-    split_id: number;
-    viewport_start: number;
-    viewport_end: number;
-    tokens: ViewTokenWire[];
-    cursor_positions: number[];
+    /** Whether any split shows this buffer in compose/preview mode, read from
+     * the live view states as this batch was built.
+     *
+     * Gate decoration work on this, not on
+     * `getBufferInfo(buffer_id).is_composing_in_any_split`. The editor marks
+     * these lines as seen the moment it sends the batch, so the batch is the
+     * only offer they get, while `getBufferInfo` reads a state snapshot
+     * refreshed on the editor thread's own schedule — early in a mode change
+     * it still reports the mode the buffer just left. Gating on the snapshot
+     * therefore drops the first decoration pass at random, leaving the
+     * document undecorated until an edit or a scroll produces another
+     * batch. */
+    is_composing_in_any_split: boolean;
   };
 
   // ── commands ─────────────────────────────────────────────────────────────
@@ -743,6 +908,35 @@ interface HookEventMap {
   window_created: { id: number; label: string; root: string };
   window_closed: { id: number };
   active_window_changed: { previous_id: number | null; active_id: number };
+  /**
+   * What the user is looking at changed: the active buffer of the active
+   * window is a different `(window, buffer)` than before. The one hook to
+   * subscribe to for "the active buffer" — it fires for a tab switch, a
+   * split focus, an open, a window dive and a workspace restore alike,
+   * after `active_window_changed` / `buffer_activated` for the same change.
+   * `reason` is `"window"` (a window switch), `"buffer"` (a different
+   * buffer in the same window) or `"open"` (the same buffer re-pointed at
+   * another file in place).
+   */
+  active_buffer_changed: {
+    window_id: number;
+    buffer_id: number;
+    previous: { window_id: number; buffer_id: number } | null;
+    reason: string;
+  };
+  /**
+   * Which chrome region holds the keyboard changed: `"editor"` (a pane),
+   * `"explorer"` (the file tree), `"dock"`, or `"section"` (a sidebar
+   * section, named by `plugin` and `panel_id`). Fires once per change, so
+   * a plugin can answer "does the pane have the keyboard?" without
+   * inferring it from its own focus events.
+   */
+  chrome_focus_changed: {
+    window_id: number;
+    region: string;
+    plugin: string | null;
+    panel_id: number | null;
+  };
 
   // ── widget runtime ───────────────────────────────────────────────────────
   /**
@@ -763,6 +957,7 @@ interface HookEventMap {
    *   * Button: `event_type = "activate"`, `payload = {}`.
    */
   widget_event: {
+    window_id: number;
     panel_id: number;
     widget_key: string;
     event_type: string;
@@ -930,6 +1125,8 @@ mod tests {
             "SplitSnapshot",
             "ActionSpec",
             "BufferSavedDiff",
+            "LineDiffHunk",
+            "DiffBaselineResult",
             "LayoutHints",
             "SpawnResult",
             "BackgroundProcessResult",
@@ -937,10 +1134,13 @@ mod tests {
             "CreateTerminalOptions",
             "CreateWindowWithTerminalOptions",
             "SessionWithTerminalResult",
+            "CreatePreparingWindowOptions",
+            "PreparingWindowResult",
             "TsCompositeLayoutConfig",
             "TsCompositeSourceConfig",
             "TsCompositePaneStyle",
             "TsCompositeHunk",
+            "TsSyntaxRegion",
             "TsCreateCompositeBufferOptions",
             "ViewTokenWireKind",
             "TokenColor",
@@ -981,6 +1181,7 @@ mod tests {
         // Rust name aliases should produce the same declaration as ts-rs name
         let alias_pairs = vec![
             ("CompositeHunk", "TsCompositeHunk"),
+            ("SyntaxRegion", "TsSyntaxRegion"),
             ("CompositeLayoutConfig", "TsCompositeLayoutConfig"),
             ("CompositeSourceConfig", "TsCompositeSourceConfig"),
             ("CompositePaneStyle", "TsCompositePaneStyle"),
@@ -1087,6 +1288,7 @@ mod tests {
             "TsCompositeSourceConfig",
             "TsCompositePaneStyle",
             "TsCompositeHunk",
+            "TsSyntaxRegion",
             "TsCreateCompositeBufferOptions",
             "PromptSuggestion",
             "BufferInfo",
@@ -1364,14 +1566,32 @@ mod tests {
             "pathExtname",
             "pathIsAbsolute",
             "utf8ByteLength",
+            "computeLineDiff",
+            "registerDiffBaseline",
+            "diffAgainstBaseline",
+            "diffBaselinePair",
+            "getBaselineLines",
+            "refreshDiffBaseline",
+            "releaseDiffBaseline",
             "fileExists",
             "readFile",
             "writeFile",
+            "replaceFile",
             "readDir",
             "createDir",
-            "removePath",
-            "renamePath",
-            "copyPath",
+            // No `removePath` / `renamePath` / `copyPath`: a plugin cannot
+            // name a path and have it removed or overwritten. What replaced
+            // them names a staging directory, a package, or a state entry.
+            "scratchCreate",
+            "scratchPath",
+            "scratchDiscard",
+            "scratchFromDirectory",
+            "installScratch",
+            "uninstallPackage",
+            "stateSet",
+            "stateGet",
+            "stateKeys",
+            "stateDelete",
             "getTempDir",
             "getConfig",
             "getUserConfig",
@@ -1393,6 +1613,7 @@ mod tests {
             "reloadGrammars",
             "getConfigDir",
             "getDataDir",
+            "getHomeDir",
             "getWorkingDataDir",
             "getTerminalDir",
             "getThemesDir",
@@ -1410,6 +1631,7 @@ mod tests {
             "pluginTranslate",
             "createCompositeBuffer",
             "updateCompositeAlignment",
+            "setSyntaxRegions",
             "closeCompositeBuffer",
             "flushLayout",
             "compositeNextHunk",
@@ -1430,8 +1652,6 @@ mod tests {
             "addSoftBreak",
             "clearSoftBreakNamespace",
             "clearSoftBreaksInRange",
-            "submitViewTransform",
-            "clearViewTransform",
             "setLayoutHints",
             "setFileExplorerDecorations",
             "clearFileExplorerDecorations",
@@ -1457,6 +1677,7 @@ mod tests {
             "setSplitBuffer",
             "focusSplit",
             "setSplitScroll",
+            "scrollToWidget",
             "setSplitRatio",
             "setSplitLabel",
             "clearSplitLabel",
@@ -1466,6 +1687,8 @@ mod tests {
             "setLineIndicator",
             "clearLineIndicators",
             "setLineNumbers",
+            "setLineNumbersDefault",
+            "setFoldIndicators",
             "setIndentationGuide",
             "setViewMode",
             "setViewState",
@@ -1516,6 +1739,9 @@ mod tests {
             "unloadPlugin",
             "reloadPlugin",
             "listPlugins",
+            "reloadInit",
+            "runCommand",
+            "listCommands",
             "mountFloatingWidget",
             "updateFloatingWidget",
             "unmountFloatingWidget",

@@ -59,7 +59,7 @@ fn test_toggle_indentation_command() {
     harness.render().unwrap();
 
     // Run "Toggle Indentation" command to switch to spaces
-    run_command(&mut harness, "Toggle Indentation");
+    run_command(&mut harness, "Toggle Indentation: Spaces");
 
     // Now Tab should insert spaces
     harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
@@ -81,7 +81,7 @@ fn test_toggle_indentation_command() {
         .unwrap();
     harness.render().unwrap();
 
-    run_command(&mut harness, "Toggle Indentation");
+    run_command(&mut harness, "Toggle Indentation: Spaces");
 
     harness.send_key(KeyCode::Tab, KeyModifiers::NONE).unwrap();
     let content = harness.get_buffer_content().unwrap();
@@ -186,6 +186,65 @@ fn test_toggle_whitespace_indicators_restores_configured_spaces() {
         screen_on.contains('·'),
         "After toggling back on, configured space indicators should return. Screen:\n{}",
         screen_on
+    );
+}
+
+/// The whitespace master toggle has to *show* whitespace when it is switched
+/// on. With the default settings (space indicators off, tab indicators on) the
+/// "on" state marked nothing at all in a space-indented file, so both halves of
+/// the toggle looked identical and the command read as broken.
+///
+/// Toggling it on marks every space; toggling it off again marks nothing.
+#[test]
+fn test_toggle_whitespace_indicators_shows_spaces_with_default_config() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.txt");
+
+    // Space-indented, with an inner and a trailing run of spaces too.
+    std::fs::write(&file_path, "    hello  world  \n").unwrap();
+
+    let config = Config::default();
+    assert!(
+        !config.editor.whitespace_spaces_leading,
+        "space indicators are off in the default config; this test is about \
+         what the master toggle does on top of those defaults"
+    );
+
+    let mut harness = EditorTestHarness::with_config(80, 24, config).unwrap();
+    harness.open_file(&file_path).unwrap();
+    harness.render().unwrap();
+
+    assert!(
+        !harness.screen_to_string().contains('·'),
+        "space indicators start hidden with the default config. Screen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // First invocation turns the master toggle off (tab indicators are on by
+    // default, so the toggle starts from the "shown" side) — still nothing.
+    run_command(&mut harness, "Toggle Whitespace Indicators");
+    assert!(
+        !harness.screen_to_string().contains('·'),
+        "turning the master toggle off must not draw indicators. Screen:\n{}",
+        harness.screen_to_string()
+    );
+
+    // Second invocation turns it on: this is the one that has to be visible.
+    run_command(&mut harness, "Toggle Whitespace Indicators");
+    let screen_on = harness.screen_to_string();
+    assert!(
+        screen_on.contains('·'),
+        "with the toggle on, spaces must be marked even though the config \
+         leaves space indicators off. Screen:\n{}",
+        screen_on
+    );
+
+    // And off again, so the toggle is a real toggle and not a one-way switch.
+    run_command(&mut harness, "Toggle Whitespace Indicators");
+    assert!(
+        !harness.screen_to_string().contains('·'),
+        "toggling off again must hide the indicators. Screen:\n{}",
+        harness.screen_to_string()
     );
 }
 
@@ -380,7 +439,7 @@ fn test_reset_buffer_settings_command() {
 
     // Modify settings: toggle tab indicators and toggle indentation to spaces
     run_command(&mut harness, "Toggle Tab Indicators");
-    run_command(&mut harness, "Toggle Indentation"); // Go uses tabs by default, so toggle switches to spaces
+    run_command(&mut harness, "Toggle Indentation: Spaces"); // Go uses tabs by default, so toggle switches to spaces
 
     // Verify modifications took effect
     let screen_modified = harness.screen_to_string();

@@ -3,6 +3,8 @@
 //! piping, and the should_quit confirmation flow that walks modified buffers.
 
 use super::*;
+use crate::view::confirm::{Choice, Confirm, Tone};
+use fresh_core::WindowId;
 
 impl Editor {
     /// Check if the editor should quit
@@ -123,19 +125,6 @@ impl Editor {
         self.clipboard.take_pending_clipboard()
     }
 
-    /// Check if the editor should restart with a new working directory
-    pub fn should_restart(&self) -> bool {
-        self.restart_with_dir.is_some()
-    }
-
-    /// Take the restart directory, clearing the restart request
-    /// Returns the new working directory if a restart was requested
-    pub fn take_restart_dir(&mut self) -> Option<PathBuf> {
-        self.restart_with_dir.take()
-    }
-
-    /// Request the editor to restart with a new working directory
-    /// This triggers a clean shutdown and restart with the new project root
     /// Request a full hardware terminal clear and redraw on the next frame.
     /// Used after external commands have messed up the terminal state, and
     /// after OS terminal resizes (host terminals may wipe the alt-screen
@@ -219,16 +208,6 @@ impl Editor {
         requested
     }
 
-    pub fn request_restart(&mut self, new_working_dir: PathBuf) {
-        tracing::info!(
-            "Restart requested with new working directory: {}",
-            new_working_dir.display()
-        );
-        self.restart_with_dir = Some(new_working_dir);
-        // Also signal quit so the event loop exits
-        self.should_quit = true;
-    }
-
     /// Get the active theme (read lock).
     pub fn theme(&self) -> std::sync::RwLockReadGuard<'_, crate::view::theme::Theme> {
         self.theme.read().unwrap()
@@ -247,60 +226,73 @@ impl Editor {
             // No dirty buffers, but the user has opted into a
             // safety-net confirmation for a stray Ctrl+Q (issue #2030).
             let msg = t!("prompt.quit_confirm").to_string();
-            self.start_prompt(msg, PromptType::ConfirmQuit);
+            let confirm = Confirm::new(
+                t!("dialog.title.quit").into_owned(),
+                msg.clone(),
+                vec![
+                    Choice::new(
+                        t!("dialog.btn.quit").into_owned(),
+                        t!("prompt.key.quit").into_owned(),
+                        Tone::Safe,
+                    ),
+                    crate::app::confirm_dialog::cancel(),
+                ],
+            )
+            // `(y)es, (N)o` — the capital was the default, and this prompt
+            // exists precisely to catch a *stray* `Ctrl+Q` (issue #2030), so
+            // an armed Quit one stray Enter later would defeat it.
+            .selecting(1);
+            self.start_confirm_prompt(msg, PromptType::ConfirmQuit, confirm);
             return;
         }
         if modified_count > 0 {
-            let save_key = t!("prompt.key.save").to_string();
-            let cancel_key = t!("prompt.key.cancel").to_string();
-            let hot_exit = self.config.editor.hot_exit;
-
-            let discard_key = t!("prompt.key.discard").to_string();
-            let msg = if hot_exit {
-                // With hot exit: offer save, discard, quit-without-saving (recoverable), or cancel
-                let quit_key = t!("prompt.key.quit").to_string();
-                if modified_count == 1 {
-                    t!(
-                        "prompt.quit_modified_hot_one",
-                        save_key = save_key,
-                        discard_key = discard_key,
-                        quit_key = quit_key,
-                        cancel_key = cancel_key
-                    )
-                    .to_string()
-                } else {
-                    t!(
-                        "prompt.quit_modified_hot_many",
-                        count = modified_count,
-                        save_key = save_key,
-                        discard_key = discard_key,
-                        quit_key = quit_key,
-                        cancel_key = cancel_key
-                    )
-                    .to_string()
+            // When some of the unsaved work is in a workspace the user is not
+            // looking at, a bare count is the wrong thing to show: it says
+            // there is something to lose without saying where, and the whole
+            // failure this prompt exists to prevent is work going unnoticed in
+            // a background workspace (issue #3189). Name the workspaces then.
+            let where_clause = self.unsaved_workspace_summary();
+            // **The outcomes are buttons now, not letters in the sentence.**
+            // That is what collapsed eight message strings into four: the
+            // hot-exit variants differed only in offering a third way out,
+            // which is one more `Choice` rather than another whole phrasing
+            // of the question.
+            let body = match (&where_clause, modified_count) {
+                (Some(w), 1) => t!("prompt.quit_modified_one_where", where = w).to_string(),
+                (Some(w), n) => {
+                    t!("prompt.quit_modified_many_where", count = n, where = w).to_string()
                 }
-            } else {
-                // Without hot exit: offer save, discard, or cancel
-                if modified_count == 1 {
-                    t!(
-                        "prompt.quit_modified_one",
-                        save_key = save_key,
-                        discard_key = discard_key,
-                        cancel_key = cancel_key
-                    )
-                    .to_string()
-                } else {
-                    t!(
-                        "prompt.quit_modified_many",
-                        count = modified_count,
-                        save_key = save_key,
-                        discard_key = discard_key,
-                        cancel_key = cancel_key
-                    )
-                    .to_string()
-                }
+                (None, 1) => t!("prompt.quit_modified_one").to_string(),
+                (None, n) => t!("prompt.quit_modified_many", count = n).to_string(),
             };
-            self.start_prompt(msg, PromptType::ConfirmQuitWithModified);
+            let mut choices = vec![
+                Choice::new(
+                    t!("dialog.btn.save_and_quit").into_owned(),
+                    t!("prompt.key.save").into_owned(),
+                    Tone::Safe,
+                ),
+                Choice::new(
+                    t!("dialog.btn.discard_and_quit").into_owned(),
+                    t!("prompt.key.discard").into_owned(),
+                    Tone::Destructive,
+                ),
+            ];
+            if self.config.editor.hot_exit {
+                // Not destructive: hot exit is exactly the promise that this
+                // one gets the work back.
+                choices.push(Choice::new(
+                    t!("dialog.btn.quit_recoverable").into_owned(),
+                    t!("prompt.key.quit").into_owned(),
+                    Tone::Safe,
+                ));
+            }
+            choices.push(crate::app::confirm_dialog::cancel());
+            let confirm = Confirm::new(
+                t!("dialog.title.unsaved_changes").into_owned(),
+                body.clone(),
+                choices,
+            );
+            self.start_confirm_prompt(body, PromptType::ConfirmQuitWithModified, confirm);
         } else {
             self.should_quit = true;
         }
@@ -314,32 +306,90 @@ impl Editor {
     /// When `auto_save_enabled` is true, file-backed buffers are excluded
     /// (they will be saved to disk on exit).
     fn count_modified_buffers_needing_prompt(&self) -> usize {
+        self.modified_buffers_needing_prompt().len()
+    }
+
+    /// Which workspaces hold the unsaved work, for the quit prompt — or
+    /// `None` to keep the prompt plain.
+    ///
+    /// Plain when it is all in the workspace on screen: the modified markers
+    /// are already in the tab bar. Once any of it is elsewhere the count alone
+    /// misleads, which is the whole of issue #3189.
+    fn unsaved_workspace_summary(&self) -> Option<String> {
+        let dirty = self.modified_buffers_needing_prompt();
+        if dirty.is_empty() {
+            return None;
+        }
+        let mut per_window: Vec<(WindowId, usize)> = Vec::new();
+        for (window_id, _) in &dirty {
+            match per_window.last_mut() {
+                Some((id, n)) if id == window_id => *n += 1,
+                _ => per_window.push((*window_id, 1)),
+            }
+        }
+        // All of it in the workspace on screen: the plain prompt is enough.
+        if per_window.len() == 1 && per_window[0].0 == self.active_window {
+            return None;
+        }
+        let parts: Vec<String> = per_window
+            .iter()
+            .map(|(window_id, count)| {
+                let label = self
+                    .windows
+                    .get(window_id)
+                    .map(|w| w.label.clone())
+                    .unwrap_or_else(|| window_id.to_string());
+                if *count > 1 {
+                    format!("{label}: {count}")
+                } else {
+                    label
+                }
+            })
+            .collect();
+        Some(parts.join(", "))
+    }
+
+    /// Every `(window, buffer)` that must be resolved before the editor may
+    /// exit, across all workspaces.
+    ///
+    /// Cross-window because `Ctrl+Q` quits the editor, not the workspace on
+    /// screen (issue #3189).
+    ///
+    /// Composite, hidden and plugin-virtual buffers are skipped: they can be
+    /// neither saved nor recovered, so a prompt naming them offers nothing to
+    /// act on. Background workspaces are full of them, which is why this
+    /// matters once every window counts.
+    pub(crate) fn modified_buffers_needing_prompt(&self) -> Vec<(WindowId, BufferId)> {
         let hot_exit = self.config.editor.hot_exit;
         let auto_save = self.config.editor.auto_save_enabled;
 
-        self.windows
-            .get(&self.active_window)
-            .map(|w| &w.buffers)
-            .expect("active window present")
-            .iter()
-            .filter(|(buffer_id, state)| {
-                if !state.buffer.is_modified() {
-                    return false;
+        let mut out = Vec::new();
+        for window_id in self.window_ids_sorted() {
+            let Some(window) = self.windows.get(&window_id) else {
+                continue;
+            };
+            for (buffer_id, state) in window.buffers.iter() {
+                if !state.buffer.is_modified() || state.is_composite_buffer {
+                    continue;
                 }
-                if let Some(meta) = self.active_window().buffer_metadata.get(buffer_id) {
+                if let Some(meta) = window.buffer_metadata.get(buffer_id) {
+                    if meta.hidden_from_tabs || meta.is_virtual() {
+                        continue;
+                    }
                     if let Some(path) = meta.file_path() {
                         let is_unnamed = path.as_os_str().is_empty();
                         if is_unnamed && hot_exit {
-                            return false; // unnamed buffer, auto-recovered via hot exit
+                            continue; // unnamed buffer, auto-recovered via hot exit
                         }
                         if !is_unnamed && auto_save {
-                            return false; // file-backed, will be auto-saved on exit
+                            continue; // file-backed, will be auto-saved on exit
                         }
                     }
                 }
-                true
-            })
-            .count()
+                out.push((window_id, *buffer_id));
+            }
+        }
+        out
     }
 
     /// Handle terminal focus gained event
@@ -361,18 +411,21 @@ impl Editor {
     /// disturbing the live cursor.
     ///
     /// Returns whether the editor wants the next frame redrawn.
-    pub fn handle_input_event(&mut self, event: crossterm::event::Event) -> anyhow::Result<bool> {
+    pub fn handle_input_event(&mut self, event: fresh_input_parser::Event) -> anyhow::Result<bool> {
         use crate::input::is_keystroke;
-        use crossterm::event::Event as Ev;
+        use fresh_input_parser::{Event as Ev, KeyPress};
 
         match event {
-            Ev::Key(key_event) if is_keystroke(key_event.kind) => {
-                let key_code = format!("{:?}", key_event.code);
-                let modifiers = format!("{:?}", key_event.modifiers);
+            Ev::Key(press) if is_keystroke(press.kind) => {
+                let key_code = format!("{:?}", press.code);
+                let modifiers = format!("{:?}", press.modifiers);
                 self.active_window_mut()
                     .log_keystroke(&key_code, &modifiers);
-                let translated = self.key_translator().translate(key_event);
-                self.handle_key(translated.code, translated.modifiers)?;
+                // The calibration translator rewrites the physical chord only;
+                // the layout character rides along untouched, since it says
+                // what the key types rather than which chord arrived.
+                let translated = self.key_translator().translate(press.event);
+                self.handle_key_press(KeyPress::with_layout_char(translated, press.layout_char))?;
                 // If `paste()` just took the async placeholder path,
                 // skip the otherwise-automatic render for this
                 // keystroke. The placeholder is sitting in the
@@ -449,6 +502,25 @@ impl Editor {
     /// plugin hook is signature-deduped, so callers never need to decide
     /// "did this actually change the layout?" — they just call `relayout`.
     pub fn relayout(&mut self) {
+        self.push_layout_geometry();
+        self.notify_layout_changed();
+    }
+
+    /// The geometry half of [`Editor::relayout`]: derive the authoritative
+    /// dimensions and push them down to every window's viewports and
+    /// terminal PTYs, *without* notifying plugins.
+    ///
+    /// Callers that are themselves running inside a plugin command must use
+    /// this rather than `relayout`. The notify half fires the `resize` hook
+    /// re-entrantly into the plugin thread, and a plugin part-way through its
+    /// own command — still awaiting the callback that hands it the buffer id
+    /// it just asked the host to create — will service that hook against its
+    /// pre-await state. `search_replace.ts` does exactly this: its `resize`
+    /// handler re-renders the panel through `panel.resultsBufferId`, which is
+    /// still its initial `0` until `createVirtualBufferInSplit` resolves, so
+    /// the panel mounts into `BufferId(0)` ("Buffer not found") and its body
+    /// never paints. Everything the terminals need lives in this half.
+    pub(crate) fn push_layout_geometry(&mut self) {
         // Derive the dock width from its placement (the source of truth),
         // exactly as the renderer's `compute_dock_split` does, so the
         // geometry we push down matches what gets painted.
@@ -459,11 +531,25 @@ impl Editor {
         // editor-global, so every window — not just the active one —
         // sizes its terminals for the post-dock chrome, ready for a
         // dive without a stale first frame.
+        //
+        // In two steps, because where a window's panes are is a function of
+        // the screen size and the dock width it is about to adopt: every
+        // window adopts them first, then its grid is laid out at that size,
+        // and only then does it seed its viewports and size its PTYs from the
+        // result. The active window's grid is the frame's, laid out once with
+        // `layout_only`; every other window's grid the retained tree does not
+        // hold, so it is laid out offscreen from the same description.
         for window in self.windows.values_mut() {
-            window.apply_layout(width, height, dock_cols);
+            window.adopt_screen(width, height, dock_cols);
         }
-
-        self.notify_layout_changed();
+        self.refresh_pane_rects();
+        let active = self.active_window;
+        for (id, window) in self.windows.iter_mut() {
+            if *id != active {
+                window.layout_panes_offscreen();
+            }
+            window.apply_layout();
+        }
     }
 
     /// Effective width (cols) the left dock currently claims, or `0` when
@@ -480,11 +566,10 @@ impl Editor {
 
     /// Fire the plugin `resize` hook and rerender mounted panels, but only
     /// when the content geometry plugins observe has actually changed since
-    /// the last notification. The dedupe is load-bearing: the orchestrator
-    /// reacts to `resize` by re-issuing the dock's `dock_width`, which loops
-    /// back through `relayout`; without the signature guard that would
-    /// re-fire every frame. Once the dock width settles the signature stops
-    /// changing and the cascade stops.
+    /// the last notification. The dedupe is load-bearing: a plugin that
+    /// answers `resize` with a layout change of its own loops back through
+    /// `relayout`, and without the signature guard that would re-fire every
+    /// frame.
     fn notify_layout_changed(&mut self) {
         let dock_cols = self.dock_cols();
         // File-explorer width of the active window, measured against the
@@ -550,26 +635,76 @@ impl Editor {
         {
             self.rerender_widget_panel(&panel_key);
         }
+
+        // Buffer-mounted (split) panels too: their auto-sized lists/trees
+        // window against the split viewport height the renderer captured,
+        // so a resize must re-run the layout even when the plugin never
+        // re-emits its spec. The dock / floating panels handled above are
+        // also in the registry, so they render twice on a resize — a
+        // benign cost on an event this rare, kept for the explicit
+        // ordering the Bug-13 fix established.
+        for panel_key in self.widget_registry.panel_keys() {
+            self.rerender_widget_panel(&panel_key);
+        }
     }
 }
 
 impl crate::app::window::Window {
-    /// Adopt the geometry handed down by [`Editor::relayout`]: cache the
-    /// screen dimensions and the editor-global dock width, reseed every
-    /// split viewport against the post-dock editor width, and resize the
-    /// visible terminal PTYs. Per-split viewport dimensions are refined
-    /// again at paint time by `sync_viewport_to_content`; terminals have
-    /// no such paint-time sync, which is why their PTY size must be pushed
-    /// here.
-    pub fn apply_layout(&mut self, width: u16, height: u16, dock_cols: u16) {
+    /// Adopt the screen dimensions and the editor-global dock width handed
+    /// down by [`Editor::relayout`] — the first half of what `apply_layout`
+    /// did, split off because the layout that places this window's panes
+    /// runs between the two: it is laid out at the size adopted here, and
+    /// [`Self::apply_layout`] reads the result.
+    pub fn adopt_screen(&mut self, width: u16, height: u16, dock_cols: u16) {
         self.terminal_width = width;
         self.terminal_height = height;
         self.dock_cols = dock_cols;
+    }
 
-        let editor_width = width.saturating_sub(dock_cols);
+    /// Adopt the geometry handed down by [`Editor::relayout`]: reseed every
+    /// split viewport against the pane rect that split will actually be
+    /// painted into, and resize the visible terminal PTYs. Per-split
+    /// viewport dimensions are refined again at paint time by
+    /// `sync_viewport_to_content` (which subtracts each pane's own chrome —
+    /// gutter, tab bar, scrollbars); terminals have no such paint-time sync,
+    /// which is why their PTY size must be pushed here.
+    ///
+    /// Reads the pane rects the funnel just laid out for this window
+    /// ([`Self::visible_panes`]), after [`Self::adopt_screen`].
+    pub fn apply_layout(&mut self) {
+        let height = self.terminal_height;
+
+        // Per-split pane rects, off the layout the funnel just ran at the
+        // adopted size — so the file explorer's columns (and a sibling
+        // split's) are already carved out of them.
+        let visible = self.visible_panes();
+
+        // Seed each visible split's viewport from its own pane rect. Seeding
+        // every split with the whole post-dock editor width instead — which is
+        // what this did — ignored the file explorer entirely, so toggling it
+        // changed no viewport here at all. Nothing downstream noticed the
+        // narrower panes until the *next* paint corrected them, and by then
+        // `notify_layout_changed` had already refreshed the plugin-facing
+        // snapshot and fired its hooks off the stale, too-wide geometry: a
+        // plugin panel that re-lays itself out in reaction (the code tour's
+        // dock panel) saw no width change, kept its old layout, and spilled
+        // out of the region it had been given until something else forced a
+        // re-layout. Toggling the *dock* never had that problem, because
+        // `dock_cols` was the one piece of chrome this did subtract.
+        //
+        // Splits that aren't on screen keep the coarse full-content-width
+        // seed; they have no rect of their own until they are laid out.
+        let content_width = self.editor_content_area().width;
+        let visible_rects: std::collections::HashMap<_, _> = visible
+            .iter()
+            .map(|(split_id, _, area)| (*split_id, *area))
+            .collect();
         if let Some(view_states) = self.split_view_states_mut() {
-            for view_state in view_states.values_mut() {
-                view_state.viewport.resize(editor_width, height);
+            for (split_id, view_state) in view_states.iter_mut() {
+                match visible_rects.get(split_id) {
+                    Some(area) => view_state.viewport.resize(area.width, area.height),
+                    None => view_state.viewport.resize(content_width, height),
+                }
             }
         }
 
@@ -582,20 +717,8 @@ impl crate::app::window::Window {
         // tab-scroll offset is never revisited. Use each split's real area
         // width (dock/explorer/split-aware), not the whole-window width, so
         // a half-width vertical split scrolls correctly too.
-        let visible: Vec<(
-            crate::model::event::LeafId,
-            crate::model::event::BufferId,
-            u16,
-        )> = match self.buffers.splits() {
-            Some((mgr, _)) => mgr
-                .get_visible_buffers(self.editor_content_area())
-                .into_iter()
-                .map(|(split_id, buffer_id, area)| (split_id, buffer_id, area.width))
-                .collect(),
-            None => Vec::new(),
-        };
-        for (split_id, buffer_id, tab_width) in visible {
-            self.ensure_active_tab_visible(split_id, buffer_id, tab_width);
+        for (split_id, buffer_id, area) in visible {
+            self.ensure_active_tab_visible(split_id, buffer_id, area.width);
         }
     }
 }

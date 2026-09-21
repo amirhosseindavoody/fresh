@@ -11,7 +11,7 @@ use super::{
 };
 use crate::input::commands::Suggestion;
 use crate::input::fuzzy::FuzzyMatcher;
-use rust_i18n::t;
+use fresh_i18n::t;
 
 // ============================================================================
 // Command Provider (prefix: ">")
@@ -60,6 +60,7 @@ impl QuickOpenProvider for CommandProvider {
             &context.custom_contexts,
             context.buffer_mode.as_deref(),
             context.has_lsp_config,
+            context.buffer_caps,
         )
     }
 
@@ -110,6 +111,10 @@ impl QuickOpenProvider for CommandProvider {
 // Buffer Provider (prefix: "#")
 // ============================================================================
 
+/// Marks a suggestion value as a buffer-group leaf id rather than a buffer
+/// id. The two are separate id spaces and would otherwise collide.
+const GROUP_VALUE_PREFIX: &str = "group:";
+
 /// Provider for switching between open buffers
 pub struct BufferProvider;
 
@@ -151,9 +156,15 @@ impl QuickOpenProvider for BufferProvider {
                     buf.name.clone()
                 };
 
+                // A group entry is selected by its leaf id, not a buffer
+                // id, so the two namespaces are kept apart in the value.
+                let value = match buf.group_leaf {
+                    Some(leaf) => format!("{GROUP_VALUE_PREFIX}{leaf}"),
+                    None => buf.id.to_string(),
+                };
                 let suggestion = Suggestion::new(display_name)
                     .with_description(buf.path.clone())
-                    .with_value(buf.id.to_string());
+                    .with_value(value);
                 Some((suggestion, m.score, buf.id))
             })
             .collect();
@@ -169,11 +180,19 @@ impl QuickOpenProvider for BufferProvider {
         _query: &str,
         _context: &QuickOpenContext,
     ) -> QuickOpenResult {
-        suggestion
-            .and_then(|s| s.value.as_deref())
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(QuickOpenResult::ShowBuffer)
-            .unwrap_or(QuickOpenResult::None)
+        let Some(value) = suggestion.and_then(|s| s.value.as_deref()) else {
+            return QuickOpenResult::None;
+        };
+        match value.strip_prefix(GROUP_VALUE_PREFIX) {
+            Some(leaf) => leaf
+                .parse::<usize>()
+                .map(QuickOpenResult::ShowBufferGroup)
+                .unwrap_or(QuickOpenResult::None),
+            None => value
+                .parse::<usize>()
+                .map(QuickOpenResult::ShowBuffer)
+                .unwrap_or(QuickOpenResult::None),
+        }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -332,7 +351,7 @@ pub struct FileProvider {
     frecency: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, FrecencyData>>>,
     filesystem: std::sync::Arc<dyn crate::model::filesystem::FileSystem + Send + Sync>,
     process_spawner: std::sync::Arc<dyn crate::services::remote::ProcessSpawner>,
-    runtime_handle: Option<tokio::runtime::Handle>,
+    runtime: Option<crate::services::runtime::LiveRuntime>,
     async_sender: Option<std::sync::mpsc::Sender<crate::services::async_bridge::AsyncMessage>>,
     /// Cancel flag shared with the background walk task.
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -342,7 +361,7 @@ impl FileProvider {
     pub fn new(
         filesystem: std::sync::Arc<dyn crate::model::filesystem::FileSystem + Send + Sync>,
         process_spawner: std::sync::Arc<dyn crate::services::remote::ProcessSpawner>,
-        runtime_handle: Option<tokio::runtime::Handle>,
+        runtime: Option<crate::services::runtime::LiveRuntime>,
         async_sender: Option<std::sync::mpsc::Sender<crate::services::async_bridge::AsyncMessage>>,
     ) -> Self {
         Self {
@@ -354,7 +373,7 @@ impl FileProvider {
             frecency: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             filesystem,
             process_spawner,
-            runtime_handle,
+            runtime,
             async_sender,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -557,8 +576,8 @@ impl FileProvider {
 
         // No cache for this cwd, not loading — kick off background load
         cache.loaded_cwd = Some(cwd.to_string());
-        let (sender, handle) = match (&self.async_sender, &self.runtime_handle) {
-            (Some(s), Some(h)) => (s.clone(), h.clone()),
+        let (sender, runtime) = match (&self.async_sender, &self.runtime) {
+            (Some(s), Some(rt)) => (s.clone(), rt.clone()),
             _ => {
                 // No async support — fall back to synchronous load
                 drop(cache);
@@ -576,7 +595,7 @@ impl FileProvider {
         let process_spawner = std::sync::Arc::clone(&self.process_spawner);
         let cwd = cwd.to_string();
 
-        handle.spawn_blocking(move || {
+        runtime.spawn_blocking(move || {
             // Fast path: git ls-files returns everything at once.
             if let Some(files) = try_git_files_blocking(&process_spawner, &cwd) {
                 let frecency_map = frecency.read().ok();
@@ -636,8 +655,8 @@ impl FileProvider {
 
     /// Synchronous `try_git_files` — used by the sync fallback path.
     fn try_git_files(&self, cwd: &str) -> Option<Vec<String>> {
-        let handle = self.runtime_handle.as_ref()?;
-        try_git_files_with_handle(&self.process_spawner, cwd, handle)
+        let runtime = self.runtime.as_ref()?;
+        try_git_files_with_handle(&self.process_spawner, cwd, runtime.handle())
     }
 
     /// Synchronous `try_walk_dir` — used by the sync fallback path.
@@ -653,23 +672,32 @@ impl FileProvider {
 
 /// List files via `git ls-files` using a `ProcessSpawner` (blocking).
 ///
-/// Called from `spawn_blocking` so we can't hold a tokio runtime handle —
-/// `ProcessSpawner::spawn` is async, so we use `tokio::runtime::Handle::block_on`
-/// from *inside* the blocking thread.
+/// Called from `spawn_blocking`, which is already running on the runtime's
+/// blocking pool — so the runtime provably exists for the duration, and
+/// `Handle::current` is sound here in a way that storing one never is.
 fn try_git_files_blocking(
     spawner: &std::sync::Arc<dyn crate::services::remote::ProcessSpawner>,
     cwd: &str,
 ) -> Option<Vec<String>> {
-    // Inside spawn_blocking we can use Handle::current() since the runtime is alive.
+    // Running on the runtime's own blocking pool, so the runtime provably
+    // exists for as long as this closure does — the liveness a `Handle` cannot
+    // carry on its own is established by where we are, not by the handle.
+    #[allow(clippy::disallowed_types)]
     let handle = tokio::runtime::Handle::try_current().ok()?;
     try_git_files_with_handle(spawner, cwd, &handle)
 }
 
+/// `handle` must belong to a runtime the caller has already established is
+/// alive — either by holding a `LiveRuntime` or by running on that runtime's
+/// blocking pool. A `Handle` carries no such guarantee on its own, which is
+/// why nothing stores one; see `services::runtime::LiveRuntime`.
+#[allow(clippy::disallowed_types)] // liveness established by both callers, above
 fn try_git_files_with_handle(
     spawner: &std::sync::Arc<dyn crate::services::remote::ProcessSpawner>,
     cwd: &str,
     handle: &tokio::runtime::Handle,
 ) -> Option<Vec<String>> {
+    #[allow(clippy::disallowed_methods)] // liveness established by the caller, above
     let result = handle
         .block_on(spawner.spawn(
             "git".to_string(),
@@ -1021,6 +1049,7 @@ mod tests {
                     name: "main.rs".to_string(),
                     modified: false,
                     is_virtual: false,
+                    group_leaf: None,
                 },
                 BufferInfo {
                     id: 2,
@@ -1028,6 +1057,7 @@ mod tests {
                     name: "lib.rs".to_string(),
                     modified: true,
                     is_virtual: false,
+                    group_leaf: None,
                 },
             ],
             active_buffer_id: 1,
@@ -1037,6 +1067,14 @@ mod tests {
             custom_contexts: std::collections::HashSet::new(),
             buffer_mode: None,
             has_lsp_config: true,
+            buffer_caps: crate::app::buffer_capabilities::BufferCapabilities {
+                has_buffer: true,
+                is_text_buffer: true,
+                editable: true,
+                modified: true,
+                has_path: true,
+                any_modified: true,
+            },
             relative_line_numbers: false,
         }
     }
@@ -1079,6 +1117,7 @@ mod tests {
             name: "*blame:lib.rs*".to_string(),
             modified: false,
             is_virtual: true,
+            group_leaf: None,
         });
         // A pathless, non-virtual buffer (e.g. unnamed scratch) must NOT appear.
         context.open_buffers.push(BufferInfo {
@@ -1087,6 +1126,7 @@ mod tests {
             name: "scratch".to_string(),
             modified: false,
             is_virtual: false,
+            group_leaf: None,
         });
 
         // Empty query lists everything that is eligible.
@@ -1106,6 +1146,42 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert!(filtered[0].text.contains("*blame:lib.rs*"));
         assert_eq!(filtered[0].value.as_deref(), Some("3"));
+    }
+
+    /// A buffer-group tab (the review-diff panels, say) is listed by its
+    /// group name and selects to `ShowBufferGroup` — its member buffers are
+    /// hidden from tabs, so the group is the only route back to it. The two
+    /// id spaces must not be confused: a group leaf and a buffer can share a
+    /// numeric id and still resolve to different results.
+    #[test]
+    fn test_buffer_provider_lists_and_selects_group_tabs() {
+        let provider = BufferProvider::new();
+        let mut context = make_test_context("/tmp");
+        context.open_buffers.push(BufferInfo {
+            id: 1,
+            path: String::new(),
+            name: "*Review Diff*".to_string(),
+            modified: false,
+            is_virtual: true,
+            group_leaf: Some(1),
+        });
+
+        let filtered = provider.suggestions("Review", &context);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].text.contains("*Review Diff*"));
+
+        match provider.on_select(Some(&filtered[0]), "Review", &context) {
+            QuickOpenResult::ShowBufferGroup(leaf) => assert_eq!(leaf, 1),
+            other => panic!("expected ShowBufferGroup, got {other:?}"),
+        }
+
+        // A plain buffer with the same numeric id still resolves to a buffer.
+        let main = provider.suggestions("main", &context);
+        assert_eq!(main.len(), 1);
+        match provider.on_select(Some(&main[0]), "main", &context) {
+            QuickOpenResult::ShowBuffer(id) => assert_eq!(id, 1),
+            other => panic!("expected ShowBuffer, got {other:?}"),
+        }
     }
 
     #[test]

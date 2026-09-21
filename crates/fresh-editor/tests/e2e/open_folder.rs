@@ -80,12 +80,14 @@ fn test_switch_project_shows_folder_browser() {
         .unwrap();
 
     // Wait for folder browser to appear with directory contents loaded
-    // On Windows, async directory loading may take longer
+    // On Windows, async directory loading may take longer. The input row
+    // carries the prompt's own label — "Switch project: ", not the
+    // "Open file: " it used to hardcode for every browser mode.
     harness
         .wait_until(|h| {
             let screen = h.screen_to_string();
             screen.contains("Navigation:")
-                && screen.contains("Open")
+                && screen.contains("Switch project")
                 && (screen.contains("subdir1") || screen.contains("subdir2"))
         })
         .expect("Folder browser should appear with directories listed");
@@ -175,7 +177,7 @@ fn test_switch_project_changes_working_dir() {
     // the editor (the old design tore the whole process down and rebuilt every
     // window).
     assert!(
-        !harness.editor().should_restart(),
+        !harness.editor().should_quit(),
         "Switch Project must not request an editor restart"
     );
 
@@ -256,7 +258,7 @@ fn test_switch_project_select_current_directory() {
     // Selecting the directory the active window is already rooted at is a
     // no-op: nothing to re-root, and certainly no editor restart.
     assert!(
-        !harness.editor().should_restart(),
+        !harness.editor().should_quit(),
         "Selecting the current directory must not request an editor restart"
     );
     assert_eq!(
@@ -517,7 +519,7 @@ fn test_switch_project_restart_flow_with_sessions() {
 
         // Switch Project re-roots the active window in place — no restart.
         assert!(
-            !harness.should_quit() && !harness.editor().should_restart(),
+            !harness.should_quit(),
             "Switch Project must not quit/restart the editor"
         );
         // The active window is now rooted at project_b...
@@ -696,7 +698,7 @@ fn test_session_persistence_across_project_switches() {
         // Switch Project re-roots in place — no restart — and the active
         // window is now rooted at project_b.
         assert!(
-            !harness.should_quit() && !harness.editor().should_restart(),
+            !harness.should_quit(),
             "Switch Project must not restart the editor"
         );
         assert!(
@@ -732,7 +734,7 @@ fn test_session_persistence_across_project_switches() {
         // Switch Project re-roots in place — no restart — and the active
         // window is now rooted at project_a.
         assert!(
-            !harness.should_quit() && !harness.editor().should_restart(),
+            !harness.should_quit(),
             "Switch Project must not restart the editor"
         );
         assert!(
@@ -768,7 +770,7 @@ fn test_session_persistence_across_project_switches() {
         harness.editor_mut().save_workspace().unwrap();
         switch_to_project(&mut harness, &project_b);
         assert!(
-            !harness.should_quit() && !harness.editor().should_restart(),
+            !harness.should_quit(),
             "Switch Project must not restart the editor"
         );
     }
@@ -798,7 +800,7 @@ fn test_session_persistence_across_project_switches() {
         harness.editor_mut().save_workspace().unwrap();
         switch_to_project(&mut harness, &project_a);
         assert!(
-            !harness.should_quit() && !harness.editor().should_restart(),
+            !harness.should_quit(),
             "Switch Project must not restart the editor"
         );
     }

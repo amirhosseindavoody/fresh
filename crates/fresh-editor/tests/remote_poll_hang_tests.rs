@@ -10,9 +10,7 @@
 //! calls filesystem.metadata() synchronously with no timeout or async handling.
 //! They will pass once polling is made non-blocking for slow/remote filesystems.
 
-mod common;
-
-use common::harness::{EditorTestHarness, HarnessOptions};
+use crate::common::harness::{EditorTestHarness, HarnessOptions};
 use fresh::config::Config;
 use fresh::model::filesystem::{
     DirEntry, FileMetadata, FilePermissions, FileReader, FileSearchCursor, FileSearchOptions,
@@ -169,15 +167,14 @@ impl FileSystem for DroppableFileSystem {
         self.check_disconnected()?;
         self.inner.sudo_write(path, data, mode, uid, gid)
     }
-    fn walk_files(
+    fn walk(
         &self,
         root: &Path,
-        skip_dirs: &[&str],
-        cancel: &std::sync::atomic::AtomicBool,
-        on_file: &mut dyn FnMut(&Path, &str) -> bool,
-    ) -> io::Result<()> {
-        self.check_disconnected()?;
-        self.inner.walk_files(root, skip_dirs, cancel, on_file)
+            opts: &fresh_editor_core::model::filesystem::WalkOptions<'_>,
+            cancel: &std::sync::atomic::AtomicBool,
+            on_entry: &mut dyn FnMut(fresh_editor_core::model::filesystem::WalkEntry<'_>) -> bool,
+    ) -> std::io::Result<()> {
+        self.inner.walk(root, opts, cancel, on_entry)
     }
     fn remote_connection_info(&self) -> Option<&str> {
         // Pretend to be remote so disconnected checks work
